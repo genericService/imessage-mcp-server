@@ -25,7 +25,7 @@ else
 fi
 
 # 3. Public HTTPS Endpoint Check
-PUBLIC_STATUS=$(curl -so /dev/null -w '%{http_code}' --connect-timeout 3 "https://imessage.genericservice.app/health" 2>/dev/null || echo "000")
+PUBLIC_STATUS=$(curl -so /dev/null -w '%{http_code}' --connect-timeout 3 -H "CF-Access-Client-Id: REDACTED_CF_ACCESS_ID.access" -H "CF-Access-Client-Secret: REDACTED_CF_ACCESS_SECRET" "https://imessage.genericservice.app/health" 2>/dev/null || echo "000")
 if [[ "$PUBLIC_STATUS" == "200" ]]; then
   printf "  %-30s ${GREEN}OK (HTTP %s)${NC}\n" "Public Tunnel Endpoint" "$PUBLIC_STATUS"
 else
