@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import dotenv from 'dotenv';
-dotenv.config();
+const __dir = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.resolve(__dir, '../.env') });
 import cors from 'cors';
 import https from 'https';
 import http from 'http';
@@ -68,7 +69,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_send_message',
     description:
-      'Send an outbound iMessage to a recipient using AppleScript on macOS. Requires recipient phone number or email address and message body.',
+      'Send an outbound iMessage to a recipient using AppleScript on macOS. Supports text message body and/or file attachments (images, PDFs, documents, audio/video).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -78,10 +79,14 @@ const TOOLS: Tool[] = [
         },
         message: {
           type: 'string',
-          description: 'Text content of the iMessage to send.'
+          description: 'Optional text content of the iMessage to send.'
+        },
+        attachment: {
+          type: 'string',
+          description: 'Optional local POSIX file path of an attachment to send (e.g. "/Users/matthias/Pictures/photo.jpg").'
         }
       },
-      required: ['recipient', 'message']
+      required: ['recipient']
     }
   }
 ];
@@ -139,10 +144,17 @@ iMessage MCP Server Instructions:
       if (name === 'imessage_send_message') {
         const recipient = String(args?.recipient || '').trim();
         const message = String(args?.message || '').trim();
-        if (!recipient || !message) {
-          throw new Error('Missing required parameters "recipient" and/or "message"');
+        const attachment = String(args?.attachment || '').trim();
+        if (!recipient) {
+          throw new Error('Missing required parameter "recipient"');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'send', recipient, message]);
+        if (!message && !attachment) {
+          throw new Error('Must provide either "message" or "attachment"');
+        }
+        const cliArgs = ['send', recipient];
+        if (message) cliArgs.push('--message', message);
+        if (attachment) cliArgs.push('--attachment', attachment);
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, ...cliArgs]);
         return {
           content: [{ type: 'text', text: stdout }]
         };
@@ -164,6 +176,7 @@ const app = express();
 
 // Request logger for diagnostic tracing
 app.use((req, _res, next) => {
+  req.headers['accept'] = 'application/json, text/event-stream';
   console.log(`[HTTP] ${req.method} ${req.url} | Auth: ${req.headers.authorization ? 'Present' : 'Missing'}`);
   next();
 });
@@ -350,8 +363,8 @@ app.get('/discover', (_req, res) => {
  */
 app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) => {
   // Normalize Accept header for clients that don't send text/event-stream explicitly
-  if (!req.headers.accept || req.headers.accept === '*/*' || !req.headers.accept.includes('text/event-stream')) {
-    req.headers.accept = 'application/json, text/event-stream';
+  if (!req.headers.accept || req.headers['accept'] === '*/*' || !req.headers.accept.includes('text/event-stream')) {
+    req.headers['accept'] = 'application/json, text/event-stream';
   }
 
   const reqSessionId = (req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id']) as string | undefined;
@@ -434,7 +447,7 @@ if (USE_HTTPS) {
     cert: fs.readFileSync(certPath)
   };
 
-  https.createServer(options, app).listen(PORT, host, () => {
+  https.createServer(options, app).listen(PORT, () => {
     console.log(`=======================================================`);
     console.log(`iMessage MCP Server running over HTTPS:`);
     console.log(`  Discovery Page:      https://0.0.0.0:${PORT}/`);
@@ -444,7 +457,7 @@ if (USE_HTTPS) {
     console.log(`=======================================================`);
   });
 } else {
-  http.createServer(app).listen(PORT, host, () => {
+  http.createServer(app).listen(PORT, () => {
     console.log(`=======================================================`);
     console.log(`iMessage MCP Server running over HTTP:`);
     console.log(`  Discovery Page:      http://0.0.0.0:${PORT}/`);
