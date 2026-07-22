@@ -3,3 +3,5 @@ dist/
 certs/
 .env
 *.log
+graphify-out/
+
