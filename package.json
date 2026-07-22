@@ -4,6 +4,12 @@
   "description": "iMessage MCP Server over HTTP/HTTPS (SSE Transport)",
   "main": "dist/index.js",
   "type": "module",
+  "author": "Matthias Goodman <matthiasgoodman@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/genericService/imessage-mcp-server.git"
+  },
+  "license": "MIT",
   "engines": {
     "node": ">=24.0.0"
   },
