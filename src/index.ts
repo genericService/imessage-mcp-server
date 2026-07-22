@@ -509,7 +509,7 @@ if (USE_HTTPS) {
     console.log(`=======================================================`);
   });
 } else {
-  http.createServer(app).listen(PORT, '::', () => {
+  http.createServer(app).listen(PORT, '0.0.0.0', () => {
     console.log(`=======================================================`);
     console.log(`iMessage MCP Server running over HTTP:`);
     console.log(`  Discovery Page:      http://0.0.0.0:${PORT}/`);
