@@ -248,7 +248,7 @@ app.get('/', (_req, res) => {
         "mcp-remote",
         "${publicBase}/mcp",
         "--header",
-        "Authorization: Bearer ${AUTH_TOKEN}"
+        "Authorization: Bearer &lt;YOUR_AUTH_TOKEN&gt;"
       ],
       "trust": true
     }
@@ -267,7 +267,7 @@ app.get('/', (_req, res) => {
         "--transport",
         "sse-only",
         "--header",
-        "Authorization: Bearer ${AUTH_TOKEN}"
+        "Authorization: Bearer &lt;YOUR_AUTH_TOKEN&gt;"
       ],
       "trust": true
     }
