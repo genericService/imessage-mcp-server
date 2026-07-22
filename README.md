@@ -2,7 +2,7 @@
 
 Model Context Protocol (MCP) Server for macOS iMessage integration over Streamable HTTP and SSE transports.
 
-Exposes your local Mac's iMessage database (`~/Library/Messages/chat.db`) and AppleScript (`osascript`) sending capabilities to AI coding assistants (Claude Desktop, Antigravity, Cursor, etc.) running on remote laptops or local sessions.
+Exposes your local Mac's iMessage database (`~/Library/Messages/chat.db`), Address Book contacts, and AppleScript / Swift automation capabilities to AI assistants (Antigravity, Claude, Cursor, etc.).
 
 ---
 
@@ -11,24 +11,29 @@ Exposes your local Mac's iMessage database (`~/Library/Messages/chat.db`) and Ap
 * **Dual Transports:** Supports modern Streamable HTTP (`/mcp`) and Server-Sent Events (`/sse`).
 * **Cloudflare Pro Tunnel:** Publicly accessible at `https://imessage.genericservice.app` over Cloudflare edge HTTPS.
 * **Authentication:** Protected with Bearer token authentication header (`Authorization: Bearer <TOKEN>`).
-* **Discovery Page & Endpoint:** Interactive landing page at `/` and structured JSON discovery at `/discover`.
-* **Built-in System Instructions:** Sends tool guidelines directly to connecting AI models during MCP protocol initialization.
+* **Attachment Support:** Full inline attachment reading and sending (photos, documents, audio, video). Converts HEIC photos to JPEG automatically for vision LLM analysis.
+* **Single-Bubble Delivery:** Pastes attachments and message text directly into Messages app for single-bubble delivery.
+* **Contacts Integration:** Searches macOS Address Book contacts (`AddressBook-v22.abcddb`) to resolve names, phone numbers, and emails.
+* **Full-Text Message Search:** High-performance search across historical iMessage conversations.
 
 ---
 
 ## Exposed MCP Tools
 
-| Tool Name | Description | Parameters |
+| Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
-| `imessage_list_chats` | List recent conversation IDs, display names, and handles | `limit` (number, default: 30) |
-| `imessage_read_messages` | Fetch past message history from a target chat | `chat` (string, required), `days` (number, default: 14) |
-| `imessage_send_message` | Send an outbound iMessage to a contact | `recipient` (string, required), `message` (string, required) |
+| `imessage_list_chats` | Discover active chats, ROWIDs, display names, and handles | `limit` (number, default: 30) |
+| `imessage_read_messages` | Read message history with inline attachment details | `chat` (string, required), `days` (number, default: 14) |
+| `imessage_search_messages` | Full-text search across all historical iMessages | `query` (string, required), `limit` (number, default: 30) |
+| `imessage_search_contacts` | Search macOS Address Book by name, phone, or email | `query` (string, optional) |
+| `imessage_get_chat_members` | List members and handles in group chats | `chat` (string, required) |
+| `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (HEIC to JPEG) | `path` (string, required) |
+| `imessage_send_message` | Send iMessage (supports text & single-bubble attachments) | `recipient` (string, required), `message`, `attachment` |
 
 ---
 
 ## Client Configuration (`mcp_config.json`)
 
-### Option A: Streamable HTTP Transport (`/mcp`)
 ```json
 {
   "mcpServers": {
@@ -39,28 +44,7 @@ Exposes your local Mac's iMessage database (`~/Library/Messages/chat.db`) and Ap
         "mcp-remote",
         "https://imessage.genericservice.app/mcp",
         "--header",
-        "Authorization: Bearer REDACTED_AUTH_TOKEN"
-      ],
-      "trust": true
-    }
-  }
-}
-```
-
-### Option B: SSE Transport (`/sse`)
-```json
-{
-  "mcpServers": {
-    "imessage": {
-      "command": "pnpm",
-      "args": [
-        "dlx",
-        "mcp-remote",
-        "https://imessage.genericservice.app/sse",
-        "--transport",
-        "sse-only",
-        "--header",
-        "Authorization: Bearer REDACTED_AUTH_TOKEN"
+        "Authorization: Bearer <YOUR_AUTH_TOKEN>"
       ],
       "trust": true
     }
@@ -70,30 +54,15 @@ Exposes your local Mac's iMessage database (`~/Library/Messages/chat.db`) and Ap
 
 ---
 
-## Management Commands
+## Architecture & Permissions
 
-Use the [`imessage-mcp`](file:///Users/matthias/bin/imessage-mcp) CLI manager:
-
-```bash
-# Check status and health
-imessage-mcp status
-
-# Print client config snippet
-imessage-mcp config
-
-# Restart service
-imessage-mcp restart
-
-# Stop service
-imessage-mcp stop
-```
+### macOS TCC & System Events Requirements
+To enable attachment pasting and automated sending over SSH / background daemons:
+1. Open **System Settings → Privacy & Security → Accessibility**.
+2. Add `/usr/libexec/sshd-keygen-wrapper` (use `Cmd+Shift+G` in the file picker) and turn **ON**.
+3. Under **Automation**, ensure **System Events** and **Messages** are allowed for terminal / sshd.
 
 ---
 
-## Endpoints
-
-* `GET /` &mdash; Human-readable discovery page with copyable configs and documentation.
-* `GET /discover` &mdash; Machine-readable JSON metadata describing endpoints, auth, and tools.
-* `GET /health` &mdash; Server status check and active session counts.
-* `ALL /mcp` &mdash; Streamable HTTP transport endpoint.
-* `GET /sse` &mdash; Server-Sent Events transport endpoint.
+## License
+MIT
