@@ -48,11 +48,24 @@ def list_chats(args):
     cursor.execute(query, (args.limit,))
     rows = cursor.fetchall()
     
-    print(f"{'ID':<6} | {'Display Name':<30} | {'Identifier':<40}")
-    print("-" * 85)
-    for rowid, display_name, identifier, _ in rows:
+    chats = []
+    for rowid, display_name, identifier, last_msg_date in rows:
         name = display_name if display_name else "<Direct Chat>"
-        print(f"{rowid:<6} | {name:<30} | {identifier:<40}")
+        chats.append({
+            'rowid': rowid,
+            'display_name': display_name,
+            'name': name,
+            'identifier': identifier,
+            'last_msg_date': last_msg_date
+        })
+        
+    if getattr(args, 'json', False):
+        print(json.dumps(chats, indent=2))
+    else:
+        print(f"{'ID':<6} | {'Display Name':<30} | {'Identifier':<40}")
+        print("-" * 85)
+        for c in chats:
+            print(f"{c['rowid']:<6} | {c['name']:<30} | {c['identifier']:<40}")
     conn.close()
 
 def parse_attributed_body(blob):
@@ -98,6 +111,10 @@ def read_messages(args):
         chat_ids = [r[0] for r in cursor.fetchall()]
         
     if not chat_ids:
+        if getattr(args, 'json', False):
+            print(json.dumps([]))
+            conn.close()
+            return
         print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
         conn.close()
         sys.exit(1)
@@ -154,8 +171,7 @@ def read_messages(args):
                 'size': format_size(total_bytes)
             })
 
-    print(f"READING MESSAGES FROM THE LAST {args.days} DAYS FOR '{target}' ({len(rows)} messages found):")
-    print("=" * 85)
+    messages = []
     for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body in rows:
         sec = date_ns / 1_000_000_000
         dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
@@ -167,16 +183,31 @@ def read_messages(args):
         if not msg_text or msg_text.strip() == "":
             msg_text = parse_attributed_body(attr_body)
         att_list = attachments_map.get(msg_id, [])
-        if att_list:
-            att_strs = []
-            for att in att_list:
-                path_str = f", path: {att['filename']}" if att['filename'] else ""
-                att_strs.append(f"[Attachment: {att['transfer_name']} ({att['mime_type']}, {att['size']}{path_str})]")
-            att_desc = " ".join(att_strs)
-            msg_text = f"{msg_text} {att_desc}".strip() if msg_text else att_desc
-        if not msg_text or msg_text.strip() == "":
-            msg_text = "<empty message>"
-        print(f"[{ts}] [{chat}] {sender}: {msg_text}")
+        messages.append({
+            'msg_id': msg_id,
+            'timestamp': ts,
+            'chat': chat,
+            'sender': sender,
+            'is_from_me': bool(is_from_me),
+            'text': msg_text or "<empty message>",
+            'attachments': att_list
+        })
+
+    if getattr(args, 'json', False):
+        print(json.dumps(messages, indent=2))
+    else:
+        print(f"READING MESSAGES FROM THE LAST {args.days} DAYS FOR '{target}' ({len(rows)} messages found):")
+        print("=" * 85)
+        for m in messages:
+            msg_text = m['text']
+            if m['attachments']:
+                att_strs = []
+                for att in m['attachments']:
+                    path_str = f", path: {att['filename']}" if att['filename'] else ""
+                    att_strs.append(f"[Attachment: {att['transfer_name']} ({att['mime_type']}, {att['size']}{path_str})]")
+                att_desc = " ".join(att_strs)
+                msg_text = f"{msg_text} {att_desc}".strip() if msg_text != "<empty message>" else att_desc
+            print(f"[{m['timestamp']}] [{m['chat']}] {m['sender']}: {msg_text}")
     conn.close()
 
 def search_messages(args):
@@ -200,16 +231,15 @@ def search_messages(args):
     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     JOIN chat c ON cmj.chat_id = c.ROWID
     LEFT JOIN handle h ON m.handle_id = h.ROWID
-    WHERE m.text LIKE ?
+    WHERE m.text LIKE ? OR (m.text IS NULL AND m.attributedBody LIKE ?)
     ORDER BY m.date DESC
     LIMIT ?
     """
-    cursor.execute(query, (f"%{query_str}%", limit))
+    cursor.execute(query, (f"%{query_str}%", f"%{query_str}%", limit))
     rows = cursor.fetchall()
     
     apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
-    print(f"SEARCH RESULTS FOR '{query_str}' ({len(rows)} matching messages found):")
-    print("=" * 85)
+    results = []
     for msg_id, chat_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body in rows:
         sec = date_ns / 1_000_000_000
         dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
@@ -218,7 +248,23 @@ def search_messages(args):
         sender = "Me" if is_from_me else (handle or "Unknown")
         chat = display_name if display_name else chat_ident
         msg_text = text or parse_attributed_body(attr_body) or "<empty message>"
-        print(f"[{ts}] [Chat {chat_id}: {chat}] {sender}: {msg_text}")
+        results.append({
+            'msg_id': msg_id,
+            'chat_id': chat_id,
+            'chat': chat,
+            'timestamp': ts,
+            'sender': sender,
+            'is_from_me': bool(is_from_me),
+            'text': msg_text
+        })
+
+    if getattr(args, 'json', False):
+        print(json.dumps(results, indent=2))
+    else:
+        print(f"SEARCH RESULTS FOR '{query_str}' ({len(results)} matching messages found):")
+        print("=" * 85)
+        for r in results:
+            print(f"[{r['timestamp']}] [Chat {r['chat_id']}: {r['chat']}] {r['sender']}: {r['text']}")
     conn.close()
 
 def search_contacts(args):
@@ -262,11 +308,14 @@ def search_contacts(args):
             seen.add(key)
             unique.append(c)
 
-    print(f"CONTACT RESULTS ({len(unique)} contacts found):")
-    print(f"{'Name':<25} | {'Organization':<20} | {'Phone':<18} | {'Email':<25}")
-    print("-" * 95)
-    for c in unique[:50]:
-        print(f"{c['name']:<25} | {c['organization']:<20} | {c['phone']:<18} | {c['email']:<25}")
+    if getattr(args, 'json', False):
+        print(json.dumps(unique, indent=2))
+    else:
+        print(f"CONTACT RESULTS ({len(unique)} contacts found):")
+        print(f"{'Name':<25} | {'Organization':<20} | {'Phone':<18} | {'Email':<25}")
+        print("-" * 95)
+        for c in unique[:50]:
+            print(f"{c['name']:<25} | {c['organization']:<20} | {c['phone']:<18} | {c['email']:<25}")
 
 def get_members(args):
     conn = get_db_connection()
@@ -284,6 +333,10 @@ def get_members(args):
         chat_ids = [r[0] for r in cursor.fetchall()]
         
     if not chat_ids:
+        if getattr(args, 'json', False):
+            print(json.dumps([]))
+            conn.close()
+            return
         print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
         conn.close()
         sys.exit(1)
@@ -304,12 +357,24 @@ def get_members(args):
     cursor.execute(query, chat_ids)
     rows = cursor.fetchall()
     
-    print(f"MEMBERS FOR CHAT '{target}' ({len(rows)} members):")
-    print(f"{'Chat ID':<8} | {'Chat Name':<25} | {'Handle / Phone':<30} | {'Service':<10}")
-    print("-" * 80)
+    members = []
     for rowid, display_name, chat_ident, handle_id, service in rows:
         name = display_name if display_name else chat_ident
-        print(f"{rowid:<8} | {name:<25} | {handle_id:<30} | {service:<10}")
+        members.append({
+            'chat_id': rowid,
+            'display_name': name,
+            'handle': handle_id,
+            'service': service
+        })
+
+    if getattr(args, 'json', False):
+        print(json.dumps(members, indent=2))
+    else:
+        print(f"MEMBERS FOR CHAT '{target}' ({len(members)} members):")
+        print(f"{'Chat ID':<8} | {'Chat Name':<25} | {'Handle / Phone':<30} | {'Service':<10}")
+        print("-" * 80)
+        for m in members:
+            print(f"{m['chat_id']:<8} | {m['display_name']:<25} | {m['handle']:<30} | {m['service']:<10}")
     conn.close()
 
 def get_attachment_payload(args):
@@ -416,24 +481,29 @@ def main():
     
     list_parser = subparsers.add_parser("list", help="List active iMessage chats")
     list_parser.add_argument("--limit", type=int, default=30, help="Number of chats to list (default 30)")
+    list_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     list_parser.set_defaults(func=list_chats)
     
     read_parser = subparsers.add_parser("read", help="Read recent messages from a chat")
     read_parser.add_argument("chat", help="Chat ID, display name, or contact identifier")
     read_parser.add_argument("--days", type=int, default=14, help="Days of history to fetch (default 14)")
+    read_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     read_parser.set_defaults(func=read_messages)
 
     search_parser = subparsers.add_parser("search", help="Search message history")
     search_parser.add_argument("query", help="Search keyword or phrase")
     search_parser.add_argument("--limit", type=int, default=30, help="Max results (default 30)")
+    search_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     search_parser.set_defaults(func=search_messages)
 
     contacts_parser = subparsers.add_parser("contacts", help="Search macOS contacts")
     contacts_parser.add_argument("query", nargs="?", default="", help="Name, phone number, or email search query")
+    contacts_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     contacts_parser.set_defaults(func=search_contacts)
 
     members_parser = subparsers.add_parser("members", help="Get members of a group chat")
     members_parser.add_argument("chat", help="Chat ID or chat identifier")
+    members_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     members_parser.set_defaults(func=get_members)
 
     attachment_parser = subparsers.add_parser("attachment", help="Get base64/multimodal attachment payload")

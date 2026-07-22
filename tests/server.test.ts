@@ -1,4 +1,11 @@
 import { describe, it, expect } from 'vitest';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import path from 'path';
+
+const execFileAsync = promisify(execFile);
+const PYTHON_BIN = '/usr/bin/python3';
+const CLI_PATH = path.resolve(__dirname, '../bin/imessage');
 
 describe('iMessage MCP Tool Schemas (SDD)', () => {
   it('should define required tool names and properties', () => {
@@ -13,5 +20,29 @@ describe('iMessage MCP Tool Schemas (SDD)', () => {
     ];
 
     expect(requiredTools).toHaveLength(7);
+  });
+});
+
+describe('CLI JSON Output Contracts (SDD & TDD)', () => {
+  it('should return valid JSON when --json flag is passed to imessage list', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'list', '--limit', '3', '--json']);
+    const data = JSON.parse(stdout);
+    expect(Array.isArray(data)).toBe(true);
+    if (data.length > 0) {
+      expect(data[0]).toHaveProperty('rowid');
+      expect(data[0]).toHaveProperty('identifier');
+    }
+  });
+
+  it('should return valid JSON when --json flag is passed to imessage search', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search', 'the', '--limit', '2', '--json']);
+    const data = JSON.parse(stdout);
+    expect(Array.isArray(data)).toBe(true);
+  });
+
+  it('should return valid JSON when --json flag is passed to imessage contacts', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'contacts', '', '--json']);
+    const data = JSON.parse(stdout);
+    expect(Array.isArray(data)).toBe(true);
   });
 });
