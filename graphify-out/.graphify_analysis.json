@@ -1,0 +1,211 @@
+{
+  "communities": {
+    "0": [
+      "package_author",
+      "package_description",
+      "package_engines",
+      "package_engines_node",
+      "package_json",
+      "package_license",
+      "package_main",
+      "package_name",
+      "package_repository",
+      "package_repository_type",
+      "package_repository_url",
+      "package_type",
+      "package_version"
+    ],
+    "1": [
+      "package_devdependencies",
+      "package_devdependencies_tsx",
+      "package_devdependencies_types_cors",
+      "package_devdependencies_types_express",
+      "package_devdependencies_types_node",
+      "package_devdependencies_typescript",
+      "package_devdependencies_vitest",
+      "tsx",
+      "types_cors",
+      "types_express",
+      "types_node",
+      "typescript",
+      "vitest"
+    ],
+    "2": [
+      "ref_src",
+      "tsconfig_compileroptions",
+      "tsconfig_compileroptions_esmoduleinterop",
+      "tsconfig_compileroptions_forceconsistentcasinginfilenames",
+      "tsconfig_compileroptions_module",
+      "tsconfig_compileroptions_moduleresolution",
+      "tsconfig_compileroptions_outdir",
+      "tsconfig_compileroptions_rootdir",
+      "tsconfig_compileroptions_skiplibcheck",
+      "tsconfig_compileroptions_strict",
+      "tsconfig_compileroptions_target",
+      "tsconfig_include",
+      "tsconfig_json"
+    ],
+    "3": [
+      "bin_imessage",
+      "bin_imessage_format_size",
+      "bin_imessage_get_attachment_payload",
+      "bin_imessage_get_db_connection",
+      "bin_imessage_get_members",
+      "bin_imessage_list_chats",
+      "bin_imessage_main",
+      "bin_imessage_parse_attributed_body",
+      "bin_imessage_read_messages",
+      "bin_imessage_search_contacts",
+      "bin_imessage_search_messages",
+      "bin_imessage_send_message"
+    ],
+    "4": [
+      "src_index",
+      "src_index_app",
+      "src_index_authmiddleware",
+      "src_index_createmcpserver",
+      "src_index_dir",
+      "src_index_execfileasync",
+      "src_index_httpsessions",
+      "src_index_port",
+      "src_index_ssesessions",
+      "src_index_tools"
+    ],
+    "5": [
+      "cors",
+      "dotenv",
+      "express",
+      "modelcontextprotocol_sdk",
+      "package_dependencies",
+      "package_dependencies_cors",
+      "package_dependencies_dotenv",
+      "package_dependencies_express",
+      "package_dependencies_modelcontextprotocol_sdk"
+    ],
+    "6": [
+      "package_scripts",
+      "package_scripts_build",
+      "package_scripts_dev",
+      "package_scripts_start",
+      "package_scripts_test"
+    ],
+    "7": [
+      "scripts_generate_certs_sh",
+      "scripts_generate_certs_sh__entry"
+    ],
+    "8": [
+      "addressbook_db"
+    ],
+    "9": [
+      "gemini_project_rules"
+    ],
+    "10": [
+      "library_messages_chat_db"
+    ],
+    "11": [
+      "pnpm_workspace"
+    ],
+    "12": [
+      "readme_imessage_mcp_server"
+    ],
+    "13": [
+      "tests_server_test"
+    ]
+  },
+  "cohesion": {
+    "0": 0.15384615384615385,
+    "1": 0.15384615384615385,
+    "2": 0.15384615384615385,
+    "3": 0.3787878787878788,
+    "4": 0.2222222222222222,
+    "5": 0.2222222222222222,
+    "6": 0.4,
+    "7": 1.0,
+    "8": 1.0,
+    "9": 1.0,
+    "10": 1.0,
+    "11": 1.0,
+    "12": 1.0,
+    "13": 1.0
+  },
+  "gods": [
+    {
+      "id": "tsconfig_compileroptions",
+      "label": "compilerOptions",
+      "degree": 10
+    },
+    {
+      "id": "package_scripts",
+      "label": "scripts",
+      "degree": 5
+    },
+    {
+      "id": "package_repository",
+      "label": "repository",
+      "degree": 3
+    },
+    {
+      "id": "package_engines",
+      "label": "engines",
+      "degree": 2
+    },
+    {
+      "id": "package_dependencies_modelcontextprotocol_sdk",
+      "label": "@modelcontextprotocol/sdk",
+      "degree": 2
+    },
+    {
+      "id": "package_dependencies_cors",
+      "label": "cors",
+      "degree": 2
+    },
+    {
+      "id": "package_dependencies_dotenv",
+      "label": "dotenv",
+      "degree": 2
+    },
+    {
+      "id": "package_dependencies_express",
+      "label": "express",
+      "degree": 2
+    },
+    {
+      "id": "package_devdependencies_types_cors",
+      "label": "@types/cors",
+      "degree": 2
+    },
+    {
+      "id": "package_devdependencies_types_express",
+      "label": "@types/express",
+      "degree": 2
+    }
+  ],
+  "surprises": [],
+  "questions": [
+    {
+      "type": "bridge_node",
+      "question": "Why does `devDependencies` connect `Community 1` to `Community 0`?",
+      "why": "High betweenness centrality (0.116) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `dependencies` connect `Community 5` to `Community 0`?",
+      "why": "High betweenness centrality (0.082) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `scripts` connect `Community 6` to `Community 0`?",
+      "why": "High betweenness centrality (0.044) - this node is a cross-community bridge."
+    },
+    {
+      "type": "verify_inferred",
+      "question": "Are the 7 inferred relationships involving `main()` (e.g. with `get_attachment_payload()` and `get_members()`) actually correct?",
+      "why": "`main()` has 7 INFERRED edges - model-reasoned connections that need verification."
+    },
+    {
+      "type": "isolated_nodes",
+      "question": "What connects `name`, `version`, `description` to the rest of the system?",
+      "why": "45 weakly-connected nodes found - possible documentation gaps or missing edges."
+    }
+  ]
+}

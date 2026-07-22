@@ -187,8 +187,8 @@ iMessage MCP Server Instructions:
 
     try {
       if (name === 'imessage_list_chats') {
-        const limit = typeof args?.limit === 'number' ? Math.min(args.limit, 100) : 30;
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'list', '--limit', String(limit)]);
+        const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 100)) : 30;
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'list', '--limit', String(limit), '--json']);
         return {
           content: [{ type: 'text', text: stdout }]
         };
@@ -196,11 +196,11 @@ iMessage MCP Server Instructions:
 
       if (name === 'imessage_read_messages') {
         const chat = String(args?.chat || '').trim();
-        const days = typeof args?.days === 'number' ? args.days : 14;
+        const days = typeof args?.days === 'number' ? Math.max(1, Math.min(Math.floor(args.days), 365)) : 14;
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'read', chat, '--days', String(days)]);
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'read', chat, '--days', String(days), '--json']);
         return {
           content: [{ type: 'text', text: stdout }]
         };
@@ -208,11 +208,11 @@ iMessage MCP Server Instructions:
 
       if (name === 'imessage_search_messages') {
         const query = String(args?.query || '').trim();
-        const limit = typeof args?.limit === 'number' ? args.limit : 30;
+        const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 100)) : 30;
         if (!query) {
           throw new Error('Missing required parameter "query"');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search', query, '--limit', String(limit)]);
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search', query, '--limit', String(limit), '--json']);
         return {
           content: [{ type: 'text', text: stdout }]
         };
@@ -220,7 +220,7 @@ iMessage MCP Server Instructions:
 
       if (name === 'imessage_search_contacts') {
         const query = String(args?.query || '').trim();
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'contacts', query]);
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'contacts', query, '--json']);
         return {
           content: [{ type: 'text', text: stdout }]
         };
@@ -231,7 +231,7 @@ iMessage MCP Server Instructions:
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'members', chat]);
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'members', chat, '--json']);
         return {
           content: [{ type: 'text', text: stdout }]
         };
