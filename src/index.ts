@@ -67,6 +67,69 @@ const TOOLS: Tool[] = [
     }
   },
   {
+    name: 'imessage_search_messages',
+    description:
+      'Full-text search across all historical iMessage conversations. Returns matching messages, dates, chat IDs, and senders.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Search keyword or phrase to search for across message history.'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of matching search results to return (default: 30).'
+        }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'imessage_search_contacts',
+    description:
+      'Search macOS AddressBook contacts by name, phone number, or email address.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Contact name, phone number, or email address search string (optional, leave empty to list recent contacts).'
+        }
+      }
+    }
+  },
+  {
+    name: 'imessage_get_chat_members',
+    description:
+      'Get members and participants of a specific iMessage chat (useful for group chats).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat: {
+          type: 'string',
+          description: 'Chat ROWID or display name to inspect group chat members for.'
+        }
+      },
+      required: ['chat']
+    }
+  },
+  {
+    name: 'imessage_get_attachment_payload',
+    description:
+      'Fetch metadata and base64 payload for an attachment file (converts HEIC photos to JPEG automatically for vision LLM analysis).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'POSIX path to attachment file (e.g. "/Users/matthias/Library/Messages/Attachments/.../IMG_4031.png").'
+        }
+      },
+      required: ['path']
+    }
+  },
+  {
     name: 'imessage_send_message',
     description:
       'Send an outbound iMessage to a recipient using AppleScript on macOS. Supports text message body and/or file attachments (images, PDFs, documents, audio/video).',
@@ -107,8 +170,10 @@ function createMcpServer(): Server {
       instructions: `
 iMessage MCP Server Instructions:
 1. Discovery: Call 'imessage_list_chats' to discover available conversation IDs, display names, and handles.
-2. Reading: Call 'imessage_read_messages' using a chat ID or contact identifier to review past messages.
-3. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
+2. Search: Call 'imessage_search_messages' to search past message history by keyword, or 'imessage_search_contacts' to find contacts.
+3. Reading: Call 'imessage_read_messages' using a chat ID or contact identifier to review past messages.
+4. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
+5. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
 `.trim()
     }
   );
@@ -141,6 +206,48 @@ iMessage MCP Server Instructions:
         };
       }
 
+      if (name === 'imessage_search_messages') {
+        const query = String(args?.query || '').trim();
+        const limit = typeof args?.limit === 'number' ? args.limit : 30;
+        if (!query) {
+          throw new Error('Missing required parameter "query"');
+        }
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search', query, '--limit', String(limit)]);
+        return {
+          content: [{ type: 'text', text: stdout }]
+        };
+      }
+
+      if (name === 'imessage_search_contacts') {
+        const query = String(args?.query || '').trim();
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'contacts', query]);
+        return {
+          content: [{ type: 'text', text: stdout }]
+        };
+      }
+
+      if (name === 'imessage_get_chat_members') {
+        const chat = String(args?.chat || '').trim();
+        if (!chat) {
+          throw new Error('Missing required parameter "chat"');
+        }
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'members', chat]);
+        return {
+          content: [{ type: 'text', text: stdout }]
+        };
+      }
+
+      if (name === 'imessage_get_attachment_payload') {
+        const filePath = String(args?.path || '').trim();
+        if (!filePath) {
+          throw new Error('Missing required parameter "path"');
+        }
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'attachment', filePath, '--json']);
+        return {
+          content: [{ type: 'text', text: stdout }]
+        };
+      }
+
       if (name === 'imessage_send_message') {
         const recipient = String(args?.recipient || '').trim();
         const message = String(args?.message || '').trim();
@@ -148,13 +255,12 @@ iMessage MCP Server Instructions:
         if (!recipient) {
           throw new Error('Missing required parameter "recipient"');
         }
-        if (!message && !attachment) {
-          throw new Error('Must provide either "message" or "attachment"');
-        }
-        const cliArgs = ['send', recipient];
-        if (message) cliArgs.push('--message', message);
-        if (attachment) cliArgs.push('--attachment', attachment);
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, ...cliArgs]);
+
+        const cliArgs = [CLI_PATH, 'send', recipient];
+        if (message) cliArgs.push('-m', message);
+        if (attachment) cliArgs.push('-a', attachment);
+
+        const { stdout } = await execFileAsync(PYTHON_BIN, cliArgs);
         return {
           content: [{ type: 'text', text: stdout }]
         };
@@ -162,8 +268,9 @@ iMessage MCP Server Instructions:
 
       throw new Error(`Unknown tool: ${name}`);
     } catch (error: any) {
+      console.error(`[MCP Tool Error] ${name}:`, error);
       return {
-        content: [{ type: 'text', text: `ERROR: ${error.stderr || error.message}` }],
+        content: [{ type: 'text', text: `Error executing ${name}: ${error.message || String(error)}` }],
         isError: true
       };
     }
@@ -173,68 +280,50 @@ iMessage MCP Server Instructions:
 }
 
 const app = express();
-
-// Request logger for diagnostic tracing
-app.use((req, _res, next) => {
-  req.headers['accept'] = 'application/json, text/event-stream';
-  console.log(`[HTTP] ${req.method} ${req.url} | Auth: ${req.headers.authorization ? 'Present' : 'Missing'}`);
-  next();
-});
-
-// CORS configuration for web and desktop clients
-app.use(cors({
-  origin: '*',
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'mcp-session-id', 'Mcp-Session-Id', 'mcp-protocol-version', 'Mcp-Protocol-Version'],
-  exposedHeaders: ['mcp-session-id', 'Mcp-Session-Id', 'Authorization']
-}));
+app.use(cors());
 app.use(express.json());
 
-// Bearer Token authentication middleware
-const authMiddleware = (req: Request, res: Response, next: NextFunction): void => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || authHeader !== `Bearer ${AUTH_TOKEN}`) {
-    res.status(401).json({
-      error: 'Unauthorized',
-      message: 'Invalid or missing Bearer token header.',
-      example: 'Authorization: Bearer <YOUR_AUTH_TOKEN>'
-    });
-    return;
-  }
-  next();
-};
-
-interface HttpSessionRecord {
-  transport: StreamableHTTPServerTransport;
-  server: Server;
-  lastAccess: number;
-}
-
 const sseSessions = new Map<string, { transport: SSEServerTransport; server: Server }>();
-const httpSessions = new Map<string, HttpSessionRecord>();
+const httpSessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server; lastAccess: number }>();
 
-// Periodically clean up inactive HTTP transport sessions (>30 mins inactive)
-setInterval(async () => {
+// Session cleanup interval for Streamable HTTP transport
+setInterval(() => {
   const now = Date.now();
-  const TTL = 30 * 60 * 1000;
   for (const [sessionId, session] of httpSessions.entries()) {
-    if (now - session.lastAccess > TTL) {
-      console.log(`[MCP Eviction] Cleaning up expired HTTP session: ${sessionId}`);
+    if (now - session.lastAccess > 300000) { // 5 minutes inactivity
+      console.log(`[MCP] Cleaning up inactive Streamable HTTP session: ${sessionId}`);
+      session.server.close().catch(() => {});
       httpSessions.delete(sessionId);
-      try {
-        await session.server.close();
-      } catch (e) {}
     }
   }
-}, 5 * 60 * 1000);
+}, 60000);
 
 /**
- * Root discovery HTML page.
+ * Middleware for Bearer Token Authentication
+ */
+function authMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Unauthorized: Missing or invalid Authorization header' });
+    return;
+  }
+
+  const token = authHeader.substring(7);
+  if (token !== AUTH_TOKEN) {
+    res.status(403).json({ error: 'Forbidden: Invalid bearer token' });
+    return;
+  }
+
+  next();
+}
+
+/**
+ * Root discovery HTML / documentation page.
  */
 app.get('/', (_req, res) => {
   const publicBase = `https://${PUBLIC_DOMAIN}`;
   res.setHeader('Content-Type', 'text/html');
-  res.send(`
-<!DOCTYPE html>
+  res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -271,48 +360,15 @@ app.get('/', (_req, res) => {
     <em>Structured API discovery metadata and tool schemas.</em>
   </div>
 
-  <h2>Client Configuration Snippets</h2>
-  <h3>1. Streamable HTTP (mcp-remote / Antigravity / Cursor)</h3>
-  <pre><code>{
-  "mcpServers": {
-    "imessage": {
-      "command": "pnpm",
-      "args": [
-        "dlx",
-        "mcp-remote",
-        "${publicBase}/mcp",
-        "--header",
-        "Authorization: Bearer &lt;YOUR_AUTH_TOKEN&gt;"
-      ],
-      "trust": true
-    }
-  }
-}</code></pre>
-
-  <h3>2. SSE Transport (mcp-remote sse-only)</h3>
-  <pre><code>{
-  "mcpServers": {
-    "imessage": {
-      "command": "pnpm",
-      "args": [
-        "dlx",
-        "mcp-remote",
-        "${publicBase}/sse",
-        "--transport",
-        "sse-only",
-        "--header",
-        "Authorization: Bearer &lt;YOUR_AUTH_TOKEN&gt;"
-      ],
-      "trust": true
-    }
-  }
-}</code></pre>
-
   <h2>Available Tools</h2>
   <ul>
     <li><code>imessage_list_chats</code>: List recent conversations, display names, and handles.</li>
     <li><code>imessage_read_messages</code>: Read message history from a chat.</li>
-    <li><code>imessage_send_message</code>: Send an iMessage to a recipient.</li>
+    <li><code>imessage_search_messages</code>: Full-text search across historical iMessage text.</li>
+    <li><code>imessage_search_contacts</code>: Search macOS contacts by name, phone, or email.</li>
+    <li><code>imessage_get_chat_members</code>: Get members of a group chat.</li>
+    <li><code>imessage_get_attachment_payload</code>: Fetch attachment metadata and base64 payload.</li>
+    <li><code>imessage_send_message</code>: Send an iMessage with text and/or attachments.</li>
   </ul>
 </body>
 </html>
@@ -326,7 +382,7 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'imessage-mcp-server',
-    version: '1.0.0',
+    version: '1.1.0',
     publicDomain: PUBLIC_DOMAIN,
     activeSseSessions: sseSessions.size,
     activeHttpSessions: httpSessions.size,
@@ -341,7 +397,7 @@ app.get('/discover', (_req, res) => {
   const publicBase = `https://${PUBLIC_DOMAIN}`;
   res.json({
     name: 'imessage-mcp-server',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'iMessage MCP Server over HTTP/HTTPS and SSE for macOS',
     publicDomain: PUBLIC_DOMAIN,
     endpoints: {
@@ -362,7 +418,6 @@ app.get('/discover', (_req, res) => {
  * Streamable HTTP Transport endpoint (GET & POST) for /mcp and /mcp/*
  */
 app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) => {
-  // Normalize Accept header for clients that don't send text/event-stream explicitly
   if (!req.headers.accept || req.headers['accept'] === '*/*' || !req.headers.accept.includes('text/event-stream')) {
     req.headers['accept'] = 'application/json, text/event-stream';
   }
@@ -376,7 +431,6 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
     return;
   }
 
-  // New session or initialization request
   let generatedSessionId: string | undefined;
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => {
@@ -430,8 +484,6 @@ app.post('/messages', authMiddleware, async (req, res) => {
   await session.transport.handlePostMessage(req, res);
 });
 
-const host = '0.0.0.0';
-
 if (USE_HTTPS) {
   const certDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'certs');
   const certPath = path.join(certDir, 'server.crt');
@@ -457,7 +509,7 @@ if (USE_HTTPS) {
     console.log(`=======================================================`);
   });
 } else {
-  http.createServer(app).listen(PORT, () => {
+  http.createServer(app).listen(PORT, '::', () => {
     console.log(`=======================================================`);
     console.log(`iMessage MCP Server running over HTTP:`);
     console.log(`  Discovery Page:      http://0.0.0.0:${PORT}/`);

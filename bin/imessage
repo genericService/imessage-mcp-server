@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+import argparse
+import sqlite3
+import datetime
+import os
+import sys
+import subprocess
+import glob
+import json
+import base64
+
+DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
+
+def get_db_connection():
+    if not os.path.exists(DB_PATH):
+        print(f"ERROR: iMessage database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    except Exception as e:
+        print(f"ERROR: Could not open database in read-only mode: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def format_size(bytes_num):
+    if not bytes_num: return "0 B"
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if abs(bytes_num) < 1024.0:
+            return f"{bytes_num:.1f} {unit}"
+        bytes_num /= 1024.0
+    return f"{bytes_num:.1f} TB"
+
+def list_chats(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = """
+    SELECT 
+        c.ROWID, 
+        COALESCE(c.display_name, ''), 
+        c.chat_identifier,
+        MAX(m.date) as last_msg_date
+    FROM chat c
+    LEFT JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
+    LEFT JOIN message m ON cmj.message_id = m.ROWID
+    GROUP BY c.ROWID
+    ORDER BY last_msg_date DESC
+    LIMIT ?
+    """
+    cursor.execute(query, (args.limit,))
+    rows = cursor.fetchall()
+    
+    print(f"{'ID':<6} | {'Display Name':<30} | {'Identifier':<40}")
+    print("-" * 85)
+    for rowid, display_name, identifier, _ in rows:
+        name = display_name if display_name else "<Direct Chat>"
+        print(f"{rowid:<6} | {name:<30} | {identifier:<40}")
+    conn.close()
+
+def parse_attributed_body(blob):
+    if not blob: return ""
+    try:
+        markers = [
+            b'NSString' + bytes([1, 148, 132, 1]) + b'+',
+            b'NSString' + bytes([1, 149, 132, 1]) + b'+',
+            b'NSString' + bytes([1, 132, 1]) + b'+'
+        ]
+        for marker in markers:
+            idx = blob.find(marker)
+            if idx != -1:
+                start = idx + len(marker)
+                if start < len(blob):
+                    length = blob[start]
+                    if length == 0x81:
+                        if start + 2 < len(blob):
+                            length = blob[start+1]
+                            start += 1
+                    elif length == 0x82:
+                        if start + 3 < len(blob):
+                            length = int.from_bytes(blob[start+1:start+3], byteorder='big')
+                            start += 2
+                    if 0 < length < len(blob) - start:
+                        return blob[start + 1 : start + 1 + length].decode('utf-8', errors='ignore')
+    except: pass
+    return ""
+
+def read_messages(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    target = args.chat
+    
+    chat_ids = []
+    if target.isdigit():
+        chat_ids = [int(target)]
+    else:
+        cursor.execute(
+            "SELECT ROWID FROM chat WHERE display_name LIKE ? OR chat_identifier LIKE ?", 
+            (f"%{target}%", f"%{target}%")
+        )
+        chat_ids = [r[0] for r in cursor.fetchall()]
+        
+    if not chat_ids:
+        print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+        
+    placeholders = ",".join(["?"] * len(chat_ids))
+    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    threshold_dt = now - datetime.timedelta(days=args.days)
+    threshold_ns = int((threshold_dt - apple_epoch).total_seconds() * 1_000_000_000)
+    
+    query = f"""
+    SELECT 
+        m.ROWID,
+        c.display_name,
+        c.chat_identifier,
+        m.date,
+        m.is_from_me,
+        h.id,
+        m.text,
+        m.attributedBody
+    FROM message m
+    JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    JOIN chat c ON cmj.chat_id = c.ROWID
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    WHERE c.ROWID IN ({placeholders}) AND m.date >= ?
+    ORDER BY m.date ASC
+    """
+    cursor.execute(query, (*chat_ids, threshold_ns))
+    rows = cursor.fetchall()
+    
+    msg_ids = [r[0] for r in rows]
+    attachments_map = {}
+    if msg_ids:
+        att_placeholders = ",".join(["?"] * len(msg_ids))
+        att_query = f"""
+        SELECT 
+            maj.message_id,
+            a.filename,
+            a.mime_type,
+            a.transfer_name,
+            a.total_bytes
+        FROM message_attachment_join maj
+        JOIN attachment a ON maj.attachment_id = a.ROWID
+        WHERE maj.message_id IN ({att_placeholders})
+        """
+        cursor.execute(att_query, msg_ids)
+        for msg_id, filename, mime_type, transfer_name, total_bytes in cursor.fetchall():
+            if msg_id not in attachments_map:
+                attachments_map[msg_id] = []
+            attachments_map[msg_id].append({
+                'filename': os.path.expanduser(filename) if filename else None,
+                'mime_type': mime_type or 'application/octet-stream',
+                'transfer_name': transfer_name or 'attachment',
+                'size': format_size(total_bytes)
+            })
+
+    print(f"READING MESSAGES FROM THE LAST {args.days} DAYS FOR '{target}' ({len(rows)} messages found):")
+    print("=" * 85)
+    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body in rows:
+        sec = date_ns / 1_000_000_000
+        dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
+        dt_local = dt_utc.astimezone()
+        ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
+        sender = "Me" if is_from_me else (handle or "Unknown")
+        chat = display_name if display_name else chat_ident
+        msg_text = text or ""
+        if not msg_text or msg_text.strip() == "":
+            msg_text = parse_attributed_body(attr_body)
+        att_list = attachments_map.get(msg_id, [])
+        if att_list:
+            att_strs = []
+            for att in att_list:
+                path_str = f", path: {att['filename']}" if att['filename'] else ""
+                att_strs.append(f"[Attachment: {att['transfer_name']} ({att['mime_type']}, {att['size']}{path_str})]")
+            att_desc = " ".join(att_strs)
+            msg_text = f"{msg_text} {att_desc}".strip() if msg_text else att_desc
+        if not msg_text or msg_text.strip() == "":
+            msg_text = "<empty message>"
+        print(f"[{ts}] [{chat}] {sender}: {msg_text}")
+    conn.close()
+
+def search_messages(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query_str = args.query
+    limit = args.limit
+    
+    query = """
+    SELECT 
+        m.ROWID,
+        c.ROWID as chat_id,
+        c.display_name,
+        c.chat_identifier,
+        m.date,
+        m.is_from_me,
+        h.id,
+        m.text,
+        m.attributedBody
+    FROM message m
+    JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    JOIN chat c ON cmj.chat_id = c.ROWID
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    WHERE m.text LIKE ?
+    ORDER BY m.date DESC
+    LIMIT ?
+    """
+    cursor.execute(query, (f"%{query_str}%", limit))
+    rows = cursor.fetchall()
+    
+    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+    print(f"SEARCH RESULTS FOR '{query_str}' ({len(rows)} matching messages found):")
+    print("=" * 85)
+    for msg_id, chat_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body in rows:
+        sec = date_ns / 1_000_000_000
+        dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
+        dt_local = dt_utc.astimezone()
+        ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
+        sender = "Me" if is_from_me else (handle or "Unknown")
+        chat = display_name if display_name else chat_ident
+        msg_text = text or parse_attributed_body(attr_body) or "<empty message>"
+        print(f"[{ts}] [Chat {chat_id}: {chat}] {sender}: {msg_text}")
+    conn.close()
+
+def search_contacts(args):
+    query = (args.query or "").lower()
+    ab_paths = glob.glob(os.path.expanduser('~/Library/Application Support/AddressBook/**/*.abcddb'), recursive=True)
+    
+    contacts = []
+    for p in ab_paths:
+        try:
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            c = conn.cursor()
+            sql = """
+            SELECT 
+                r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION,
+                p.ZFULLNUMBER, e.ZADDRESS
+            FROM ZABCDRECORD r
+            LEFT JOIN ZABCDPHONENUMBER p ON r.Z_PK = p.ZOWNER
+            LEFT JOIN ZABCDEMAILADDRESS e ON r.Z_PK = e.ZOWNER
+            """
+            c.execute(sql)
+            for fname, lname, org, phone, email in c.fetchall():
+                full_name = " ".join(filter(None, [fname, lname]))
+                search_target = " ".join(filter(None, [full_name, org, phone, email])).lower()
+                if not query or query in search_target:
+                    contacts.append({
+                        'name': full_name or org or "Unknown",
+                        'organization': org or "",
+                        'phone': phone or "",
+                        'email': email or ""
+                    })
+            conn.close()
+        except Exception:
+            pass
+
+    # Deduplicate
+    unique = []
+    seen = set()
+    for c in contacts:
+        key = (c['name'], c['phone'], c['email'])
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+
+    print(f"CONTACT RESULTS ({len(unique)} contacts found):")
+    print(f"{'Name':<25} | {'Organization':<20} | {'Phone':<18} | {'Email':<25}")
+    print("-" * 95)
+    for c in unique[:50]:
+        print(f"{c['name']:<25} | {c['organization']:<20} | {c['phone']:<18} | {c['email']:<25}")
+
+def get_members(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    target = args.chat
+    
+    chat_ids = []
+    if target.isdigit():
+        chat_ids = [int(target)]
+    else:
+        cursor.execute(
+            "SELECT ROWID FROM chat WHERE display_name LIKE ? OR chat_identifier LIKE ?", 
+            (f"%{target}%", f"%{target}%")
+        )
+        chat_ids = [r[0] for r in cursor.fetchall()]
+        
+    if not chat_ids:
+        print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+        
+    placeholders = ",".join(["?"] * len(chat_ids))
+    query = f"""
+    SELECT 
+        c.ROWID,
+        COALESCE(c.display_name, ''),
+        c.chat_identifier,
+        h.id,
+        h.service
+    FROM chat c
+    JOIN chat_handle_join chj ON c.ROWID = chj.chat_id
+    JOIN handle h ON chj.handle_id = h.ROWID
+    WHERE c.ROWID IN ({placeholders})
+    """
+    cursor.execute(query, chat_ids)
+    rows = cursor.fetchall()
+    
+    print(f"MEMBERS FOR CHAT '{target}' ({len(rows)} members):")
+    print(f"{'Chat ID':<8} | {'Chat Name':<25} | {'Handle / Phone':<30} | {'Service':<10}")
+    print("-" * 80)
+    for rowid, display_name, chat_ident, handle_id, service in rows:
+        name = display_name if display_name else chat_ident
+        print(f"{rowid:<8} | {name:<25} | {handle_id:<30} | {service:<10}")
+    conn.close()
+
+def get_attachment_payload(args):
+    filepath = os.path.abspath(os.path.expanduser(args.path))
+    if not os.path.exists(filepath):
+        print(f"ERROR: Attachment file not found at '{filepath}'", file=sys.stderr)
+        sys.exit(1)
+        
+    target_path = filepath
+    mime = "application/octet-stream"
+    ext = os.path.splitext(filepath)[1].lower()
+    
+    if ext in ['.heic', '.heif']:
+        jpg_path = f"/tmp/imessage_conv_{os.path.basename(filepath)}.jpg"
+        subprocess.run(['sips', '-s', 'format', 'jpeg', filepath, '--out', jpg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(jpg_path):
+            target_path = jpg_path
+            mime = "image/jpeg"
+    elif ext in ['.jpg', '.jpeg']:
+        mime = "image/jpeg"
+    elif ext == '.png':
+        mime = "image/png"
+    elif ext == '.gif':
+        mime = "image/gif"
+    elif ext == '.pdf':
+        mime = "application/pdf"
+    elif ext == '.txt':
+        mime = "text/plain"
+
+    with open(target_path, 'rb') as f:
+        data = f.read()
+
+    payload = {
+        'path': filepath,
+        'converted_path': target_path if target_path != filepath else None,
+        'mime_type': mime,
+        'size_bytes': len(data),
+        'base64': base64.b64encode(data).decode('utf-8')
+    }
+    
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"File: {filepath}")
+        print(f"MIME: {mime} ({len(data)} bytes)")
+        print(f"Base64 string length: {len(payload['base64'])} characters")
+
+def send_message(args):
+    recipient = args.recipient
+    message = args.message
+    attachment = args.attachment
+    
+    if attachment:
+        attachment_path = os.path.abspath(os.path.expanduser(attachment))
+        if not os.path.exists(attachment_path):
+            print(f"ERROR: Attachment file not found at '{attachment_path}'", file=sys.stderr)
+            sys.exit(1)
+            
+        swift_script = f"""import Cocoa
+let url = URL(fileURLWithPath: "{attachment_path}")
+let pb = NSPasteboard.general
+pb.clearContents()
+pb.writeObjects([url as NSURL])
+"""
+        subprocess.run(['swift', '-'], input=swift_script, text=True, check=True)
+        
+        msg_str = (message or '').replace('\\', '\\\\').replace('"', '\\"')
+        type_code = f'keystroke "{msg_str}"' if msg_str else ''
+
+        applescript_att = f'''open location "imessage://{recipient}"
+delay 0.8
+tell application "System Events"
+    tell process "Messages"
+        keystroke "v" using {{command down}}
+        delay 0.5
+        {type_code}
+        delay 0.3
+        key code 36
+    end tell
+end tell'''
+        res = subprocess.run(['osascript', '-e', applescript_att], capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"ERROR: Could not paste/send attachment: {res.stderr or res.stdout}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Attachment '{attachment_path}' sent to '{recipient}' successfully!")
+
+    elif message:
+        applescript_msg = """on run argv
+    set recipientIdentifier to item 1 of argv
+    set messageText to item 2 of argv
+    tell application "Messages"
+        send messageText to buddy recipientIdentifier
+    end tell
+end run"""
+        res = subprocess.run(['osascript', '-e', applescript_msg, recipient, message], capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"ERROR: Could not send text message: {res.stderr or res.stdout}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Message sent to '{recipient}' successfully!")
+
+def main():
+    parser = argparse.ArgumentParser(description="iMessage CLI tool for macOS")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    list_parser = subparsers.add_parser("list", help="List active iMessage chats")
+    list_parser.add_argument("--limit", type=int, default=30, help="Number of chats to list (default 30)")
+    list_parser.set_defaults(func=list_chats)
+    
+    read_parser = subparsers.add_parser("read", help="Read recent messages from a chat")
+    read_parser.add_argument("chat", help="Chat ID, display name, or contact identifier")
+    read_parser.add_argument("--days", type=int, default=14, help="Days of history to fetch (default 14)")
+    read_parser.set_defaults(func=read_messages)
+
+    search_parser = subparsers.add_parser("search", help="Search message history")
+    search_parser.add_argument("query", help="Search keyword or phrase")
+    search_parser.add_argument("--limit", type=int, default=30, help="Max results (default 30)")
+    search_parser.set_defaults(func=search_messages)
+
+    contacts_parser = subparsers.add_parser("contacts", help="Search macOS contacts")
+    contacts_parser.add_argument("query", nargs="?", default="", help="Name, phone number, or email search query")
+    contacts_parser.set_defaults(func=search_contacts)
+
+    members_parser = subparsers.add_parser("members", help="Get members of a group chat")
+    members_parser.add_argument("chat", help="Chat ID or chat identifier")
+    members_parser.set_defaults(func=get_members)
+
+    attachment_parser = subparsers.add_parser("attachment", help="Get base64/multimodal attachment payload")
+    attachment_parser.add_argument("path", help="POSIX path to attachment file")
+    attachment_parser.add_argument("--json", action="store_true", help="Output JSON with base64 data")
+    attachment_parser.set_defaults(func=get_attachment_payload)
+
+    send_parser = subparsers.add_parser("send", help="Send an iMessage")
+    send_parser.add_argument("recipient", help="Recipient identifier")
+    send_parser.add_argument("--message", "-m", help="Message text body")
+    send_parser.add_argument("--attachment", "-a", help="POSIX path to attachment file")
+    send_parser.set_defaults(func=send_message)
+    
+    args = parser.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
