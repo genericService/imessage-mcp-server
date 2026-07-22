@@ -190,8 +190,29 @@ const authMiddleware = (req: Request, res: Response, next: NextFunction): void =
   next();
 };
 
+interface HttpSessionRecord {
+  transport: StreamableHTTPServerTransport;
+  server: Server;
+  lastAccess: number;
+}
+
 const sseSessions = new Map<string, { transport: SSEServerTransport; server: Server }>();
-const httpSessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server }>();
+const httpSessions = new Map<string, HttpSessionRecord>();
+
+// Periodically clean up inactive HTTP transport sessions (>30 mins inactive)
+setInterval(async () => {
+  const now = Date.now();
+  const TTL = 30 * 60 * 1000;
+  for (const [sessionId, session] of httpSessions.entries()) {
+    if (now - session.lastAccess > TTL) {
+      console.log(`[MCP Eviction] Cleaning up expired HTTP session: ${sessionId}`);
+      httpSessions.delete(sessionId);
+      try {
+        await session.server.close();
+      } catch (e) {}
+    }
+  }
+}, 5 * 60 * 1000);
 
 /**
  * Root discovery HTML page.
@@ -337,6 +358,7 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
 
   if (reqSessionId && httpSessions.has(reqSessionId)) {
     const session = httpSessions.get(reqSessionId)!;
+    session.lastAccess = Date.now();
     await session.transport.handleRequest(req, res, req.body);
     return;
   }
@@ -355,7 +377,7 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
   await transport.handleRequest(req, res, req.body);
 
   if (generatedSessionId) {
-    httpSessions.set(generatedSessionId, { transport, server });
+    httpSessions.set(generatedSessionId, { transport, server, lastAccess: Date.now() });
     console.log(`[MCP] Registered Streamable HTTP session: ${generatedSessionId}`);
   }
 });
