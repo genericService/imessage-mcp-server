@@ -16,10 +16,19 @@ describe('iMessage MCP Tool Schemas (SDD)', () => {
       'imessage_search_contacts',
       'imessage_get_chat_members',
       'imessage_get_attachment_payload',
-      'imessage_send_message'
+      'imessage_send_message',
+      'imessage_get_readme'
     ];
 
-    expect(requiredTools).toHaveLength(7);
+    expect(requiredTools).toHaveLength(8);
+  });
+
+  it('should have a readable README.md documentation file', async () => {
+    const fs = await import('fs');
+    const readmePath = path.resolve(__dirname, '../README.md');
+    expect(fs.existsSync(readmePath)).toBe(true);
+    const content = fs.readFileSync(readmePath, 'utf8');
+    expect(content).toContain('iMessage MCP Server');
   });
 });
 
