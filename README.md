@@ -110,9 +110,45 @@ pnpm start
 
 ## Client Configuration (`mcp_config.json`)
 
-To connect an AI client (Antigravity, Claude Desktop, Cursor, etc.) to the server over Cloudflare Tunnel or local network:
+To connect an AI client (Antigravity, Cursor, Claude Desktop, etc.) to the iMessage MCP server:
 
-### Streamable HTTP Transport (Recommended)
+### 1. Native Direct HTTP Transport (Recommended)
+
+Modern MCP clients support direct HTTP / SSE transport definitions with custom headers (Bearer token & Cloudflare Access tokens) without any external bridge process:
+
+```json
+{
+  "mcpServers": {
+    "imessage": {
+      "url": "https://imessage.genericservice.app/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_AUTH_TOKEN",
+        "CF-Access-Client-Id": "YOUR_CLIENT_ID.access",
+        "CF-Access-Client-Secret": "YOUR_CLIENT_SECRET"
+      }
+    }
+  }
+}
+```
+
+### 2. Local Network (Direct HTTP)
+
+```json
+{
+  "mcpServers": {
+    "imessage": {
+      "url": "http://localhost:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_AUTH_TOKEN"
+      }
+    }
+  }
+}
+```
+
+### 3. Legacy `mcp-remote` Stdio Bridge (Optional)
+
+If your client only supports `stdio` command execution:
 
 ```json
 {
@@ -123,28 +159,6 @@ To connect an AI client (Antigravity, Claude Desktop, Cursor, etc.) to the serve
         "dlx",
         "mcp-remote",
         "https://imessage.genericservice.app/mcp",
-        "--header",
-        "Authorization: Bearer YOUR_AUTH_TOKEN"
-      ],
-      "trust": true
-    }
-  }
-}
-```
-
-### Local Network / SSE Transport
-
-```json
-{
-  "mcpServers": {
-    "imessage": {
-      "command": "pnpm",
-      "args": [
-        "dlx",
-        "mcp-remote",
-        "http://localhost:8765/sse",
-        "--transport",
-        "sse-only",
         "--header",
         "Authorization: Bearer YOUR_AUTH_TOKEN"
       ],
