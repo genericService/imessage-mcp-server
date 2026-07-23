@@ -17,6 +17,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
   Tool
 } from '@modelcontextprotocol/sdk/types.js';
 
@@ -151,6 +153,15 @@ const TOOLS: Tool[] = [
       },
       required: ['recipient']
     }
+  },
+  {
+    name: 'imessage_get_readme',
+    description:
+      'Retrieve the full iMessage MCP Server README documentation (markdown), setup guides, client configurations, and API signatures.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
   }
 ];
 
@@ -165,7 +176,8 @@ function createMcpServer(): Server {
     },
     {
       capabilities: {
-        tools: {}
+        tools: {},
+        resources: {}
       },
       instructions: `
 iMessage MCP Server Instructions:
@@ -174,6 +186,7 @@ iMessage MCP Server Instructions:
 3. Reading: Call 'imessage_read_messages' using a chat ID or contact identifier to review past messages.
 4. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
 5. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
+6. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
 `.trim()
     }
   );
@@ -182,10 +195,49 @@ iMessage MCP Server Instructions:
     return { tools: TOOLS };
   });
 
+  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    return {
+      resources: [
+        {
+          uri: 'resource://readme',
+          name: 'README.md',
+          description: 'Full iMessage MCP Server Documentation & Usage Guide',
+          mimeType: 'text/markdown'
+        }
+      ]
+    };
+  });
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const { uri } = request.params;
+    if (uri === 'resource://readme' || uri === 'file:///README.md') {
+      const readmePath = path.resolve(__dir, '../README.md');
+      const content = await fs.promises.readFile(readmePath, 'utf8');
+      return {
+        contents: [
+          {
+            uri: 'resource://readme',
+            mimeType: 'text/markdown',
+            text: content
+          }
+        ]
+      };
+    }
+    throw new Error(`Resource not found: ${uri}`);
+  });
+
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
     try {
+      if (name === 'imessage_get_readme') {
+        const readmePath = path.resolve(__dir, '../README.md');
+        const content = await fs.promises.readFile(readmePath, 'utf8');
+        return {
+          content: [{ type: 'text', text: content }]
+        };
+      }
+
       if (name === 'imessage_list_chats') {
         const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 100)) : 30;
         const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'list', '--limit', String(limit), '--json']);
@@ -509,7 +561,7 @@ if (USE_HTTPS) {
     console.log(`=======================================================`);
   });
 } else {
-  http.createServer(app).listen(PORT, '0.0.0.0', () => {
+  http.createServer(app).listen(PORT, () => {
     console.log(`=======================================================`);
     console.log(`iMessage MCP Server running over HTTP:`);
     console.log(`  Discovery Page:      http://0.0.0.0:${PORT}/`);
