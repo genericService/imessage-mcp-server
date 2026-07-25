@@ -74,3 +74,27 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     expect(stdout).toContain('Recipient identifier');
   });
 });
+
+describe('Local Action Audit Logger (Security & Privacy)', () => {
+  it('should write JSON audit event when ENABLE_AUDIT_LOG=true', async () => {
+    const fs = await import('fs');
+    const { logAuditEvent } = await import('../src/audit.js');
+    process.env.ENABLE_AUDIT_LOG = 'true';
+    const auditFile = path.resolve(process.cwd(), 'logs/audit.log');
+
+    logAuditEvent({
+      timestamp: new Date().toISOString(),
+      tool: 'imessage_send_message',
+      target: 'Sarah (+14802016076)',
+      dry_run: true,
+      status: 'success',
+      duration_ms: 42
+    });
+
+    expect(fs.existsSync(auditFile)).toBe(true);
+    const content = fs.readFileSync(auditFile, 'utf8');
+    expect(content).toContain('imessage_send_message');
+    expect(content).toContain('Sarah (+14802016076)');
+    expect(content).not.toContain('message_text');
+  });
+});

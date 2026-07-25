@@ -187,6 +187,25 @@ If your client only supports `stdio` command execution:
 
 ---
 
+## Security & Local Action Audit Logging
+
+To maintain absolute privacy and trauma-informed data autonomy, the server **never** stores or logs personal message text, passwords, or attachment bytes.
+
+If you wish to log AI agent action executions for security auditing, set `ENABLE_AUDIT_LOG=true` in your `.env` file. This appends structured JSON audit lines to `logs/audit.log`:
+
+```json
+{
+  "timestamp": "2026-07-25T00:46:45Z",
+  "tool": "imessage_send_message",
+  "target": "Sarah (+14802016076)",
+  "dry_run": true,
+  "status": "success",
+  "duration_ms": 42
+}
+```
+
+---
+
 ## Known Limitations & Considerations
 
 1. **Host Mac Requirement:** Must run on a physical Mac or macOS VM signed into an active Apple ID.
