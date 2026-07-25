@@ -17,10 +17,12 @@ describe('iMessage MCP Tool Schemas (SDD)', () => {
       'imessage_get_chat_members',
       'imessage_get_attachment_payload',
       'imessage_send_message',
-      'imessage_get_readme'
+      'imessage_get_readme',
+      'imessage_get_recent_messages',
+      'imessage_search_group_chats'
     ];
 
-    expect(requiredTools).toHaveLength(8);
+    expect(requiredTools).toHaveLength(10);
   });
 
   it('should have a readable README.md documentation file', async () => {
@@ -51,6 +53,18 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
 
   it('should return valid JSON when --json flag is passed to imessage contacts', async () => {
     const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'contacts', '', '--json']);
+    const data = JSON.parse(stdout);
+    expect(Array.isArray(data)).toBe(true);
+  });
+
+  it('should return valid JSON for recent messages CLI command', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'recent', '1', '--limit', '2', '--json']);
+    const data = JSON.parse(stdout);
+    expect(Array.isArray(data)).toBe(true);
+  });
+
+  it('should return valid JSON for search-group CLI command', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search-group', 'Sarah', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
   });

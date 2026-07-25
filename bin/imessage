@@ -29,6 +29,41 @@ def format_size(bytes_num):
         bytes_num /= 1024.0
     return f"{bytes_num:.1f} TB"
 
+def normalize_handle(val):
+    if not val: return ""
+    clean = "".join([c for c in val if c.isalnum() or c == '@'])
+    if clean.startswith('1') and len(clean) == 11 and clean.isdigit():
+        clean = clean[1:]
+    return clean.lower()
+
+def get_contacts_map():
+    ab_paths = glob.glob(os.path.expanduser('~/Library/Application Support/AddressBook/**/*.abcddb'), recursive=True)
+    cmap = {}
+    for p in ab_paths:
+        try:
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            c = conn.cursor()
+            sql = """
+            SELECT 
+                r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION,
+                p.ZFULLNUMBER, e.ZADDRESS
+            FROM ZABCDRECORD r
+            LEFT JOIN ZABCDPHONENUMBER p ON r.Z_PK = p.ZOWNER
+            LEFT JOIN ZABCDEMAILADDRESS e ON r.Z_PK = e.ZOWNER
+            """
+            c.execute(sql)
+            for fname, lname, org, phone, email in c.fetchall():
+                full_name = " ".join(filter(None, [fname, lname])) or org or ""
+                if not full_name: continue
+                if phone:
+                    cmap[normalize_handle(phone)] = full_name
+                if email:
+                    cmap[normalize_handle(email)] = full_name
+            conn.close()
+        except Exception:
+            pass
+    return cmap
+
 def list_chats(args):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -48,24 +83,46 @@ def list_chats(args):
     cursor.execute(query, (args.limit,))
     rows = cursor.fetchall()
     
+    cmap = get_contacts_map()
     chats = []
     for rowid, display_name, identifier, last_msg_date in rows:
-        name = display_name if display_name else "<Direct Chat>"
+        cursor.execute("""
+            SELECT h.id
+            FROM chat_handle_join chj
+            JOIN handle h ON chj.handle_id = h.ROWID
+            WHERE chj.chat_id = ?
+        """, (rowid,))
+        handles = [r[0] for r in cursor.fetchall()]
+        
+        participants = []
+        for h in handles:
+            norm = normalize_handle(h)
+            pname = cmap.get(norm, h)
+            participants.append({'name': pname, 'handle': h})
+            
+        if display_name:
+            name = display_name
+        elif participants:
+            name = ", ".join([p['name'] for p in participants])
+        else:
+            name = identifier or "<Direct Chat>"
+
         chats.append({
             'rowid': rowid,
             'display_name': display_name,
             'name': name,
             'identifier': identifier,
-            'last_msg_date': last_msg_date
+            'last_msg_date': last_msg_date,
+            'participants': participants
         })
         
     if getattr(args, 'json', False):
         print(json.dumps(chats, indent=2))
     else:
-        print(f"{'ID':<6} | {'Display Name':<30} | {'Identifier':<40}")
+        print(f"{'ID':<6} | {'Display Name / Participants':<35} | {'Identifier':<35}")
         print("-" * 85)
         for c in chats:
-            print(f"{c['rowid']:<6} | {c['name']:<30} | {c['identifier']:<40}")
+            print(f"{c['rowid']:<6} | {c['name']:<35} | {c['identifier']:<35}")
     conn.close()
 
 def parse_attributed_body(blob):
@@ -506,6 +563,155 @@ end run"""
             sys.exit(1)
         print(f"Message sent to '{recipient}' ({target_ident}) successfully!")
 
+def get_recent_messages(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    target = args.chat
+    limit = getattr(args, 'limit', 5) or 5
+    
+    chat_ids = []
+    if target.isdigit():
+        chat_ids = [int(target)]
+    else:
+        cursor.execute(
+            "SELECT ROWID FROM chat WHERE display_name LIKE ? OR chat_identifier LIKE ?", 
+            (f"%{target}%", f"%{target}%")
+        )
+        chat_ids = [r[0] for r in cursor.fetchall()]
+        
+    if not chat_ids:
+        if getattr(args, 'json', False):
+            print(json.dumps([]))
+            conn.close()
+            return
+        print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+        
+    placeholders = ",".join(["?"] * len(chat_ids))
+    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+    
+    query = f"""
+    SELECT 
+        m.ROWID,
+        c.display_name,
+        c.chat_identifier,
+        m.date,
+        m.is_from_me,
+        h.id,
+        m.text,
+        m.attributedBody
+    FROM message m
+    JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    JOIN chat c ON cmj.chat_id = c.ROWID
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    WHERE c.ROWID IN ({placeholders})
+    ORDER BY m.date DESC
+    LIMIT ?
+    """
+    cursor.execute(query, (*chat_ids, limit))
+    rows = cursor.fetchall()
+    rows.reverse()
+    
+    cmap = get_contacts_map()
+    messages = []
+    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body in rows:
+        sec = date_ns / 1_000_000_000
+        dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
+        dt_local = dt_utc.astimezone()
+        ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
+        
+        sender_name = "Me"
+        if not is_from_me:
+            norm = normalize_handle(handle)
+            sender_name = cmap.get(norm, handle or "Unknown")
+
+        chat = display_name if display_name else chat_ident
+        msg_text = text or ""
+        if not msg_text or msg_text.strip() == "":
+            msg_text = parse_attributed_body(attr_body)
+            
+        messages.append({
+            'msg_id': msg_id,
+            'timestamp': ts,
+            'chat': chat,
+            'sender': sender_name,
+            'handle': handle or "",
+            'is_from_me': bool(is_from_me),
+            'text': msg_text or "<empty message>"
+        })
+
+    if getattr(args, 'json', False):
+        print(json.dumps(messages, indent=2))
+    else:
+        print(f"LAST {len(messages)} RECENT MESSAGES FOR '{target}':")
+        print("=" * 85)
+        for m in messages:
+            print(f"[{m['timestamp']}] {m['sender']}: {m['text']}")
+    conn.close()
+
+def search_group_chats(args):
+    raw_participants = args.participants
+    if isinstance(raw_participants, str):
+        query_participants = [p.strip() for p in raw_participants.split(',') if p.strip()]
+    elif isinstance(raw_participants, list):
+        query_participants = raw_participants
+    else:
+        query_participants = []
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cmap = get_contacts_map()
+
+    cursor.execute("SELECT ROWID, COALESCE(display_name, ''), chat_identifier FROM chat")
+    chats = cursor.fetchall()
+
+    matching_chats = []
+    for rowid, display_name, identifier in chats:
+        cursor.execute("""
+            SELECT h.id
+            FROM chat_handle_join chj
+            JOIN handle h ON chj.handle_id = h.ROWID
+            WHERE chj.chat_id = ?
+        """, (rowid,))
+        handles = [r[0] for r in cursor.fetchall()]
+
+        participants = []
+        participant_search_space = []
+        for h in handles:
+            norm = normalize_handle(h)
+            pname = cmap.get(norm, h)
+            participants.append({'name': pname, 'handle': h})
+            participant_search_space.append(f"{pname} {h}".lower())
+
+        # Check if ALL requested queries match at least one participant in this chat
+        all_matched = True
+        for q in query_participants:
+            q_lower = q.lower()
+            found = any(q_lower in search_str for search_str in participant_search_space)
+            if not found:
+                all_matched = False
+                break
+
+        if all_matched and (handles or display_name):
+            name = display_name if display_name else ", ".join([p['name'] for p in participants])
+            matching_chats.append({
+                'rowid': rowid,
+                'display_name': display_name,
+                'name': name,
+                'identifier': identifier,
+                'participants': participants
+            })
+
+    if getattr(args, 'json', False):
+        print(json.dumps(matching_chats, indent=2))
+    else:
+        print(f"SEARCH GROUP CHATS MATCHING {query_participants} ({len(matching_chats)} chats found):")
+        print("=" * 85)
+        for c in matching_chats:
+            print(f"[{c['rowid']}] {c['name']} ({c['identifier']})")
+    conn.close()
+
 def main():
     parser = argparse.ArgumentParser(description="iMessage CLI tool for macOS")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -521,11 +727,22 @@ def main():
     read_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     read_parser.set_defaults(func=read_messages)
 
+    recent_parser = subparsers.add_parser("recent", help="Get recent messages preview")
+    recent_parser.add_argument("chat", help="Chat ID, display name, or contact identifier")
+    recent_parser.add_argument("--limit", type=int, default=5, help="Number of recent messages to preview (default 5)")
+    recent_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    recent_parser.set_defaults(func=get_recent_messages)
+
     search_parser = subparsers.add_parser("search", help="Search message history")
     search_parser.add_argument("query", help="Search keyword or phrase")
     search_parser.add_argument("--limit", type=int, default=30, help="Max results (default 30)")
     search_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     search_parser.set_defaults(func=search_messages)
+
+    search_group_parser = subparsers.add_parser("search-group", help="Search group chats by participant names/handles")
+    search_group_parser.add_argument("participants", nargs="+", help="Participant names or phone numbers")
+    search_group_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    search_group_parser.set_defaults(func=search_group_chats)
 
     contacts_parser = subparsers.add_parser("contacts", help="Search macOS contacts")
     contacts_parser.add_argument("query", nargs="?", default="", help="Name, phone number, or email search query")

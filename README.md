@@ -174,13 +174,15 @@ If your client only supports `stdio` command execution:
 
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
-| `imessage_list_chats` | List recent conversations, display names, and handles | `limit` (number, default: 30) |
+| `imessage_list_chats` | List recent conversations with AddressBook names and participant sets | `limit` (number, default: 30) |
 | `imessage_read_messages` | Read message history with inline attachment details | `chat` (string, required), `days` (number, default: 14) |
+| `imessage_get_recent_messages` | Preview last N messages to verify thread context before sending | `chat` (string, required), `limit` (number, default: 5) |
 | `imessage_search_messages` | Full-text search across all historical iMessages | `query` (string, required), `limit` (number, default: 30) |
+| `imessage_search_group_chats` | Exact participant set search across group chats | `participants` (array of strings, required) |
 | `imessage_search_contacts` | Search macOS Address Book by name, phone, or email | `query` (string, optional) |
-| `imessage_get_chat_members` | List members and handles in group chats | `chat` (string, required) |
+| `imessage_get_chat_members` | List members and resolved contact names in group chats | `chat` (string, required) |
 | `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (HEIC to JPEG) | `path` (string, required) |
-| `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports text & attachments) | `recipient` (string, required), `message`, `attachment` |
+| `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports dry_run preview & confirm_token) | `recipient` (string, required), `message`, `attachment`, `dry_run`, `confirm_token` |
 | `imessage_get_readme` | Retrieve full server README documentation & usage guide | *(none)* |
 
 ---

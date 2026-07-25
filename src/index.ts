@@ -134,7 +134,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_send_message',
     description:
-      'Send an outbound iMessage to a recipient or existing group chat thread using AppleScript on macOS. Supports text message body and/or file attachments (images, PDFs, documents, audio/video).',
+      'Send an outbound iMessage to a recipient or existing group chat thread using AppleScript on macOS. Supports text message body and/or file attachments (images, PDFs, documents, audio/video). Supports dry_run safety previews with confirmation tokens.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -149,9 +149,52 @@ const TOOLS: Tool[] = [
         attachment: {
           type: 'string',
           description: 'Optional local POSIX file path of an attachment to send (e.g. "/Users/matthias/Pictures/photo.jpg").'
+        },
+        dry_run: {
+          type: 'boolean',
+          description: 'If true, returns a structured safety preview object and confirmation token without sending (default: false).'
+        },
+        confirm_token: {
+          type: 'string',
+          description: 'Confirmation token returned by a previous dry_run preview call to authorize dispatch.'
         }
       },
       required: ['recipient']
+    }
+  },
+  {
+    name: 'imessage_get_recent_messages',
+    description:
+      'Preview the last N recent messages from a chat to quickly verify thread context, participants, and conversation topic before sending a reply.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat: {
+          type: 'string',
+          description: 'Target chat ROWID, display name, or handle (e.g. "46" or "Sarah").'
+        },
+        limit: {
+          type: 'number',
+          description: 'Number of recent messages to preview (default: 5, max: 50).'
+        }
+      },
+      required: ['chat']
+    }
+  },
+  {
+    name: 'imessage_search_group_chats',
+    description:
+      'Search for multi-party group chats matching an exact set of participant names or phone numbers (e.g. ["Sarah", "Susie"]). Returns only threads where all requested participants exist.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        participants: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of participant names or phone numbers to match (e.g. ["Sarah", "Susie"]).'
+        }
+      },
+      required: ['participants']
     }
   },
   {
@@ -164,6 +207,14 @@ const TOOLS: Tool[] = [
     }
   }
 ];
+
+interface PendingSend {
+  recipient: string;
+  message: string;
+  attachment: string;
+  createdAt: number;
+}
+const pendingConfirmTokens = new Map<string, PendingSend>();
 
 /**
  * Creates and configures an instance of the MCP Server.
@@ -278,6 +329,32 @@ iMessage MCP Server Instructions:
         };
       }
 
+
+
+      if (name === 'imessage_get_recent_messages') {
+        const chat = String(args?.chat || '').trim();
+        const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 50)) : 5;
+        if (!chat) {
+          throw new Error('Missing required parameter "chat"');
+        }
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'recent', chat, '--limit', String(limit), '--json']);
+        return {
+          content: [{ type: 'text', text: stdout }]
+        };
+      }
+
+      if (name === 'imessage_search_group_chats') {
+        const raw = args?.participants;
+        const participants: string[] = Array.isArray(raw) ? raw.map(p => String(p).trim()).filter(Boolean) : [];
+        if (participants.length === 0) {
+          throw new Error('Missing required parameter "participants" (non-empty array)');
+        }
+        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search-group', ...participants, '--json']);
+        return {
+          content: [{ type: 'text', text: stdout }]
+        };
+      }
+
       if (name === 'imessage_get_chat_members') {
         const chat = String(args?.chat || '').trim();
         if (!chat) {
@@ -301,9 +378,49 @@ iMessage MCP Server Instructions:
       }
 
       if (name === 'imessage_send_message') {
-        const recipient = String(args?.recipient || '').trim();
-        const message = String(args?.message || '').trim();
-        const attachment = String(args?.attachment || '').trim();
+        const dryRun = Boolean(args?.dry_run);
+        const confirmToken = String(args?.confirm_token || '').trim();
+
+        let recipient = String(args?.recipient || '').trim();
+        let message = String(args?.message || '').trim();
+        let attachment = String(args?.attachment || '').trim();
+
+        if (confirmToken) {
+          const pending = pendingConfirmTokens.get(confirmToken);
+          if (!pending) {
+            throw new Error(`Invalid or expired confirm_token: "${confirmToken}". Please run a new dry_run preview or send directly.`);
+          }
+          pendingConfirmTokens.delete(confirmToken);
+          recipient = pending.recipient;
+          message = pending.message;
+          attachment = pending.attachment;
+        } else if (dryRun) {
+          if (!recipient) throw new Error('Missing required parameter "recipient"');
+          const token = `cf_${crypto.randomBytes(8).toString('hex')}`;
+          pendingConfirmTokens.set(token, { recipient, message, attachment, createdAt: Date.now() });
+
+          let membersOutput = [];
+          try {
+            const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'members', recipient, '--json']);
+            membersOutput = JSON.parse(stdout);
+          } catch {}
+
+          const previewObj = {
+            status: "preview",
+            dry_run: true,
+            target_recipient: recipient,
+            message_text: message || null,
+            attachment: attachment || null,
+            participants: membersOutput,
+            confirm_token: token,
+            instructions: `To dispatch this message, re-call imessage_send_message with confirm_token: "${token}" or dry_run: false.`
+          };
+
+          return {
+            content: [{ type: 'text', text: JSON.stringify(previewObj, null, 2) }]
+          };
+        }
+
         if (!recipient) {
           throw new Error('Missing required parameter "recipient"');
         }
