@@ -35,7 +35,7 @@ const PYTHON_BIN = '/usr/bin/python3';
 const CLI_PATH = path.resolve(__dir, '../bin/imessage');
 
 const PORT = parseInt(process.env.PORT || '8765', 10);
-const AUTH_TOKEN = process.env.BEARER_TOKEN || '51efa996c0dd01bd562e90e1bdcec0064aece4b854ff15909b370057202c3a17';
+const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
 
