@@ -170,6 +170,46 @@ If your client only supports `stdio` command execution:
 
 ---
 
+## OAuth 2.0 Auth Server (CLI & Online Agents)
+
+The server embeds a native **OAuth 2.0 Authorization Server** supporting RFC 8414 metadata, Client Credentials grant, and Authorization Code grant with PKCE for CLI tools (Claude Code, Antigravity CLI, Codex) and online services (ChatGPT Actions, custom GPTs, web apps).
+
+### 1. Server Metadata Endpoint
+* **Discovery URL:** `https://imessage.genericservice.app/.well-known/oauth-authorization-server`
+* **Authorization Endpoint:** `https://imessage.genericservice.app/oauth/authorize`
+* **Token Endpoint:** `https://imessage.genericservice.app/oauth/token`
+
+### 2. Client Credentials Token Exchange (CLI & Headless Agents)
+Agents can exchange `client_id` and `client_secret` for a signed HS256 JWT access token:
+
+```bash
+curl -X POST https://imessage.genericservice.app/oauth/token \
+  -H "Content-Type: application/json" \
+  -d '{
+    "grant_type": "client_credentials",
+    "client_id": "antigravity-cli",
+    "client_secret": "YOUR_SERVICE_SECRET"
+  }'
+```
+
+Returns:
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1Ni...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "ref_5ae1f64eb91...",
+  "scope": "imessage:all"
+}
+```
+
+### 3. Interactive Web & Online Agents (ChatGPT / Web Apps)
+1. Point your client to `https://imessage.genericservice.app/oauth/authorize`.
+2. The user sees a branded authorization consent screen on the Mac host.
+3. Upon approval, the server redirects with an authorization code exchanged at `/oauth/token`.
+
+---
+
 ## Available MCP Tools
 
 | Tool Name | Description | Key Parameters |
