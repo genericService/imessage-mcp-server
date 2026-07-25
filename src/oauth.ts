@@ -5,6 +5,11 @@ const JWT_SECRET = process.env.JWT_SECRET || process.env.BEARER_TOKEN || 'imessa
 const DEFAULT_CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'imessage-cli-client';
 const DEFAULT_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || process.env.BEARER_TOKEN || '51efa996c0dd01bd562e90e1bdcec0064aece4b854ff15909b370057202c3a17';
 
+export const CLIENT_REGISTRY = new Map<string, string>([
+  ['imessage-cli-client', DEFAULT_CLIENT_SECRET],
+  ['ubuntu-remote', process.env.CLIENT_UBUNTU_SECRET || 'REDACTED_UBUNTU_SECRET']
+]);
+
 interface AuthCodeData {
   clientId: string;
   redirectUri: string;
@@ -194,10 +199,12 @@ export function handleTokenPost(req: Request, res: Response) {
 
   // 1. Client Credentials Grant
   if (grantType === 'client_credentials') {
+    const cid = clientId || DEFAULT_CLIENT_ID;
     const reqSecret = clientSecret || req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
+    const registeredSecret = CLIENT_REGISTRY.get(cid);
     
-    // Verify client credentials against configured secret
-    if (clientSecret && clientSecret !== DEFAULT_CLIENT_SECRET && reqSecret !== DEFAULT_CLIENT_SECRET) {
+    // Verify client credentials
+    if (registeredSecret ? reqSecret !== registeredSecret : (reqSecret !== DEFAULT_CLIENT_SECRET)) {
       return res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client credentials.' });
     }
 
