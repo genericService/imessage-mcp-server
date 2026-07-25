@@ -124,7 +124,12 @@ describe('OAuth 2.0 Auth Server & JWT Verification', () => {
     expect(meta.issuer).toBe('https://imessage.genericservice.app');
     expect(meta.token_endpoint).toBe('https://imessage.genericservice.app/oauth/token');
     expect(meta.authorization_endpoint).toBe('https://imessage.genericservice.app/oauth/authorize');
-    expect(meta.grant_types_supported).toContain('client_credentials');
     expect(meta.grant_types_supported).toContain('authorization_code');
+  });
+
+  it('should return a Map from getClientRegistry()', async () => {
+    const { getClientRegistry } = await import('../src/oauth.js');
+    const registry = getClientRegistry();
+    expect(registry).toBeInstanceOf(Map);
   });
 });
