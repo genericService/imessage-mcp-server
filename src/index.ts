@@ -21,6 +21,7 @@ import {
   ReadResourceRequestSchema,
   Tool
 } from '@modelcontextprotocol/sdk/types.js';
+import { logAuditEvent } from './audit.js';
 
 const execFileAsync = promisify(execFile);
 const PYTHON_BIN = '/usr/bin/python3';
@@ -279,105 +280,100 @@ iMessage MCP Server Instructions:
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    const startTime = Date.now();
+    let targetParam: string | undefined = undefined;
+    let dryRunParam: boolean | undefined = undefined;
+
+    if (name === 'imessage_send_message') {
+      targetParam = String(args?.recipient || args?.confirm_token || '');
+      dryRunParam = Boolean(args?.dry_run);
+    } else if (name === 'imessage_read_messages' || name === 'imessage_get_recent_messages' || name === 'imessage_get_chat_members') {
+      targetParam = String(args?.chat || '');
+    } else if (name === 'imessage_search_messages' || name === 'imessage_search_contacts') {
+      targetParam = String(args?.query || '');
+    } else if (name === 'imessage_get_attachment_payload') {
+      targetParam = String(args?.path || '');
+    }
 
     try {
+      let result: { content: { type: string; text: string }[]; isError?: boolean };
       if (name === 'imessage_get_readme') {
         const readmePath = path.resolve(__dir, '../README.md');
         const content = await fs.promises.readFile(readmePath, 'utf8');
-        return {
+        result = {
           content: [{ type: 'text', text: content }]
         };
-      }
-
-      if (name === 'imessage_list_chats') {
+      } else if (name === 'imessage_list_chats') {
         const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 100)) : 30;
         const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'list', '--limit', String(limit), '--json']);
-        return {
+        result = {
           content: [{ type: 'text', text: stdout }]
         };
-      }
-
-      if (name === 'imessage_read_messages') {
+      } else if (name === 'imessage_read_messages') {
         const chat = String(args?.chat || '').trim();
         const days = typeof args?.days === 'number' ? Math.max(1, Math.min(Math.floor(args.days), 365)) : 14;
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
         const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'read', chat, '--days', String(days), '--json']);
-        return {
+        result = {
           content: [{ type: 'text', text: stdout }]
         };
-      }
-
-      if (name === 'imessage_search_messages') {
+      } else if (name === 'imessage_search_messages') {
         const query = String(args?.query || '').trim();
         const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 100)) : 30;
         if (!query) {
           throw new Error('Missing required parameter "query"');
         }
         const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search', query, '--limit', String(limit), '--json']);
-        return {
+        result = {
           content: [{ type: 'text', text: stdout }]
         };
-      }
-
-      if (name === 'imessage_search_contacts') {
+      } else if (name === 'imessage_search_contacts') {
         const query = String(args?.query || '').trim();
         const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'contacts', query, '--json']);
-        return {
+        result = {
           content: [{ type: 'text', text: stdout }]
         };
-      }
-
-
-
-      if (name === 'imessage_get_recent_messages') {
+      } else if (name === 'imessage_get_recent_messages') {
         const chat = String(args?.chat || '').trim();
         const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 50)) : 5;
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
         const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'recent', chat, '--limit', String(limit), '--json']);
-        return {
+        result = {
           content: [{ type: 'text', text: stdout }]
         };
-      }
-
-      if (name === 'imessage_search_group_chats') {
+      } else if (name === 'imessage_search_group_chats') {
         const raw = args?.participants;
         const participants: string[] = Array.isArray(raw) ? raw.map(p => String(p).trim()).filter(Boolean) : [];
         if (participants.length === 0) {
           throw new Error('Missing required parameter "participants" (non-empty array)');
         }
         const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search-group', ...participants, '--json']);
-        return {
+        result = {
           content: [{ type: 'text', text: stdout }]
         };
-      }
-
-      if (name === 'imessage_get_chat_members') {
+      } else if (name === 'imessage_get_chat_members') {
         const chat = String(args?.chat || '').trim();
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
         const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'members', chat, '--json']);
-        return {
+        result = {
           content: [{ type: 'text', text: stdout }]
         };
-      }
-
-      if (name === 'imessage_get_attachment_payload') {
+      } else if (name === 'imessage_get_attachment_payload') {
         const filePath = String(args?.path || '').trim();
         if (!filePath) {
           throw new Error('Missing required parameter "path"');
         }
         const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'attachment', filePath, '--json']);
-        return {
+        result = {
           content: [{ type: 'text', text: stdout }]
         };
-      }
-
-      if (name === 'imessage_send_message') {
+      } else if (name === 'imessage_send_message') {
         const dryRun = Boolean(args?.dry_run);
         const confirmToken = String(args?.confirm_token || '').trim();
 
@@ -394,7 +390,9 @@ iMessage MCP Server Instructions:
           recipient = pending.recipient;
           message = pending.message;
           attachment = pending.attachment;
-        } else if (dryRun) {
+        }
+
+        if (dryRun && !confirmToken) {
           if (!recipient) throw new Error('Missing required parameter "recipient"');
           const token = `cf_${crypto.randomBytes(8).toString('hex')}`;
           pendingConfirmTokens.set(token, { recipient, message, attachment, createdAt: Date.now() });
@@ -416,27 +414,46 @@ iMessage MCP Server Instructions:
             instructions: `To dispatch this message, re-call imessage_send_message with confirm_token: "${token}" or dry_run: false.`
           };
 
-          return {
+          result = {
             content: [{ type: 'text', text: JSON.stringify(previewObj, null, 2) }]
           };
+        } else {
+          if (!recipient) {
+            throw new Error('Missing required parameter "recipient"');
+          }
+
+          const cliArgs = [CLI_PATH, 'send', recipient];
+          if (message) cliArgs.push('-m', message);
+          if (attachment) cliArgs.push('-a', attachment);
+
+          const { stdout } = await execFileAsync(PYTHON_BIN, cliArgs);
+          result = {
+            content: [{ type: 'text', text: stdout }]
+          };
         }
-
-        if (!recipient) {
-          throw new Error('Missing required parameter "recipient"');
-        }
-
-        const cliArgs = [CLI_PATH, 'send', recipient];
-        if (message) cliArgs.push('-m', message);
-        if (attachment) cliArgs.push('-a', attachment);
-
-        const { stdout } = await execFileAsync(PYTHON_BIN, cliArgs);
-        return {
-          content: [{ type: 'text', text: stdout }]
-        };
+      } else {
+        throw new Error(`Unknown tool: ${name}`);
       }
 
-      throw new Error(`Unknown tool: ${name}`);
+      logAuditEvent({
+        timestamp: new Date().toISOString(),
+        tool: name,
+        target: targetParam,
+        dry_run: dryRunParam,
+        status: 'success',
+        duration_ms: Date.now() - startTime
+      });
+      return result;
     } catch (error: any) {
+      logAuditEvent({
+        timestamp: new Date().toISOString(),
+        tool: name,
+        target: targetParam,
+        dry_run: dryRunParam,
+        status: 'error',
+        duration_ms: Date.now() - startTime,
+        error_message: error.message || String(error)
+      });
       console.error(`[MCP Tool Error] ${name}:`, error);
       return {
         content: [{ type: 'text', text: `Error executing ${name}: ${error.message || String(error)}` }],
