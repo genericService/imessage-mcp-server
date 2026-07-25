@@ -27,7 +27,8 @@ import {
   handleAuthorizeGet,
   handleAuthorizePost,
   handleTokenPost,
-  verifyJwt
+  verifyJwt,
+  getClientRegistry
 } from './oauth.js';
 
 const execFileAsync = promisify(execFile);
@@ -526,12 +527,21 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
     return;
   }
 
-  // 1. Static Bearer token check (backward compatibility)
+  // 1. Static Master Bearer token check (backward compatibility)
   if (token === AUTH_TOKEN) {
     return next();
   }
 
-  // 2. OAuth 2.0 JWT verification
+  // 2. Client Registry secret token check (e.g. ubuntu-remote)
+  const registry = getClientRegistry();
+  for (const [clientId, clientSecret] of registry.entries()) {
+    if (token === clientSecret) {
+      (req as any).user = { sub: clientId, scope: 'imessage:all' };
+      return next();
+    }
+  }
+
+  // 3. OAuth 2.0 JWT verification
   const jwtPayload = verifyJwt(token);
   if (jwtPayload) {
     (req as any).user = jwtPayload;

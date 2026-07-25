@@ -3,14 +3,17 @@ import { Request, Response, NextFunction } from 'express';
 
 const JWT_SECRET = process.env.JWT_SECRET || process.env.BEARER_TOKEN || crypto.randomBytes(32).toString('hex');
 const DEFAULT_CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'imessage-cli-client';
-const DEFAULT_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || process.env.BEARER_TOKEN;
 
-export const CLIENT_REGISTRY = new Map<string, string>();
-if (DEFAULT_CLIENT_SECRET) {
-  CLIENT_REGISTRY.set('imessage-cli-client', DEFAULT_CLIENT_SECRET);
-}
-if (process.env.CLIENT_UBUNTU_SECRET) {
-  CLIENT_REGISTRY.set('ubuntu-remote', process.env.CLIENT_UBUNTU_SECRET);
+export function getClientRegistry(): Map<string, string> {
+  const registry = new Map<string, string>();
+  const defaultSecret = process.env.OAUTH_CLIENT_SECRET || process.env.BEARER_TOKEN;
+  if (defaultSecret) {
+    registry.set('imessage-cli-client', defaultSecret);
+  }
+  if (process.env.CLIENT_UBUNTU_SECRET) {
+    registry.set('ubuntu-remote', process.env.CLIENT_UBUNTU_SECRET);
+  }
+  return registry;
 }
 
 interface AuthCodeData {
@@ -204,10 +207,12 @@ export function handleTokenPost(req: Request, res: Response) {
   if (grantType === 'client_credentials') {
     const cid = clientId || DEFAULT_CLIENT_ID;
     const reqSecret = clientSecret || req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
-    const registeredSecret = CLIENT_REGISTRY.get(cid);
+    const registry = getClientRegistry();
+    const registeredSecret = registry.get(cid);
+    const defaultSecret = process.env.OAUTH_CLIENT_SECRET || process.env.BEARER_TOKEN;
     
     // Verify client credentials
-    if (registeredSecret ? reqSecret !== registeredSecret : (reqSecret !== DEFAULT_CLIENT_SECRET)) {
+    if (registeredSecret ? reqSecret !== registeredSecret : (reqSecret !== defaultSecret)) {
       return res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client credentials.' });
     }
 
