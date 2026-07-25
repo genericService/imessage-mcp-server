@@ -98,3 +98,33 @@ describe('Local Action Audit Logger (Security & Privacy)', () => {
     expect(content).not.toContain('message_text');
   });
 });
+
+describe('OAuth 2.0 Auth Server & JWT Verification', () => {
+  it('should sign and verify valid HS256 JWT tokens', async () => {
+    const { signJwt, verifyJwt } = await import('../src/oauth.js');
+    const token = signJwt({ sub: 'test-agent', scope: 'imessage:all' }, 3600);
+    expect(typeof token).toBe('string');
+    expect(token.split('.')).toHaveLength(3);
+
+    const payload = verifyJwt(token);
+    expect(payload).not.toBeNull();
+    expect(payload?.sub).toBe('test-agent');
+    expect(payload?.scope).toBe('imessage:all');
+  });
+
+  it('should reject invalid or tampered JWT tokens', async () => {
+    const { verifyJwt } = await import('../src/oauth.js');
+    expect(verifyJwt('invalid.token.string')).toBeNull();
+    expect(verifyJwt('eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.tampered_signature')).toBeNull();
+  });
+
+  it('should generate RFC 8414 OAuth server metadata', async () => {
+    const { getOAuthMetadata } = await import('../src/oauth.js');
+    const meta = getOAuthMetadata('https://imessage.genericservice.app');
+    expect(meta.issuer).toBe('https://imessage.genericservice.app');
+    expect(meta.token_endpoint).toBe('https://imessage.genericservice.app/oauth/token');
+    expect(meta.authorization_endpoint).toBe('https://imessage.genericservice.app/oauth/authorize');
+    expect(meta.grant_types_supported).toContain('client_credentials');
+    expect(meta.grant_types_supported).toContain('authorization_code');
+  });
+});

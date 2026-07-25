@@ -22,15 +22,22 @@ import {
   Tool
 } from '@modelcontextprotocol/sdk/types.js';
 import { logAuditEvent } from './audit.js';
+import {
+  getOAuthMetadata,
+  handleAuthorizeGet,
+  handleAuthorizePost,
+  handleTokenPost,
+  verifyJwt
+} from './oauth.js';
 
 const execFileAsync = promisify(execFile);
 const PYTHON_BIN = '/usr/bin/python3';
-const CLI_PATH = '/Users/matthias/bin/imessage';
+const CLI_PATH = path.resolve(__dir, '../bin/imessage');
 
 const PORT = parseInt(process.env.PORT || '8765', 10);
-const AUTH_TOKEN = process.env.AUTH_TOKEN || crypto.randomBytes(16).toString('hex');
+const AUTH_TOKEN = process.env.BEARER_TOKEN || '51efa996c0dd01bd562e90e1bdcec0064aece4b854ff15909b370057202c3a17';
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
-const PUBLIC_DOMAIN = 'imessage.genericservice.app';
+const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
 
 /**
  * Detailed MCP tool definitions for iMessage integration.
@@ -468,6 +475,19 @@ iMessage MCP Server Instructions:
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+/**
+ * OAuth 2.0 Authorization Server Endpoints
+ */
+app.get('/.well-known/oauth-authorization-server', (_req, res) => {
+  const publicBase = `https://${PUBLIC_DOMAIN}`;
+  res.json(getOAuthMetadata(publicBase));
+});
+
+app.get('/oauth/authorize', handleAuthorizeGet);
+app.post('/oauth/authorize', handleAuthorizePost);
+app.post('/oauth/token', handleTokenPost);
 
 const sseSessions = new Map<string, { transport: SSEServerTransport; server: Server }>();
 const httpSessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server; lastAccess: number }>();
@@ -485,22 +505,40 @@ setInterval(() => {
 }, 60000);
 
 /**
- * Middleware for Bearer Token Authentication
+ * Enhanced Middleware for Bearer Token & OAuth JWT Authentication
  */
 function authMiddleware(req: Request, res: Response, next: NextFunction): void {
+  if (['/', '/health', '/discover', '/.well-known/oauth-authorization-server'].includes(req.path) || req.path.startsWith('/oauth/')) {
+    return next();
+  }
+
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Unauthorized: Missing or invalid Authorization header' });
+  let token: string | null = null;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.substring(7);
+  } else if (req.query.token && typeof req.query.token === 'string') {
+    token = req.query.token;
+  }
+
+  if (!token) {
+    res.status(401).json({ error: 'Unauthorized: Missing or invalid Authorization header or ?token parameter' });
     return;
   }
 
-  const token = authHeader.substring(7);
-  if (token !== AUTH_TOKEN) {
-    res.status(403).json({ error: 'Forbidden: Invalid bearer token' });
-    return;
+  // 1. Static Bearer token check (backward compatibility)
+  if (token === AUTH_TOKEN) {
+    return next();
   }
 
-  next();
+  // 2. OAuth 2.0 JWT verification
+  const jwtPayload = verifyJwt(token);
+  if (jwtPayload) {
+    (req as any).user = jwtPayload;
+    return next();
+  }
+
+  res.status(403).json({ error: 'Forbidden: Invalid bearer token or expired OAuth JWT' });
 }
 
 /**
