@@ -134,13 +134,13 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_send_message',
     description:
-      'Send an outbound iMessage to a recipient using AppleScript on macOS. Supports text message body and/or file attachments (images, PDFs, documents, audio/video).',
+      'Send an outbound iMessage to a recipient or existing group chat thread using AppleScript on macOS. Supports text message body and/or file attachments (images, PDFs, documents, audio/video).',
     inputSchema: {
       type: 'object',
       properties: {
         recipient: {
           type: 'string',
-          description: "Recipient's phone number or email address (e.g., '+14802998607' or 'user@example.com')."
+          description: "Target recipient phone number, email address, group chat display name, or numeric chat ROWID (e.g. '+14802998607', 'user@example.com', '46', or 'chat619850043729068762')."
         },
         message: {
           type: 'string',

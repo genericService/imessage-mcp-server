@@ -426,6 +426,25 @@ def send_message(args):
     recipient = args.recipient
     message = args.message
     attachment = args.attachment
+
+    # Resolve recipient against chat.db (group chats, display names, or numeric ROWIDs)
+    target_ident = recipient
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        if recipient.isdigit():
+            c.execute("SELECT chat_identifier FROM chat WHERE ROWID = ?", (int(recipient),))
+            row = c.fetchone()
+            if row and row[0]:
+                target_ident = row[0]
+        else:
+            c.execute("SELECT chat_identifier FROM chat WHERE display_name LIKE ? OR chat_identifier = ?", (f"%{recipient}%", recipient))
+            row = c.fetchone()
+            if row and row[0]:
+                target_ident = row[0]
+        conn.close()
+    except Exception:
+        pass
     
     if attachment:
         attachment_path = os.path.abspath(os.path.expanduser(attachment))
@@ -444,7 +463,7 @@ pb.writeObjects([url as NSURL])
         msg_str = (message or '').replace('\\', '\\\\').replace('"', '\\"')
         type_code = f'keystroke "{msg_str}"' if msg_str else ''
 
-        applescript_att = f'''open location "imessage://{recipient}"
+        applescript_att = f'''open location "imessage://{target_ident}"
 delay 0.8
 tell application "System Events"
     tell process "Messages"
@@ -459,21 +478,33 @@ end tell'''
         if res.returncode != 0:
             print(f"ERROR: Could not paste/send attachment: {res.stderr or res.stdout}", file=sys.stderr)
             sys.exit(1)
-        print(f"Attachment '{attachment_path}' sent to '{recipient}' successfully!")
+        print(f"Attachment '{attachment_path}' sent to '{recipient}' ({target_ident}) successfully!")
 
     elif message:
         applescript_msg = """on run argv
-    set recipientIdentifier to item 1 of argv
-    set messageText to item 2 of argv
+    set chatIdent to item 1 of argv
+    set rawRecipient to item 2 of argv
+    set messageText to item 3 of argv
     tell application "Messages"
-        send messageText to buddy recipientIdentifier
+        try
+            set targetChat to first chat whose id contains chatIdent or guid contains chatIdent
+            send messageText to targetChat
+            return
+        on error
+        end try
+        try
+            send messageText to buddy chatIdent
+            return
+        on error
+        end try
+        send messageText to buddy rawRecipient
     end tell
 end run"""
-        res = subprocess.run(['osascript', '-e', applescript_msg, recipient, message], capture_output=True, text=True)
+        res = subprocess.run(['osascript', '-e', applescript_msg, target_ident, recipient, message], capture_output=True, text=True)
         if res.returncode != 0:
             print(f"ERROR: Could not send text message: {res.stderr or res.stdout}", file=sys.stderr)
             sys.exit(1)
-        print(f"Message sent to '{recipient}' successfully!")
+        print(f"Message sent to '{recipient}' ({target_ident}) successfully!")
 
 def main():
     parser = argparse.ArgumentParser(description="iMessage CLI tool for macOS")
