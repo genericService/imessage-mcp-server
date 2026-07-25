@@ -1,14 +1,17 @@
 import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 
-const JWT_SECRET = process.env.JWT_SECRET || process.env.BEARER_TOKEN || 'imessage-mcp-default-secret-key-change-me';
+const JWT_SECRET = process.env.JWT_SECRET || process.env.BEARER_TOKEN || crypto.randomBytes(32).toString('hex');
 const DEFAULT_CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'imessage-cli-client';
-const DEFAULT_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || process.env.BEARER_TOKEN || 'REDACTED_FALLBACK_TOKEN';
+const DEFAULT_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || process.env.BEARER_TOKEN;
 
-export const CLIENT_REGISTRY = new Map<string, string>([
-  ['imessage-cli-client', DEFAULT_CLIENT_SECRET],
-  ['ubuntu-remote', process.env.CLIENT_UBUNTU_SECRET || 'REDACTED_UBUNTU_SECRET']
-]);
+export const CLIENT_REGISTRY = new Map<string, string>();
+if (DEFAULT_CLIENT_SECRET) {
+  CLIENT_REGISTRY.set('imessage-cli-client', DEFAULT_CLIENT_SECRET);
+}
+if (process.env.CLIENT_UBUNTU_SECRET) {
+  CLIENT_REGISTRY.set('ubuntu-remote', process.env.CLIENT_UBUNTU_SECRET);
+}
 
 interface AuthCodeData {
   clientId: string;
