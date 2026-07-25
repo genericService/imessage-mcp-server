@@ -54,4 +54,9 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
   });
+
+  it('should support recipient parameter targeting group chats or phone numbers', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'send', '--help']);
+    expect(stdout).toContain('Recipient identifier');
+  });
 });

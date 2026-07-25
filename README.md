@@ -180,7 +180,7 @@ If your client only supports `stdio` command execution:
 | `imessage_search_contacts` | Search macOS Address Book by name, phone, or email | `query` (string, optional) |
 | `imessage_get_chat_members` | List members and handles in group chats | `chat` (string, required) |
 | `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (HEIC to JPEG) | `path` (string, required) |
-| `imessage_send_message` | Send iMessage (supports text & single-bubble attachments) | `recipient` (string, required), `message`, `attachment` |
+| `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports text & attachments) | `recipient` (string, required), `message`, `attachment` |
 | `imessage_get_readme` | Retrieve full server README documentation & usage guide | *(none)* |
 
 ---
