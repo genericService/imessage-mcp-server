@@ -3,8 +3,14 @@ import path from 'path';
 
 export interface AuditEvent {
   timestamp: string;
+  type?: 'tool_call' | 'http_connection';
   client_id?: string;
-  tool: string;
+  client_ip?: string;
+  user_agent?: string;
+  method?: string;
+  path?: string;
+  status_code?: number;
+  tool?: string;
   target?: string;
   dry_run?: boolean;
   status: 'success' | 'error';

@@ -481,6 +481,34 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 /**
+ * Network Connection Audit Middleware
+ */
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const startTime = Date.now();
+  const rawIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0] || req.socket.remoteAddress || 'unknown';
+  const clientIp = rawIp.replace(/^::ffff:/, '');
+  const userAgent = req.headers['user-agent'] || 'unknown';
+
+  res.on('finish', () => {
+    if (req.path.startsWith('/mcp') || req.path.startsWith('/sse') || req.path.startsWith('/oauth') || req.path === '/health') {
+      logAuditEvent({
+        timestamp: new Date().toISOString(),
+        type: 'http_connection',
+        client_id: (req as any).user?.sub || (req.headers.authorization ? 'master-token' : 'anonymous'),
+        client_ip: clientIp,
+        user_agent: userAgent,
+        method: req.method,
+        path: req.path,
+        status_code: res.statusCode,
+        status: res.statusCode < 400 ? 'success' : 'error',
+        duration_ms: Date.now() - startTime
+      });
+    }
+  });
+  next();
+});
+
+/**
  * OAuth 2.0 Authorization Server Endpoints
  */
 app.get('/.well-known/oauth-authorization-server', (_req, res) => {

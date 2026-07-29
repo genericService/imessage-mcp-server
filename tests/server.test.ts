@@ -97,6 +97,31 @@ describe('Local Action Audit Logger (Security & Privacy)', () => {
     expect(content).toContain('Sarah (+14802016076)');
     expect(content).not.toContain('message_text');
   });
+
+  it('should write http_connection audit events', async () => {
+    const fs = await import('fs');
+    const { logAuditEvent } = await import('../src/audit.js');
+    process.env.ENABLE_AUDIT_LOG = 'true';
+    const auditFile = path.resolve(process.cwd(), 'logs/audit.log');
+
+    logAuditEvent({
+      timestamp: new Date().toISOString(),
+      type: 'http_connection',
+      client_id: 'ubuntu-remote',
+      client_ip: '192.168.1.50',
+      user_agent: 'AntigravityCLI/1.0',
+      method: 'POST',
+      path: '/mcp',
+      status_code: 200,
+      status: 'success',
+      duration_ms: 12
+    });
+
+    const content = fs.readFileSync(auditFile, 'utf8');
+    expect(content).toContain('http_connection');
+    expect(content).toContain('ubuntu-remote');
+    expect(content).toContain('192.168.1.50');
+  });
 });
 
 describe('OAuth 2.0 Auth Server & JWT Verification', () => {
