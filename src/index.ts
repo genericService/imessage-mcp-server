@@ -286,7 +286,7 @@ iMessage MCP Server Instructions:
     throw new Error(`Resource not found: ${uri}`);
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: args } = request.params;
     const startTime = Date.now();
     let targetParam: string | undefined = undefined;
@@ -445,6 +445,7 @@ iMessage MCP Server Instructions:
 
       logAuditEvent({
         timestamp: new Date().toISOString(),
+        client_id: (extra as any)?.user?.sub || 'master-token',
         tool: name,
         target: targetParam,
         dry_run: dryRunParam,
@@ -455,6 +456,7 @@ iMessage MCP Server Instructions:
     } catch (error: any) {
       logAuditEvent({
         timestamp: new Date().toISOString(),
+        client_id: (extra as any)?.user?.sub || 'master-token',
         tool: name,
         target: targetParam,
         dry_run: dryRunParam,
