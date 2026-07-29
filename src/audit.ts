@@ -3,6 +3,7 @@ import path from 'path';
 
 export interface AuditEvent {
   timestamp: string;
+  client_id?: string;
   tool: string;
   target?: string;
   dry_run?: boolean;
