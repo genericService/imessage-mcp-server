@@ -158,3 +158,10 @@ describe('OAuth 2.0 Auth Server & JWT Verification', () => {
     expect(registry).toBeInstanceOf(Map);
   });
 });
+
+describe('MCP 2026-07-28 Spec Compliance', () => {
+  it('should declare protocol version 2026-07-28 and support stateless discovery', async () => {
+    const { SPEC_VERSION } = await import('../src/index.js');
+    expect(SPEC_VERSION).toBe('2026-07-28');
+  });
+});
