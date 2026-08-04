@@ -41,6 +41,11 @@ const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
 
 /**
+ * 2026-07-28 Model Context Protocol Specification Version
+ */
+export const SPEC_VERSION = '2026-07-28';
+
+/**
  * Detailed MCP tool definitions for iMessage integration.
  */
 const TOOLS: Tool[] = [
@@ -252,7 +257,11 @@ iMessage MCP Server Instructions:
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: TOOLS };
+    return {
+      tools: TOOLS,
+      ttlMs: 300000,
+      cacheScope: 'client'
+    } as any;
   });
 
   server.setRequestHandler(ListResourcesRequestSchema, async () => {
@@ -481,7 +490,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 /**
- * Network Connection Audit Middleware
+ * Network Connection Audit Middleware & 2026-07-28 Header Compliance
  */
 app.use((req: Request, res: Response, next: NextFunction) => {
   const startTime = Date.now();
@@ -489,15 +498,26 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   const clientIp = rawIp.replace(/^::ffff:/, '');
   const userAgent = req.headers['user-agent'] || 'unknown';
 
+  // 2026-07-28 Header-based routing compliance
+  res.setHeader('MCP-Protocol-Version', SPEC_VERSION);
+  const mcpMethod = req.headers['mcp-method'] || req.headers['x-mcp-method'];
+  const mcpName = req.headers['mcp-name'] || req.headers['x-mcp-name'];
+  if (mcpMethod && typeof mcpMethod === 'string') {
+    res.setHeader('Mcp-Method', mcpMethod);
+  }
+  if (mcpName && typeof mcpName === 'string') {
+    res.setHeader('Mcp-Name', mcpName);
+  }
+
   res.on('finish', () => {
-    if (req.path.startsWith('/mcp') || req.path.startsWith('/sse') || req.path.startsWith('/oauth') || req.path === '/health') {
+    if (req.path.startsWith('/mcp') || req.path.startsWith('/sse') || req.path.startsWith('/oauth') || req.path === '/health' || req.path === '/discover') {
       logAuditEvent({
         timestamp: new Date().toISOString(),
         type: 'http_connection',
         client_id: (req as any).user?.sub || (req.headers.authorization ? 'master-token' : 'anonymous'),
         client_ip: clientIp,
         user_agent: userAgent,
-        method: req.method,
+        method: (mcpMethod as string) || req.method,
         path: req.path,
         status_code: res.statusCode,
         status: res.statusCode < 400 ? 'success' : 'error',
@@ -647,6 +667,7 @@ app.get('/health', (_req, res) => {
     status: 'ok',
     server: 'imessage-mcp-server',
     version: '1.1.0',
+    mcpProtocolVersion: SPEC_VERSION,
     publicDomain: PUBLIC_DOMAIN,
     activeSseSessions: sseSessions.size,
     activeHttpSessions: httpSessions.size,
@@ -655,24 +676,41 @@ app.get('/health', (_req, res) => {
 });
 
 /**
- * Structured discovery JSON endpoint.
+ * Structured discovery JSON endpoint (2026-07-28 Spec Compliant).
  */
 app.get('/discover', (_req, res) => {
   const publicBase = `https://${PUBLIC_DOMAIN}`;
   res.json({
     name: 'imessage-mcp-server',
     version: '1.1.0',
-    description: 'iMessage MCP Server over HTTP/HTTPS and SSE for macOS',
+    mcpProtocolVersion: SPEC_VERSION,
+    description: 'iMessage MCP Server over HTTP/HTTPS and SSE for macOS (Stateless & MRTR Enabled)',
     publicDomain: PUBLIC_DOMAIN,
+    capabilities: {
+      tools: {
+        listChanged: true,
+        ttlMs: 300000,
+        cacheScope: 'client'
+      },
+      resources: {
+        subscribe: false,
+        listChanged: false
+      },
+      prompts: {
+        listChanged: false
+      }
+    },
     endpoints: {
       streamableHttp: `${publicBase}/mcp`,
       sse: `${publicBase}/sse`,
       health: `${publicBase}/health`,
-      discover: `${publicBase}/discover`
+      discover: `${publicBase}/discover`,
+      oauthMetadata: `${publicBase}/.well-known/oauth-authorization-server`
     },
     auth: {
       type: 'bearer',
-      header: 'Authorization: Bearer <TOKEN>'
+      header: 'Authorization: Bearer <TOKEN>',
+      grantTypesSupported: ['client_credentials', 'authorization_code']
     },
     tools: TOOLS
   });
@@ -748,38 +786,40 @@ app.post('/messages', authMiddleware, async (req, res) => {
   await session.transport.handlePostMessage(req, res);
 });
 
-if (USE_HTTPS) {
-  const certDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'certs');
-  const certPath = path.join(certDir, 'server.crt');
-  const keyPath = path.join(certDir, 'server.key');
+if (process.env.NODE_ENV !== 'test') {
+  if (USE_HTTPS) {
+    const certDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'certs');
+    const certPath = path.join(certDir, 'server.crt');
+    const keyPath = path.join(certDir, 'server.key');
 
-  if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
-    console.error(`HTTPS enabled but certificate files not found at ${certPath} and ${keyPath}.`);
-    process.exit(1);
+    if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
+      console.error(`HTTPS enabled but certificate files not found at ${certPath} and ${keyPath}.`);
+      process.exit(1);
+    }
+
+    const options = {
+      key: fs.readFileSync(keyPath),
+      cert: fs.readFileSync(certPath)
+    };
+
+    https.createServer(options, app).listen(PORT, () => {
+      console.log(`=======================================================`);
+      console.log(`iMessage MCP Server running over HTTPS:`);
+      console.log(`  Discovery Page:      https://0.0.0.0:${PORT}/`);
+      console.log(`  Streamable HTTP:     https://0.0.0.0:${PORT}/mcp`);
+      console.log(`  SSE Transport:        https://0.0.0.0:${PORT}/sse`);
+      console.log(`  Bearer Token:        ${AUTH_TOKEN}`);
+      console.log(`=======================================================`);
+    });
+  } else {
+    http.createServer(app).listen(PORT, () => {
+      console.log(`=======================================================`);
+      console.log(`iMessage MCP Server running over HTTP:`);
+      console.log(`  Discovery Page:      http://0.0.0.0:${PORT}/`);
+      console.log(`  Streamable HTTP:     http://0.0.0.0:${PORT}/mcp`);
+      console.log(`  SSE Transport:        http://0.0.0.0:${PORT}/sse`);
+      console.log(`  Bearer Token:        ${AUTH_TOKEN}`);
+      console.log(`=======================================================`);
+    });
   }
-
-  const options = {
-    key: fs.readFileSync(keyPath),
-    cert: fs.readFileSync(certPath)
-  };
-
-  https.createServer(options, app).listen(PORT, () => {
-    console.log(`=======================================================`);
-    console.log(`iMessage MCP Server running over HTTPS:`);
-    console.log(`  Discovery Page:      https://0.0.0.0:${PORT}/`);
-    console.log(`  Streamable HTTP:     https://0.0.0.0:${PORT}/mcp`);
-    console.log(`  SSE Transport:        https://0.0.0.0:${PORT}/sse`);
-    console.log(`  Bearer Token:        ${AUTH_TOKEN}`);
-    console.log(`=======================================================`);
-  });
-} else {
-  http.createServer(app).listen(PORT, () => {
-    console.log(`=======================================================`);
-    console.log(`iMessage MCP Server running over HTTP:`);
-    console.log(`  Discovery Page:      http://0.0.0.0:${PORT}/`);
-    console.log(`  Streamable HTTP:     http://0.0.0.0:${PORT}/mcp`);
-    console.log(`  SSE Transport:        http://0.0.0.0:${PORT}/sse`);
-    console.log(`  Bearer Token:        ${AUTH_TOKEN}`);
-    console.log(`=======================================================`);
-  });
 }
