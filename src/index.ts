@@ -491,8 +491,17 @@ iMessage MCP Server Instructions:
 
 const app = express();
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+
+// Skip express.json for /mcp endpoints so @hono/node-server in MCP SDK can stream raw req
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.path.startsWith('/mcp')) {
+    return next();
+  }
+  express.json()(req, res, (err) => {
+    if (err) return next(err);
+    express.urlencoded({ extended: true })(req, res, next);
+  });
+});
 
 /**
  * Network Connection Audit Middleware & 2026-07-28 Header Compliance
@@ -882,7 +891,7 @@ if (process.env.NODE_ENV !== 'test') {
       cert: fs.readFileSync(certPath)
     };
 
-    https.createServer(options, app).listen(PORT, () => {
+    https.createServer(options, app).listen(PORT, '0.0.0.0', () => {
       console.log(`=======================================================`);
       console.log(`iMessage MCP Server running over HTTPS:`);
       console.log(`  Discovery Page:      https://0.0.0.0:${PORT}/`);
@@ -892,7 +901,7 @@ if (process.env.NODE_ENV !== 'test') {
       console.log(`=======================================================`);
     });
   } else {
-    http.createServer(app).listen(PORT, () => {
+    http.createServer(app).listen(PORT, '0.0.0.0', () => {
       console.log(`=======================================================`);
       console.log(`iMessage MCP Server running over HTTP:`);
       console.log(`  Discovery Page:      http://0.0.0.0:${PORT}/`);
