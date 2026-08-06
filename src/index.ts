@@ -731,29 +731,18 @@ app.get('/discover', (_req, res) => {
 app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('X-Accel-Buffering', 'no');
-  res.setHeader('Connection', 'keep-alive');
-
-  // Normalize Accept header so all HTTP Streamable clients work seamlessly
-  const currentAccept = String(req.headers.accept || '');
-  if (!currentAccept.includes('application/json') || !currentAccept.includes('text/event-stream')) {
-    Object.defineProperty(req.headers, 'accept', {
-      value: 'application/json, text/event-stream',
-      writable: true,
-      configurable: true,
-      enumerable: true
-    });
-  }
 
   // Handle standalone GET health probe requests (e.g. grok mcp doctor probes)
   if (req.method === 'GET' && !req.headers['mcp-session-id'] && !req.headers['Mcp-Session-Id']) {
-    res.status(200).json({
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.status(200).send(JSON.stringify({
       status: 'ok',
       server: 'imessage-mcp-server',
       version: '1.1.0',
       mcpProtocolVersion: SPEC_VERSION,
       publicDomain: PUBLIC_DOMAIN,
       transports: ['streamable-http', 'sse']
-    });
+    }));
     return;
   }
 
