@@ -493,6 +493,10 @@ app.use(express.urlencoded({ extended: true }));
  * Network Connection Audit Middleware & 2026-07-28 Header Compliance
  */
 app.use((req: Request, res: Response, next: NextFunction) => {
+  // Normalize Accept header for /mcp endpoints so all Streamable HTTP clients work seamlessly
+  if (req.path.startsWith('/mcp')) {
+    req.headers['accept'] = 'application/json, text/event-stream';
+  }
   const startTime = Date.now();
   const rawIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0] || req.socket.remoteAddress || 'unknown';
   const clientIp = rawIp.replace(/^::ffff:/, '');
@@ -723,6 +727,17 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('X-Accel-Buffering', 'no');
   res.setHeader('Connection', 'keep-alive');
+
+  // Normalize Accept header so all HTTP Streamable clients work seamlessly
+  const currentAccept = String(req.headers.accept || '');
+  if (!currentAccept.includes('application/json') || !currentAccept.includes('text/event-stream')) {
+    Object.defineProperty(req.headers, 'accept', {
+      value: 'application/json, text/event-stream',
+      writable: true,
+      configurable: true,
+      enumerable: true
+    });
+  }
 
   const _setHeader = res.setHeader.bind(res);
   const _writeHead = res.writeHead.bind(res);
