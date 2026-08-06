@@ -237,12 +237,17 @@ function createMcpServer(): Server {
   const server = new Server(
     {
       name: 'imessage-mcp-server',
-      version: '1.0.0'
+      version: '1.1.0'
     },
     {
       capabilities: {
-        tools: {},
-        resources: {}
+        tools: {
+          listChanged: true
+        },
+        resources: {
+          subscribe: false,
+          listChanged: false
+        }
       },
       instructions: `
 iMessage MCP Server Instructions:
