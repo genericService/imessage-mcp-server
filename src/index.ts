@@ -722,34 +722,68 @@ app.get('/discover', (_req, res) => {
 app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('X-Accel-Buffering', 'no');
-  if (!req.headers.accept || req.headers['accept'] === '*/*' || !req.headers.accept.includes('text/event-stream')) {
-    req.headers['accept'] = 'application/json, text/event-stream';
-  }
+  res.setHeader('Connection', 'keep-alive');
+
+  const _setHeader = res.setHeader.bind(res);
+  const _writeHead = res.writeHead.bind(res);
+
+  res.setHeader = function (name: string, value: any) {
+    if (String(name).toLowerCase() === 'content-length') {
+      const ct = String(res.getHeader('content-type') || '');
+      if (ct.includes('text/event-stream')) {
+        return res;
+      }
+    }
+    return _setHeader(name, value);
+  };
+
+  res.writeHead = function (statusCode: number, ...args: any[]) {
+    const ct = String(res.getHeader('content-type') || '');
+    if (ct.includes('text/event-stream')) {
+      res.removeHeader('content-length');
+      res.removeHeader('Content-Length');
+    }
+    return _writeHead(statusCode, ...args);
+  };
 
   const reqSessionId = (req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id']) as string | undefined;
 
   if (reqSessionId && httpSessions.has(reqSessionId)) {
     const session = httpSessions.get(reqSessionId)!;
     session.lastAccess = Date.now();
-    await session.transport.handleRequest(req, res, req.body);
+    try {
+      await session.transport.handleRequest(req, res, req.body);
+    } catch (err: any) {
+      console.error(`[MCP Session Error] ${reqSessionId}:`, err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Internal Server Error', message: err.message });
+      }
+    }
     return;
   }
 
-  let generatedSessionId: string | undefined;
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => {
-      generatedSessionId = crypto.randomUUID();
-      return generatedSessionId;
+  try {
+    let generatedSessionId: string | undefined;
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => {
+        generatedSessionId = crypto.randomUUID();
+        return generatedSessionId;
+      }
+    });
+    const server = createMcpServer();
+    await server.connect(transport);
+
+    await transport.handleRequest(req, res, req.body);
+
+    if (generatedSessionId) {
+      httpSessions.set(generatedSessionId, { transport, server, lastAccess: Date.now() });
+      console.log(`[MCP] Registered Streamable HTTP session: ${generatedSessionId}`);
     }
-  });
-  const server = createMcpServer();
-  await server.connect(transport);
-
-  await transport.handleRequest(req, res, req.body);
-
-  if (generatedSessionId) {
-    httpSessions.set(generatedSessionId, { transport, server, lastAccess: Date.now() });
-    console.log(`[MCP] Registered Streamable HTTP session: ${generatedSessionId}`);
+  } catch (err: any) {
+    console.error('[MCP Transport Error]:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    }
   }
 });
 
