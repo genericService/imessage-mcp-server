@@ -746,6 +746,28 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
     return;
   }
 
+  // Handle ping & notification probes for grok/mcp doctor checks without requiring an active session
+  if (req.body && typeof req.body === 'object') {
+    if (req.body.method === 'ping') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.status(200).send(JSON.stringify({
+        jsonrpc: '2.0',
+        result: {},
+        id: req.body.id ?? 1
+      }));
+      return;
+    }
+    if (req.body.method === 'notifications/initialized') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.status(200).send(JSON.stringify({
+        jsonrpc: '2.0',
+        result: {},
+        id: req.body.id ?? null
+      }));
+      return;
+    }
+  }
+
   const _setHeader = res.setHeader.bind(res);
   const _writeHead = res.writeHead.bind(res);
 
