@@ -720,6 +720,8 @@ app.get('/discover', (_req, res) => {
  * Streamable HTTP Transport endpoint (GET & POST) for /mcp and /mcp/*
  */
 app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
   if (!req.headers.accept || req.headers['accept'] === '*/*' || !req.headers.accept.includes('text/event-stream')) {
     req.headers['accept'] = 'application/json, text/event-stream';
   }
