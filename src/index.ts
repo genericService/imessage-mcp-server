@@ -744,6 +744,19 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
     });
   }
 
+  // Handle standalone GET health probe requests (e.g. grok mcp doctor probes)
+  if (req.method === 'GET' && !req.headers['mcp-session-id'] && !req.headers['Mcp-Session-Id']) {
+    res.status(200).json({
+      status: 'ok',
+      server: 'imessage-mcp-server',
+      version: '1.1.0',
+      mcpProtocolVersion: SPEC_VERSION,
+      publicDomain: PUBLIC_DOMAIN,
+      transports: ['streamable-http', 'sse']
+    });
+    return;
+  }
+
   const _setHeader = res.setHeader.bind(res);
   const _writeHead = res.writeHead.bind(res);
 
