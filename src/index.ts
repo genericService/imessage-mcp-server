@@ -510,6 +510,18 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   // Normalize Accept header for /mcp endpoints so all Streamable HTTP clients work seamlessly
   if (req.path.startsWith('/mcp')) {
     req.headers['accept'] = 'application/json, text/event-stream';
+    if (Array.isArray(req.rawHeaders)) {
+      let foundAccept = false;
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        if (req.rawHeaders[i] && req.rawHeaders[i].toLowerCase() === 'accept') {
+          req.rawHeaders[i + 1] = 'application/json, text/event-stream';
+          foundAccept = true;
+        }
+      }
+      if (!foundAccept) {
+        req.rawHeaders.push('Accept', 'application/json, text/event-stream');
+      }
+    }
   }
   const startTime = Date.now();
   const rawIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0] || req.socket.remoteAddress || 'unknown';
