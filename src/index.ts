@@ -36,7 +36,6 @@ import {
   getOAuthStoreStats
 } from './oauth.js';
 
-const __dir = PACKAGE_ROOT;
 const PORT = config.port;
 const AUTH_TOKEN = config.authToken;
 const USE_HTTPS = config.useHttps;
@@ -355,8 +354,9 @@ iMessage MCP Server Instructions:
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const { uri } = request.params;
     if (uri === 'resource://readme' || uri === 'file:///README.md') {
-      const readmePath = path.resolve(__dir, '../README.md');
-      const content = await fs.promises.readFile(readmePath, 'utf8');
+      // Use the shared cached loader so this resolves against the package
+      // root (not the cwd) and survives a transient read failure.
+      const content = await loadReadme();
       return {
         contents: [
           {

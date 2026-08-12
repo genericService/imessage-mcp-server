@@ -412,3 +412,21 @@ describe('Audit Log Durability', () => {
     expect(getAuditStatus()).toHaveProperty('enabled');
   });
 });
+
+describe('Package-relative path resolution', () => {
+  it('should resolve README via the package root, not the process cwd', async () => {
+    // Regression: the resources/read handler resolved '../README.md' against a
+    // stale base, producing ENOENT ("/home/user/README.md") whenever the
+    // server was launched from a different working directory -- the common
+    // case under launchd/systemd, which start with cwd '/'.
+    const { PACKAGE_ROOT } = await import('../src/config.js');
+    const readme = path.join(PACKAGE_ROOT, 'README.md');
+    expect(fsSync.existsSync(readme)).toBe(true);
+    expect(fsSync.readFileSync(readme, 'utf8')).toContain('iMessage MCP Server');
+  });
+
+  it('should resolve the CLI path against the package root', async () => {
+    const { config } = await import('../src/config.js');
+    expect(fsSync.existsSync(config.cliPath)).toBe(true);
+  });
+});
