@@ -246,11 +246,76 @@ If you wish to log AI agent action executions for security auditing, set `ENABLE
 
 ---
 
+## Reliability & Operations
+
+The server is built to survive unattended operation on a Mac that may sleep,
+lose permissions, or run iCloud syncs mid-request.
+
+### Failure isolation
+- **Hard subprocess timeouts.** Every call into the Python CLI runs with a
+  timeout (`CLI_READ_TIMEOUT_MS`, `CLI_SEND_TIMEOUT_MS`,
+  `CLI_ATTACHMENT_TIMEOUT_MS`). A wedged AppleScript, a locked screen, or a
+  macOS permission prompt can no longer hang a request forever or pin the MCP
+  session behind it. Hung children are killed, not orphaned.
+- **Large attachments.** Output buffers default to 128 MB, so base64 payloads
+  no longer die with `ENOBUFS` against Node's 1 MB `execFile` default.
+- **Bounded concurrency.** `MAX_CONCURRENT_CLI` (default 4) caps simultaneous
+  `python3`/sqlite subprocesses so a runaway agent loop cannot starve the host.
+- **Errors are returned, not thrown.** Tool failures come back as structured
+  JSON (`error_code`, `retryable`) instead of transport-level errors that make
+  clients drop the session. Invalid model input is rejected before it reaches
+  a subprocess.
+- **Process-level guards.** `unhandledRejection` is logged and survived;
+  `uncaughtException` triggers a clean drain so a supervisor restarts from a
+  known state.
+
+### Resource lifecycle
+- Idle Streamable HTTP **and** SSE sessions are swept (`SESSION_IDLE_MS`), with
+  LRU eviction at `MAX_HTTP_SESSIONS`. SSE cleanup covers `close`, `aborted`
+  and `error`, so dropped connections no longer leak MCP server instances.
+- Unknown session IDs return `404` so clients re-initialise cleanly after a
+  restart rather than silently attaching to a new session.
+- Dry-run `confirm_token`s expire (`CONFIRM_TOKEN_TTL_MS`) and are single-use;
+  unconfirmed previews no longer retain recipients and message text in memory.
+- OAuth authorization codes and refresh tokens are pruned and capped; refresh
+  tokens rotate on use.
+- The audit log writes through a non-blocking stream with size-based rotation
+  (`AUDIT_MAX_BYTES`, `AUDIT_MAX_FILES`) and can never crash the process.
+
+### Graceful shutdown
+`SIGTERM`/`SIGINT` stops new work, drains in-flight requests, closes MCP
+sessions, flushes the audit log, then exits — with a hard `SHUTDOWN_GRACE_MS`
+backstop so a restart is never blocked. `/ready` reports `draining` (503) so a
+tunnel or load balancer stops routing before the listener closes.
+
+### Monitoring
+`GET /health` reports uptime, active sessions per transport, subprocess pool
+depth, OAuth store sizes, memory, and any configuration warnings.
+`GET /ready` is a supervisor-oriented readiness probe that fails when the CLI
+is missing or the server is draining.
+
+### Security hardening
+- Bearer tokens and client secrets are compared in **constant time**.
+- Repeated auth failures temporarily block an IP (`AUTH_FAIL_MAX`).
+- JWT verification rejects `alg=none` confusion and no longer throws on a
+  truncated signature.
+- The OAuth consent screen escapes all untrusted input, and only `http(s)`
+  redirect URIs are accepted.
+- The bearer token is redacted in startup logs.
+- The formerly hardcoded legacy token now comes from `LEGACY_TOKEN`; no
+  credential is committed to the repository.
+
+> **Behind a proxy:** keep `TRUST_PROXY=true` (default) so client IPs are
+> accurate, and ensure `KEEP_ALIVE_TIMEOUT_MS` exceeds your proxy's idle
+> timeout to avoid intermittent 502s through Cloudflare Tunnel.
+
+---
+
 ## Known Limitations & Considerations
 
 1. **Host Mac Requirement:** Must run on a physical Mac or macOS VM signed into an active Apple ID.
 2. **AppleScript Attachment Sandboxing:** Native AppleScript `send alias` in macOS Sonoma/Sequoia marks attachments as "Not Delivered". This server bypasses that bug using a Swift NSPasteboard paste workflow; therefore, the host Mac must be in an active Aqua GUI session.
-3. **Read-Only SQLite Access:** Database reads use `URI mode=ro` (`sqlite3.connect('file:chat.db?mode=ro', uri=True)`) to ensure `chat.db` is never locked or corrupted by server reads.
+3. **Read-Only SQLite Access:** Database reads use `URI mode=ro` (`sqlite3.connect('file:chat.db?mode=ro', uri=True)`) to ensure `chat.db` is never locked or corrupted by server reads. A `busy_timeout` (`IMESSAGE_DB_TIMEOUT`, default 15s) lets reads wait out iCloud sync locks instead of failing instantly with "database is locked".
 4. **SMS vs iMessage:** Text-only messages fallback gracefully to SMS if the recipient handle is a mobile phone number registered on your iPhone's Text Message Forwarding network.
 
 ---
