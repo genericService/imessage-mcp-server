@@ -8,18 +8,81 @@ import subprocess
 import glob
 import json
 import base64
+import contextlib
+import tempfile
+import shutil
 
-DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
+DB_PATH = os.environ.get("IMESSAGE_DB_PATH") or os.path.expanduser("~/Library/Messages/chat.db")
+CONTACTS_GLOB = os.path.expanduser('~/Library/Application Support/AddressBook/**/*.abcddb')
+
+# Messages.app holds write locks on chat.db while syncing. Without a busy
+# timeout, concurrent reads fail instantly with "database is locked".
+DB_TIMEOUT_SECONDS = float(os.environ.get("IMESSAGE_DB_TIMEOUT", "15"))
+
+
+class CliError(Exception):
+    """Recoverable, user-facing error. Carries a stable exit code."""
+
+    def __init__(self, message, exit_code=1):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+# Connections opened during this invocation, closed unconditionally at exit so
+# an exception mid-query can never leave a sqlite handle dangling.
+_OPEN_CONNECTIONS = []
+
+
+def close_all_connections():
+    while _OPEN_CONNECTIONS:
+        conn = _OPEN_CONNECTIONS.pop()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def get_db_connection():
     if not os.path.exists(DB_PATH):
-        print(f"ERROR: iMessage database not found at {DB_PATH}", file=sys.stderr)
-        sys.exit(1)
+        raise CliError(
+            f"iMessage database not found at {DB_PATH}. "
+            "This tool must run on a macOS host signed into iMessage, and the process "
+            "needs Full Disk Access (System Settings > Privacy & Security > Full Disk Access)."
+        )
     try:
-        return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=DB_TIMEOUT_SECONDS
+        )
+        conn.execute(f"PRAGMA busy_timeout = {int(DB_TIMEOUT_SECONDS * 1000)}")
+        _OPEN_CONNECTIONS.append(conn)
+        return conn
+    except sqlite3.OperationalError as e:
+        msg = str(e)
+        if "unable to open" in msg.lower() or "authorization" in msg.lower():
+            raise CliError(
+                f"Could not open {DB_PATH}: {msg}. This is almost always missing Full Disk "
+                "Access for the process running the server (Terminal, or sshd-keygen-wrapper over SSH)."
+            )
+        raise CliError(f"Could not open database in read-only mode: {msg}")
     except Exception as e:
-        print(f"ERROR: Could not open database in read-only mode: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise CliError(f"Could not open database in read-only mode: {e}")
+
+
+@contextlib.contextmanager
+def db_cursor():
+    """Always close the connection, even when a query raises.
+
+    Every command previously called conn.close() only on the success path, so
+    any exception mid-query leaked the sqlite handle for the process lifetime.
+    """
+    conn = get_db_connection()
+    try:
+        yield conn.cursor()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def format_size(bytes_num):
     if not bytes_num: return "0 B"
@@ -37,7 +100,15 @@ def normalize_handle(val):
     return clean.lower()
 
 def get_contacts_map():
-    ab_paths = glob.glob(os.path.expanduser('~/Library/Application Support/AddressBook/**/*.abcddb'), recursive=True)
+    """Best-effort contact name resolution.
+
+    Contact lookup is an enrichment, never a hard dependency: if AddressBook
+    is missing or unreadable the caller still gets raw handles back.
+    """
+    try:
+        ab_paths = glob.glob(CONTACTS_GLOB, recursive=True)
+    except OSError:
+        return {}
     cmap = {}
     for p in ab_paths:
         try:
@@ -172,9 +243,7 @@ def read_messages(args):
             print(json.dumps([]))
             conn.close()
             return
-        print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
-        conn.close()
-        sys.exit(1)
+        raise CliError(f"No chat found matching '{target}'. Use imessage_list_chats to discover valid chat identifiers.")
         
     placeholders = ",".join(["?"] * len(chat_ids))
     apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
@@ -326,7 +395,10 @@ def search_messages(args):
 
 def search_contacts(args):
     query = (args.query or "").lower()
-    ab_paths = glob.glob(os.path.expanduser('~/Library/Application Support/AddressBook/**/*.abcddb'), recursive=True)
+    try:
+        ab_paths = glob.glob(CONTACTS_GLOB, recursive=True)
+    except OSError:
+        ab_paths = []
     
     contacts = []
     for p in ab_paths:
@@ -394,9 +466,7 @@ def get_members(args):
             print(json.dumps([]))
             conn.close()
             return
-        print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
-        conn.close()
-        sys.exit(1)
+        raise CliError(f"No chat found matching '{target}'. Use imessage_list_chats to discover valid chat identifiers.")
         
     placeholders = ",".join(["?"] * len(chat_ids))
     query = f"""
@@ -437,19 +507,49 @@ def get_members(args):
 def get_attachment_payload(args):
     filepath = os.path.abspath(os.path.expanduser(args.path))
     if not os.path.exists(filepath):
-        print(f"ERROR: Attachment file not found at '{filepath}'", file=sys.stderr)
-        sys.exit(1)
+        raise CliError(f"Attachment file not found at '{filepath}'")
+    if os.path.isdir(filepath):
+        raise CliError(f"'{filepath}' is a directory, not an attachment file.")
+    if not os.access(filepath, os.R_OK):
+        raise CliError(
+            f"Attachment '{filepath}' is not readable. The server process likely needs Full Disk Access."
+        )
+
+    # Guard against base64-ing a multi-GB file into memory and blowing past
+    # the parent process' output buffer.
+    max_bytes = int(os.environ.get("IMESSAGE_MAX_ATTACHMENT_BYTES", str(64 * 1024 * 1024)))
+    actual_size = os.path.getsize(filepath)
+    if actual_size > max_bytes:
+        raise CliError(
+            f"Attachment is {format_size(actual_size)}, exceeding the {format_size(max_bytes)} limit. "
+            "Raise IMESSAGE_MAX_ATTACHMENT_BYTES to allow larger payloads."
+        )
         
     target_path = filepath
     mime = "application/octet-stream"
     ext = os.path.splitext(filepath)[1].lower()
     
     if ext in ['.heic', '.heif']:
-        jpg_path = f"/tmp/imessage_conv_{os.path.basename(filepath)}.jpg"
-        subprocess.run(['sips', '-s', 'format', 'jpeg', filepath, '--out', jpg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if os.path.exists(jpg_path):
-            target_path = jpg_path
-            mime = "image/jpeg"
+        # Convert into a private temp dir; the previous predictable /tmp path
+        # was world-writable and collided across concurrent conversions.
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="imessage_conv_")
+            jpg_path = os.path.join(tmp_dir, os.path.basename(filepath) + ".jpg")
+            subprocess.run(
+                ['sips', '-s', 'format', 'jpeg', filepath, '--out', jpg_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+                check=False,
+            )
+            if os.path.exists(jpg_path):
+                target_path = jpg_path
+                mime = "image/jpeg"
+            else:
+                mime = "image/heic"
+        except (subprocess.TimeoutExpired, OSError):
+            # Conversion is best-effort: fall back to the original bytes.
+            mime = "image/heic"
     elif ext in ['.jpg', '.jpeg']:
         mime = "image/jpeg"
     elif ext == '.png':
@@ -461,8 +561,11 @@ def get_attachment_payload(args):
     elif ext == '.txt':
         mime = "text/plain"
 
-    with open(target_path, 'rb') as f:
-        data = f.read()
+    try:
+        with open(target_path, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        raise CliError(f"Could not read attachment '{target_path}': {e}")
 
     payload = {
         'path': filepath,
@@ -484,38 +587,70 @@ def send_message(args):
     message = args.message
     attachment = args.attachment
 
-    # Resolve recipient against chat.db (group chats, display names, or numeric ROWIDs)
+    if not message and not attachment:
+        raise CliError("Nothing to send: provide --message and/or --attachment.")
+
+    # Resolve recipient against chat.db (group chats, display names, or numeric ROWIDs).
+    # Resolution is best-effort: if chat.db is unreadable we still attempt the
+    # send using the raw recipient rather than failing outright.
     target_ident = recipient
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        if recipient.isdigit():
-            c.execute("SELECT chat_identifier FROM chat WHERE ROWID = ?", (int(recipient),))
-            row = c.fetchone()
-            if row and row[0]:
-                target_ident = row[0]
-        else:
-            c.execute("SELECT chat_identifier FROM chat WHERE display_name LIKE ? OR chat_identifier = ?", (f"%{recipient}%", recipient))
-            row = c.fetchone()
-            if row and row[0]:
-                target_ident = row[0]
-        conn.close()
+        with db_cursor() as c:
+            if recipient.isdigit():
+                c.execute("SELECT chat_identifier FROM chat WHERE ROWID = ?", (int(recipient),))
+                row = c.fetchone()
+                if row and row[0]:
+                    target_ident = row[0]
+            else:
+                c.execute(
+                    "SELECT chat_identifier FROM chat WHERE display_name LIKE ? OR chat_identifier = ?",
+                    (f"%{recipient}%", recipient),
+                )
+                row = c.fetchone()
+                if row and row[0]:
+                    target_ident = row[0]
     except Exception:
         pass
-    
+
     if attachment:
         attachment_path = os.path.abspath(os.path.expanduser(attachment))
         if not os.path.exists(attachment_path):
-            print(f"ERROR: Attachment file not found at '{attachment_path}'", file=sys.stderr)
-            sys.exit(1)
-            
-        swift_script = f"""import Cocoa
-let url = URL(fileURLWithPath: "{attachment_path}")
+            raise CliError(f"Attachment file not found at '{attachment_path}'")
+        if not os.path.isfile(attachment_path):
+            raise CliError(f"Attachment '{attachment_path}' is not a regular file.")
+
+        if shutil.which('swift') is None:
+            raise CliError(
+                "The 'swift' toolchain is required to send attachments but was not found. "
+                "Install Xcode Command Line Tools: xcode-select --install"
+            )
+
+        # Read the path from argv inside Swift instead of interpolating it into
+        # the source. Interpolating broke on any path containing a quote or
+        # backslash and allowed arbitrary Swift to be injected via a filename.
+        swift_script = """import Cocoa
+let args = CommandLine.arguments
+guard args.count > 1 else { exit(2) }
+let url = URL(fileURLWithPath: args[1])
 let pb = NSPasteboard.general
 pb.clearContents()
-pb.writeObjects([url as NSURL])
+if !pb.writeObjects([url as NSURL]) { exit(3) }
 """
-        subprocess.run(['swift', '-'], input=swift_script, text=True, check=True)
+        try:
+            res = subprocess.run(
+                ['swift', '-', attachment_path],
+                input=swift_script,
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            raise CliError("Timed out copying the attachment to the pasteboard (swift took over 60s).")
+        if res.returncode != 0:
+            raise CliError(
+                f"Could not place attachment on the pasteboard (swift exit {res.returncode}): "
+                f"{(res.stderr or '').strip()}"
+            )
         
         msg_str = (message or '').replace('\\', '\\\\').replace('"', '\\"')
         type_code = f'keystroke "{msg_str}"' if msg_str else ''
@@ -531,10 +666,24 @@ tell application "System Events"
         key code 36
     end tell
 end tell'''
-        res = subprocess.run(['osascript', '-e', applescript_att], capture_output=True, text=True)
+        try:
+            res = subprocess.run(
+                ['osascript', '-e', applescript_att], capture_output=True, text=True, timeout=120
+            )
+        except subprocess.TimeoutExpired:
+            raise CliError(
+                "Timed out driving Messages.app (120s). The Mac may be showing a permission prompt, "
+                "the screen may be locked, or Messages.app may be unresponsive. An active GUI session is required."
+            )
         if res.returncode != 0:
-            print(f"ERROR: Could not paste/send attachment: {res.stderr or res.stdout}", file=sys.stderr)
-            sys.exit(1)
+            detail = (res.stderr or res.stdout or "").strip()
+            if "not allowed assistive access" in detail or "-1719" in detail or "-25211" in detail:
+                raise CliError(
+                    "Accessibility permission denied. Grant Accessibility and Automation rights to the "
+                    "process running this server (System Settings > Privacy & Security > Accessibility). "
+                    f"Detail: {detail}"
+                )
+            raise CliError(f"Could not paste/send attachment: {detail}")
         print(f"Attachment '{attachment_path}' sent to '{recipient}' ({target_ident}) successfully!")
 
     elif message:
@@ -557,10 +706,26 @@ end tell'''
         send messageText to buddy rawRecipient
     end tell
 end run"""
-        res = subprocess.run(['osascript', '-e', applescript_msg, target_ident, recipient, message], capture_output=True, text=True)
+        try:
+            res = subprocess.run(
+                ['osascript', '-e', applescript_msg, target_ident, recipient, message],
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+        except subprocess.TimeoutExpired:
+            raise CliError(
+                "Timed out sending via Messages.app (90s). The Mac may be showing a permission prompt "
+                "or Messages.app may be unresponsive."
+            )
         if res.returncode != 0:
-            print(f"ERROR: Could not send text message: {res.stderr or res.stdout}", file=sys.stderr)
-            sys.exit(1)
+            detail = (res.stderr or res.stdout or "").strip()
+            if "not authorized" in detail.lower() or "-1743" in detail:
+                raise CliError(
+                    "Automation permission denied. Allow this process to control Messages under "
+                    f"System Settings > Privacy & Security > Automation. Detail: {detail}"
+                )
+            raise CliError(f"Could not send text message: {detail}")
         print(f"Message sent to '{recipient}' ({target_ident}) successfully!")
 
 def get_recent_messages(args):
@@ -584,9 +749,7 @@ def get_recent_messages(args):
             print(json.dumps([]))
             conn.close()
             return
-        print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
-        conn.close()
-        sys.exit(1)
+        raise CliError(f"No chat found matching '{target}'. Use imessage_list_chats to discover valid chat identifiers.")
         
     placeholders = ",".join(["?"] * len(chat_ids))
     apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
@@ -768,5 +931,38 @@ def main():
     args = parser.parse_args()
     args.func(args)
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CliError as e:
+        # Structured, actionable failure. Exit code 1 = recoverable.
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    except BrokenPipeError:
+        # The Node parent closed stdout (client disconnected / timeout kill).
+        # Suppress Python's noisy secondary error on interpreter shutdown.
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except sqlite3.OperationalError as e:
+        msg = str(e)
+        if "locked" in msg.lower() or "busy" in msg.lower():
+            print(
+                f"ERROR: iMessage database is locked by Messages.app ({msg}). "
+                "This is usually transient during an iCloud sync; retry shortly.",
+                file=sys.stderr,
+            )
+            sys.exit(75)  # EX_TEMPFAIL: signals a retryable condition
+        print(f"ERROR: Database error: {msg}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        # Last-resort guard: never surface a raw traceback to the MCP client.
+        print(f"ERROR: Unexpected failure: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        close_all_connections()
