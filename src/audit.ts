@@ -52,7 +52,11 @@ function openStream(): fs.WriteStream | null {
 
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
-    bytesWritten = fs.existsSync(AUDIT_FILE) ? fs.statSync(AUDIT_FILE).size : 0;
+    // Create the file synchronously so it is observable the moment the first
+    // event is logged. createWriteStream opens lazily/asynchronously, which
+    // otherwise leaves a window where the audit file does not yet exist.
+    fs.closeSync(fs.openSync(AUDIT_FILE, 'a'));
+    bytesWritten = fs.statSync(AUDIT_FILE).size;
 
     const stream = fs.createWriteStream(AUDIT_FILE, { flags: 'a' });
     // Without an 'error' handler a stream error is an unhandled 'error' event,
@@ -133,6 +137,22 @@ export function logAuditEvent(event: AuditEvent): void {
   } catch (err: any) {
     console.error('[Audit Logger Error] Failed to write audit event:', err?.message || err);
   }
+}
+
+/**
+ * Resolve once buffered audit events have been handed to the OS.
+ *
+ * Writes are asynchronous for throughput, so callers that need durability
+ * (shutdown, tests, forensic reads) must flush explicitly.
+ */
+export async function flushAuditLog(): Promise<void> {
+  const stream = writeStream;
+  if (!stream) return;
+  await new Promise<void>((resolve) => {
+    // An empty write invokes its callback after preceding buffered chunks
+    // have been flushed to the file descriptor.
+    stream.write('', () => resolve());
+  });
 }
 
 /** Flush and close the audit stream during graceful shutdown. */

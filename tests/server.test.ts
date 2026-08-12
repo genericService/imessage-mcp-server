@@ -152,9 +152,12 @@ describe.skipIf(!fixtureReady)('CLI JSON Output Contracts (SDD & TDD)', () => {
 describe('Local Action Audit Logger (Security & Privacy)', () => {
   it('should write JSON audit event when ENABLE_AUDIT_LOG=true', async () => {
     const fs = await import('fs');
-    const { logAuditEvent } = await import('../src/audit.js');
+    const { logAuditEvent, flushAuditLog } = await import('../src/audit.js');
+    const { PACKAGE_ROOT } = await import('../src/config.js');
     process.env.ENABLE_AUDIT_LOG = 'true';
-    const auditFile = path.resolve(process.cwd(), 'logs/audit.log');
+    // Resolved against the package root, not cwd: the logger no longer depends
+    // on the working directory the server happened to be launched from.
+    const auditFile = path.join(PACKAGE_ROOT, 'logs/audit.log');
 
     logAuditEvent({
       timestamp: new Date().toISOString(),
@@ -164,6 +167,8 @@ describe('Local Action Audit Logger (Security & Privacy)', () => {
       status: 'success',
       duration_ms: 42
     });
+    // Writes are async for throughput; flush before asserting on the file.
+    await flushAuditLog();
 
     expect(fs.existsSync(auditFile)).toBe(true);
     const content = fs.readFileSync(auditFile, 'utf8');
@@ -174,9 +179,10 @@ describe('Local Action Audit Logger (Security & Privacy)', () => {
 
   it('should write http_connection audit events', async () => {
     const fs = await import('fs');
-    const { logAuditEvent } = await import('../src/audit.js');
+    const { logAuditEvent, flushAuditLog } = await import('../src/audit.js');
+    const { PACKAGE_ROOT } = await import('../src/config.js');
     process.env.ENABLE_AUDIT_LOG = 'true';
-    const auditFile = path.resolve(process.cwd(), 'logs/audit.log');
+    const auditFile = path.join(PACKAGE_ROOT, 'logs/audit.log');
 
     logAuditEvent({
       timestamp: new Date().toISOString(),
@@ -190,6 +196,7 @@ describe('Local Action Audit Logger (Security & Privacy)', () => {
       status: 'success',
       duration_ms: 12
     });
+    await flushAuditLog();
 
     const content = fs.readFileSync(auditFile, 'utf8');
     expect(content).toContain('http_connection');
@@ -398,7 +405,8 @@ describe('Audit Log Durability', () => {
       // @ts-expect-error deliberately passing a forbidden field
       base64: 'AAAA'
     });
-    const { getAuditStatus } = await import('../src/audit.js');
+    const { getAuditStatus, flushAuditLog } = await import('../src/audit.js');
+    await flushAuditLog();
     const status = getAuditStatus();
     if (status.file && fsSync.existsSync(status.file)) {
       const content = fsSync.readFileSync(status.file, 'utf8');
