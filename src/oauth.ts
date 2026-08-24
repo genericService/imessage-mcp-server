@@ -1,8 +1,21 @@
 import crypto from 'crypto';
-import { Request, Response, NextFunction } from 'express';
+import { Request, Response } from 'express';
+import { isRateLimited, recordAuthFailure } from './ratelimit.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || process.env.BEARER_TOKEN || crypto.randomBytes(32).toString('hex');
 const DEFAULT_CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'imessage-cli-client';
+
+interface DynamicClient {
+  clientId: string;
+  clientSecret?: string;
+  redirectUris: string[];
+  tokenEndpointAuthMethod: string;
+  clientName?: string;
+  issuedAt: number;
+}
+
+/** In-memory RFC 7591 dynamic clients (Grok/Cursor OAuth connectors). */
+const dynamicClients = new Map<string, DynamicClient>();
 
 export function getClientRegistry(): Map<string, string> {
   const registry = new Map<string, string>();
@@ -13,7 +26,63 @@ export function getClientRegistry(): Map<string, string> {
   if (process.env.CLIENT_UBUNTU_SECRET) {
     registry.set('ubuntu-remote', process.env.CLIENT_UBUNTU_SECRET);
   }
+  for (const [clientId, client] of dynamicClients.entries()) {
+    if (client.clientSecret) {
+      registry.set(clientId, client.clientSecret);
+    }
+  }
   return registry;
+}
+
+export function getDynamicClient(clientId: string): DynamicClient | undefined {
+  return dynamicClients.get(clientId);
+}
+
+function adminSecret(): string {
+  return process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || '';
+}
+
+export function secretsEqual(provided: string, expected: string): boolean {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+/** Master backend token from Authorization header or form field. */
+function providedAdminToken(req: Request): string {
+  const header = req.headers.authorization;
+  if (header && /^Bearer\s+/i.test(header)) {
+    return header.replace(/^Bearer\s+/i, '').trim();
+  }
+  const body = req.body || {};
+  return String(body.admin_token || body.backend_token || '').trim();
+}
+
+function requireAdminToken(req: Request, res: Response): boolean {
+  const expected = adminSecret();
+  if (!expected) {
+    res.status(500).json({ error: 'server_error', error_description: 'Backend token is not configured.' });
+    return false;
+  }
+  if (!secretsEqual(providedAdminToken(req), expected)) {
+    authFailure(req, res, 401, {
+      error: 'unauthorized',
+      error_description: 'Approval requires the backend bearer token.'
+    });
+    return false;
+  }
+  return true;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 interface AuthCodeData {
@@ -82,7 +151,9 @@ export function verifyJwt(token: string): Record<string, any> | null {
 
     const expectedSignature = base64UrlEncode(crypto.createHmac('sha256', JWT_SECRET).update(signatureInput).digest());
 
-    if (!crypto.timingSafeEqual(Buffer.from(encodedSignature), Buffer.from(expectedSignature))) {
+    const provided = Buffer.from(encodedSignature);
+    const expected = Buffer.from(expectedSignature);
+    if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
       return null;
     }
 
@@ -106,13 +177,72 @@ export function getOAuthMetadata(baseUrl: string) {
     issuer: baseUrl,
     authorization_endpoint: `${baseUrl}/oauth/authorize`,
     token_endpoint: `${baseUrl}/oauth/token`,
-    registration_endpoint: `${baseUrl}/oauth/register`,
+    // Registration is not public; clients must use a backend-minted bearer token.
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'client_credentials', 'refresh_token'],
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
-    code_challenge_methods_supported: ['S256', 'plain'],
+    code_challenge_methods_supported: ['S256'],
     scopes_supported: ['imessage:read', 'imessage:write', 'imessage:all']
   };
+}
+
+/**
+ * OAuth 2.0 Protected Resource Metadata (RFC 9728) for MCP auth discovery.
+ */
+export function getProtectedResourceMetadata(baseUrl: string, resourcePath = '/mcp') {
+  const resource = `${baseUrl}${resourcePath}`;
+  return {
+    resource,
+    authorization_servers: [baseUrl],
+    scopes_supported: ['imessage:read', 'imessage:write', 'imessage:all'],
+    bearer_methods_supported: ['header'],
+    resource_name: 'iMessage MCP Server',
+    resource_documentation: `${baseUrl}/`
+  };
+}
+
+/**
+ * RFC 7591 Dynamic Client Registration (required by Grok/Cursor OAuth connectors).
+ */
+export function handleRegisterPost(req: Request, res: Response) {
+  if (!requireAdminToken(req, res)) return;
+
+  const body = req.body || {};
+  const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.map(String) : [];
+  if (redirectUris.length === 0) {
+    return res.status(400).json({
+      error: 'invalid_client_metadata',
+      error_description: 'redirect_uris is required and must be a non-empty array.'
+    });
+  }
+
+  const authMethod = String(body.token_endpoint_auth_method || 'client_secret_post');
+  const isPublic = authMethod === 'none';
+  const clientId = crypto.randomUUID();
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const clientSecret = isPublic ? undefined : crypto.randomBytes(32).toString('hex');
+
+  dynamicClients.set(clientId, {
+    clientId,
+    clientSecret,
+    redirectUris,
+    tokenEndpointAuthMethod: authMethod,
+    clientName: body.client_name ? String(body.client_name) : undefined,
+    issuedAt
+  });
+
+  res.setHeader('Cache-Control', 'no-store');
+  return res.status(201).json({
+    client_id: clientId,
+    client_id_issued_at: issuedAt,
+    client_secret: clientSecret,
+    client_secret_expires_at: isPublic ? undefined : 0,
+    redirect_uris: redirectUris,
+    token_endpoint_auth_method: authMethod,
+    grant_types: Array.isArray(body.grant_types) ? body.grant_types : ['authorization_code', 'refresh_token'],
+    response_types: Array.isArray(body.response_types) ? body.response_types : ['code'],
+    client_name: body.client_name || undefined
+  });
 }
 
 /**
@@ -149,17 +279,20 @@ export function handleAuthorizeGet(req: Request, res: Response) {
 <body>
   <div class="card">
     <h2>Authorize Client Access</h2>
-    <p>An application is requesting access to your iMessage MCP Server.</p>
+    <p>This approval is gated by the backend bearer token. Random visitors cannot grant access.</p>
     <div class="client-box">
-      <strong>Client ID:</strong> ${clientId || 'Default Client'}<br>
-      <strong>Redirect URI:</strong> ${redirectUri || 'None'}
+      <strong>Client ID:</strong> ${escapeHtml(clientId || 'Default Client')}<br>
+      <strong>Redirect URI:</strong> ${escapeHtml(redirectUri || 'None')}
     </div>
     <form method="POST" action="/oauth/authorize">
-      <input type="hidden" name="client_id" value="${clientId}">
-      <input type="hidden" name="redirect_uri" value="${redirectUri}">
-      <input type="hidden" name="state" value="${state}">
-      <input type="hidden" name="code_challenge" value="${codeChallenge}">
-      <input type="hidden" name="code_challenge_method" value="${codeChallengeMethod}">
+      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
+      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
+      <input type="hidden" name="state" value="${escapeHtml(state)}">
+      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
+      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}">
+      <label style="display:block;margin:0 0 8px;color:#a3a3a3;font-size:0.85rem;">Backend token</label>
+      <input type="password" name="admin_token" autocomplete="current-password" required
+        style="width:100%;box-sizing:border-box;margin-bottom:16px;padding:10px;border-radius:6px;border:1px solid #404040;background:#0a0a0a;color:#f5f0eb;">
       <button type="submit" class="btn">Approve & Grant Access</button>
     </form>
   </div>
@@ -174,19 +307,28 @@ export function handleAuthorizeGet(req: Request, res: Response) {
  * Handle Authorization Submission (POST /oauth/authorize)
  */
 export function handleAuthorizePost(req: Request, res: Response) {
+  if (!requireAdminToken(req, res)) return;
+
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.body;
+  const clientId = String(client_id || DEFAULT_CLIENT_ID);
+  const redirectUri = String(redirect_uri || '');
+
+  const dyn = getDynamicClient(clientId);
+  if (dyn && redirectUri && !dyn.redirectUris.includes(redirectUri)) {
+    return res.status(400).send('Invalid redirect_uri for registered client.');
+  }
 
   const code = `code_${crypto.randomBytes(16).toString('hex')}`;
   authCodes.set(code, {
-    clientId: client_id || DEFAULT_CLIENT_ID,
-    redirectUri: redirect_uri,
+    clientId,
+    redirectUri,
     codeChallenge: code_challenge,
     codeChallengeMethod: code_challenge_method,
     expiresAt: Date.now() + 10 * 60 * 1000 // 10 mins
   });
 
-  if (redirect_uri) {
-    const url = new URL(redirect_uri);
+  if (redirectUri) {
+    const url = new URL(redirectUri);
     url.searchParams.set('code', code);
     if (state) url.searchParams.set('state', state);
     return res.redirect(url.toString());
@@ -198,6 +340,14 @@ export function handleAuthorizePost(req: Request, res: Response) {
 /**
  * OAuth 2.0 Token Endpoint (POST /oauth/token)
  */
+function authFailure(req: Request, res: Response, status: number, body: Record<string, string>) {
+  recordAuthFailure(req);
+  if (isRateLimited(req)) {
+    return res.status(429).json({ error: 'too_many_requests', error_description: 'Too many failed attempts, retry later.' });
+  }
+  return res.status(status).json(body);
+}
+
 export function handleTokenPost(req: Request, res: Response) {
   const grantType = req.body.grant_type || req.query.grant_type;
   const clientId = req.body.client_id || req.query.client_id;
@@ -212,8 +362,8 @@ export function handleTokenPost(req: Request, res: Response) {
     const defaultSecret = process.env.OAUTH_CLIENT_SECRET || process.env.BEARER_TOKEN;
     
     // Verify client credentials
-    if (registeredSecret ? reqSecret !== registeredSecret : (reqSecret !== defaultSecret)) {
-      return res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client credentials.' });
+    if (!secretsEqual(reqSecret, registeredSecret || defaultSecret || '')) {
+      return authFailure(req, res, 401, { error: 'invalid_client', error_description: 'Invalid client credentials.' });
     }
 
     const accessToken = signJwt({ sub: clientId || DEFAULT_CLIENT_ID, scope: 'imessage:all' }, 3600);
@@ -233,6 +383,7 @@ export function handleTokenPost(req: Request, res: Response) {
   if (grantType === 'authorization_code') {
     const code = req.body.code || req.query.code;
     const codeVerifier = req.body.code_verifier || req.query.code_verifier;
+    const redirectUri = String(req.body.redirect_uri || req.query.redirect_uri || '');
 
     if (!code || !authCodes.has(code)) {
       return res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired authorization code.' });
@@ -243,6 +394,18 @@ export function handleTokenPost(req: Request, res: Response) {
 
     if (Date.now() > authData.expiresAt) {
       return res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code expired.' });
+    }
+
+    if (authData.redirectUri && redirectUri && authData.redirectUri !== redirectUri) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch.' });
+    }
+
+    // Public dynamic clients (auth method "none") skip client_secret; confidential clients must match.
+    const dyn = getDynamicClient(authData.clientId);
+    if (dyn?.clientSecret) {
+      if (!secretsEqual(String(clientSecret || ''), dyn.clientSecret)) {
+        return authFailure(req, res, 401, { error: 'invalid_client', error_description: 'Invalid client credentials.' });
+      }
     }
 
     // Verify PKCE if present

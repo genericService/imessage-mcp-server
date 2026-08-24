@@ -24,26 +24,100 @@ import {
 import { logAuditEvent } from './audit.js';
 import {
   getOAuthMetadata,
+  getProtectedResourceMetadata,
   handleAuthorizeGet,
   handleAuthorizePost,
+  handleRegisterPost,
   handleTokenPost,
   verifyJwt,
-  getClientRegistry
+  getClientRegistry,
+  secretsEqual
 } from './oauth.js';
+import { isRateLimited, recordAuthFailure } from './ratelimit.js';
 
 const execFileAsync = promisify(execFile);
 const PYTHON_BIN = '/usr/bin/python3';
 const CLI_PATH = path.resolve(__dir, '../bin/imessage');
+// launchd node lacks Full Disk Access; sshd has it. Route CLI via localhost SSH
+// so chat.db reads work without GUI TCC grants (SIP blocks writing TCC.db).
+const IMESSAGE_SSH_FDA = process.env.IMESSAGE_SSH_FDA !== 'false';
+const SSH_BIN = process.env.SSH_BIN || '/usr/bin/ssh';
+const SSH_FDA_HOST = process.env.IMESSAGE_SSH_FDA_HOST || 'localhost';
+const CLI_MAX_BUFFER = 32 * 1024 * 1024;
+
+async function runImessageCli(cliArgs: string[]): Promise<string> {
+  try {
+    if (IMESSAGE_SSH_FDA) {
+      const { stdout } = await execFileAsync(
+        SSH_BIN,
+        [
+          '-o', 'BatchMode=yes',
+          '-o', 'StrictHostKeyChecking=accept-new',
+          '-o', 'IdentitiesOnly=yes',
+          '-o', 'ConnectTimeout=15',
+          '-o', 'LogLevel=ERROR',
+          SSH_FDA_HOST,
+          PYTHON_BIN,
+          CLI_PATH,
+          ...cliArgs,
+        ],
+        { maxBuffer: CLI_MAX_BUFFER },
+      );
+      return stdout;
+    }
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, ...cliArgs], {
+      maxBuffer: CLI_MAX_BUFFER,
+    });
+    return stdout;
+  } catch (err: any) {
+    const detail = [err.stderr, err.stdout, err.message]
+      .map((v) => (typeof v === 'string' ? v : v?.toString?.() || ''))
+      .find((s) => s.trim()) || String(err);
+    throw new Error(`imessage CLI failed: ${detail.trim().slice(0, 2000)}`);
+  }
+}
+
 
 const PORT = parseInt(process.env.PORT || '8765', 10);
+// Dual-stack: '::' accepts IPv6 + IPv4-mapped (Node default ipv6Only=false).
+// Override with HOST=0.0.0.0 for IPv4-only.
+const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
+const SERVER_VERSION = '1.1.0';
+const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
+const LEGACY_BEARER_TOKENS = new Set(
+  (process.env.LEGACY_BEARER_TOKENS || '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean)
+);
 
 /**
  * 2026-07-28 Model Context Protocol Specification Version
  */
 export const SPEC_VERSION = '2026-07-28';
+
+function publicBaseUrl(): string {
+  return `https://${PUBLIC_DOMAIN}`;
+}
+
+function resourceMetadataUrl(): string {
+  return `${publicBaseUrl()}/.well-known/oauth-protected-resource/mcp`;
+}
+
+function setWwwAuthenticate(res: Response, errorCode: string, description: string): void {
+  res.setHeader(
+    'WWW-Authenticate',
+    `Bearer error="${errorCode}", error_description="${description}", resource_metadata="${resourceMetadataUrl()}"`
+  );
+}
+
+function maskToken(token: string): string {
+  if (token.length <= 12) return '***';
+  return `${token.slice(0, 8)}…${token.slice(-4)}`;
+}
 
 /**
  * Detailed MCP tool definitions for iMessage integration.
@@ -230,6 +304,14 @@ interface PendingSend {
 }
 const pendingConfirmTokens = new Map<string, PendingSend>();
 
+function pruneExpiredConfirmTokens(now = Date.now()): void {
+  for (const [token, pending] of pendingConfirmTokens.entries()) {
+    if (now - pending.createdAt > CONFIRM_TOKEN_TTL_MS) {
+      pendingConfirmTokens.delete(token);
+    }
+  }
+}
+
 /**
  * Creates and configures an instance of the MCP Server.
  */
@@ -237,7 +319,7 @@ function createMcpServer(): Server {
   const server = new Server(
     {
       name: 'imessage-mcp-server',
-      version: '1.1.0'
+      version: SERVER_VERSION
     },
     {
       capabilities: {
@@ -327,7 +409,7 @@ iMessage MCP Server Instructions:
         };
       } else if (name === 'imessage_list_chats') {
         const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 100)) : 30;
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'list', '--limit', String(limit), '--json']);
+        const stdout = await runImessageCli(['list', '--limit', String(limit), '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -337,7 +419,7 @@ iMessage MCP Server Instructions:
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'read', chat, '--days', String(days), '--json']);
+        const stdout = await runImessageCli(['read', chat, '--days', String(days), '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -347,13 +429,13 @@ iMessage MCP Server Instructions:
         if (!query) {
           throw new Error('Missing required parameter "query"');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search', query, '--limit', String(limit), '--json']);
+        const stdout = await runImessageCli(['search', query, '--limit', String(limit), '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_search_contacts') {
         const query = String(args?.query || '').trim();
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'contacts', query, '--json']);
+        const stdout = await runImessageCli(['contacts', query, '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -363,7 +445,7 @@ iMessage MCP Server Instructions:
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'recent', chat, '--limit', String(limit), '--json']);
+        const stdout = await runImessageCli(['recent', chat, '--limit', String(limit), '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -373,7 +455,7 @@ iMessage MCP Server Instructions:
         if (participants.length === 0) {
           throw new Error('Missing required parameter "participants" (non-empty array)');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search-group', ...participants, '--json']);
+        const stdout = await runImessageCli(['search-group', ...participants, '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -382,7 +464,7 @@ iMessage MCP Server Instructions:
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'members', chat, '--json']);
+        const stdout = await runImessageCli(['members', chat, '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -391,7 +473,7 @@ iMessage MCP Server Instructions:
         if (!filePath) {
           throw new Error('Missing required parameter "path"');
         }
-        const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'attachment', filePath, '--json']);
+        const stdout = await runImessageCli(['attachment', filePath, '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -404,6 +486,7 @@ iMessage MCP Server Instructions:
         let attachment = String(args?.attachment || '').trim();
 
         if (confirmToken) {
+          pruneExpiredConfirmTokens();
           const pending = pendingConfirmTokens.get(confirmToken);
           if (!pending) {
             throw new Error(`Invalid or expired confirm_token: "${confirmToken}". Please run a new dry_run preview or send directly.`);
@@ -416,12 +499,13 @@ iMessage MCP Server Instructions:
 
         if (dryRun && !confirmToken) {
           if (!recipient) throw new Error('Missing required parameter "recipient"');
+          pruneExpiredConfirmTokens();
           const token = `cf_${crypto.randomBytes(8).toString('hex')}`;
           pendingConfirmTokens.set(token, { recipient, message, attachment, createdAt: Date.now() });
 
           let membersOutput = [];
           try {
-            const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'members', recipient, '--json']);
+            const stdout = await runImessageCli(['members', recipient, '--json']);
             membersOutput = JSON.parse(stdout);
           } catch {}
 
@@ -444,11 +528,11 @@ iMessage MCP Server Instructions:
             throw new Error('Missing required parameter "recipient"');
           }
 
-          const cliArgs = [CLI_PATH, 'send', recipient];
+          const cliArgs = ['send', recipient];
           if (message) cliArgs.push('-m', message);
           if (attachment) cliArgs.push('-a', attachment);
 
-          const { stdout } = await execFileAsync(PYTHON_BIN, cliArgs);
+          const stdout = await runImessageCli(cliArgs);
           result = {
             content: [{ type: 'text', text: stdout }]
           };
@@ -490,7 +574,55 @@ iMessage MCP Server Instructions:
 }
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  exposedHeaders: ['WWW-Authenticate', 'Mcp-Session-Id', 'MCP-Protocol-Version'],
+  allowedHeaders: [
+    'Authorization',
+    'Content-Type',
+    'Accept',
+    'Mcp-Session-Id',
+    'MCP-Protocol-Version',
+    'Mcp-Protocol-Version'
+  ]
+}));
+
+/** Parse JSON for /mcp POSTs (ping/initialize) without buffering SSE streams. */
+async function parseMcpRequestBody(req: Request): Promise<unknown> {
+  if (req.method !== 'POST') return undefined;
+  if (req.body !== undefined && req.body !== null && typeof req.body === 'object') {
+    return req.body;
+  }
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  if (!ct.includes('application/json')) return undefined;
+
+  return await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const maxBytes = 4 * 1024 * 1024;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error('Request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (chunks.length === 0) {
+        resolve(undefined);
+        return;
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch {
+        reject(new Error('Invalid JSON body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
 
 // Skip express.json for /mcp endpoints so @hono/node-server in MCP SDK can stream raw req
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -560,15 +692,30 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 /**
  * OAuth 2.0 Authorization Server Endpoints
+ * Serve RFC 8414 / RFC 9728 metadata at every path Grok/Cursor probe.
  */
-app.get('/.well-known/oauth-authorization-server', (_req, res) => {
-  const publicBase = `https://${PUBLIC_DOMAIN}`;
-  res.json(getOAuthMetadata(publicBase));
-});
+function sendOAuthMetadata(_req: Request, res: Response): void {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(getOAuthMetadata(publicBaseUrl()));
+}
+
+function sendProtectedResourceMetadata(_req: Request, res: Response): void {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(getProtectedResourceMetadata(publicBaseUrl(), '/mcp'));
+}
+
+app.get('/.well-known/oauth-authorization-server', sendOAuthMetadata);
+app.get('/.well-known/oauth-authorization-server/mcp', sendOAuthMetadata);
+app.get('/mcp/.well-known/oauth-authorization-server', sendOAuthMetadata);
+
+app.get('/.well-known/oauth-protected-resource', sendProtectedResourceMetadata);
+app.get('/.well-known/oauth-protected-resource/mcp', sendProtectedResourceMetadata);
+app.get('/mcp/.well-known/oauth-protected-resource', sendProtectedResourceMetadata);
 
 app.get('/oauth/authorize', handleAuthorizeGet);
 app.post('/oauth/authorize', handleAuthorizePost);
 app.post('/oauth/token', handleTokenPost);
+app.post('/oauth/register', handleRegisterPost);
 
 const sseSessions = new Map<string, { transport: SSEServerTransport; server: Server }>();
 const httpSessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server; lastAccess: number }>();
@@ -576,9 +723,11 @@ const httpSessions = new Map<string, { transport: StreamableHTTPServerTransport;
 // Session cleanup interval for Streamable HTTP transport
 setInterval(() => {
   const now = Date.now();
+  pruneExpiredConfirmTokens(now);
   for (const [sessionId, session] of httpSessions.entries()) {
     if (now - session.lastAccess > 300000) { // 5 minutes inactivity
       console.log(`[MCP] Cleaning up inactive Streamable HTTP session: ${sessionId}`);
+      session.transport.close().catch(() => {});
       session.server.close().catch(() => {});
       httpSessions.delete(sessionId);
     }
@@ -589,7 +738,15 @@ setInterval(() => {
  * Enhanced Middleware for Bearer Token & OAuth JWT Authentication
  */
 function authMiddleware(req: Request, res: Response, next: NextFunction): void {
-  if (['/', '/health', '/discover', '/.well-known/oauth-authorization-server'].includes(req.path) || req.path.startsWith('/oauth/')) {
+  if (req.method === 'OPTIONS') {
+    return next();
+  }
+  if (
+    ['/', '/health', '/discover'].includes(req.path)
+    || req.path.startsWith('/.well-known/')
+    || req.path.includes('/.well-known/')
+    || req.path.startsWith('/oauth/')
+  ) {
     return next();
   }
 
@@ -603,12 +760,18 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   }
 
   if (!token) {
+    recordAuthFailure(req);
+    if (isRateLimited(req)) {
+      res.status(429).json({ error: 'Too Many Requests: too many failed authentication attempts, retry later' });
+      return;
+    }
+    setWwwAuthenticate(res, 'invalid_token', 'Missing Authorization header or ?token parameter');
     res.status(401).json({ error: 'Unauthorized: Missing or invalid Authorization header or ?token parameter' });
     return;
   }
 
   // 1. Static Master Bearer token check (backward compatibility)
-  if (token === AUTH_TOKEN) {
+  if (secretsEqual(token, AUTH_TOKEN)) {
     (req as any).user = { sub: 'master-token', scope: 'imessage:all' };
     return next();
   }
@@ -616,16 +779,18 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   // 2. Client Registry secret token check (e.g. ubuntu-remote)
   const registry = getClientRegistry();
   for (const [clientId, clientSecret] of registry.entries()) {
-    if (token === clientSecret) {
+    if (secretsEqual(token, clientSecret)) {
       (req as any).user = { sub: clientId, scope: 'imessage:all' };
       return next();
     }
   }
 
-  // Legacy transition token check
-  if (token === 'ub_184426e568bbd48f4bc11b58d592eac020550327b0e7063549c0d32c8afa3a52') {
-    (req as any).user = { sub: 'ubuntu-remote-legacy', scope: 'imessage:all' };
-    return next();
+  // Legacy transition tokens (env-configurable; avoids hardcoded secrets in source)
+  for (const legacyToken of LEGACY_BEARER_TOKENS) {
+    if (secretsEqual(token, legacyToken)) {
+      (req as any).user = { sub: 'legacy-client', scope: 'imessage:all' };
+      return next();
+    }
   }
 
   // 3. OAuth 2.0 JWT verification
@@ -635,6 +800,12 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
     return next();
   }
 
+  recordAuthFailure(req);
+  if (isRateLimited(req)) {
+    res.status(429).json({ error: 'Too Many Requests: too many failed authentication attempts, retry later' });
+    return;
+  }
+  setWwwAuthenticate(res, 'invalid_token', 'Invalid bearer token or expired OAuth JWT');
   res.status(403).json({ error: 'Forbidden: Invalid bearer token or expired OAuth JWT' });
 }
 
@@ -642,7 +813,7 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
  * Root discovery HTML / documentation page.
  */
 app.get('/', (_req, res) => {
-  const publicBase = `https://${PUBLIC_DOMAIN}`;
+  const publicBase = publicBaseUrl();
   res.setHeader('Content-Type', 'text/html');
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -690,6 +861,9 @@ app.get('/', (_req, res) => {
     <li><code>imessage_get_chat_members</code>: Get members of a group chat.</li>
     <li><code>imessage_get_attachment_payload</code>: Fetch attachment metadata and base64 payload.</li>
     <li><code>imessage_send_message</code>: Send an iMessage with text and/or attachments.</li>
+    <li><code>imessage_get_recent_messages</code>: Preview last N messages before sending.</li>
+    <li><code>imessage_search_group_chats</code>: Find group chats by participant set.</li>
+    <li><code>imessage_get_readme</code>: Full server README and setup guide.</li>
   </ul>
 </body>
 </html>
@@ -703,11 +877,12 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'imessage-mcp-server',
-    version: '1.1.0',
+    version: SERVER_VERSION,
     mcpProtocolVersion: SPEC_VERSION,
     publicDomain: PUBLIC_DOMAIN,
     activeSseSessions: sseSessions.size,
     activeHttpSessions: httpSessions.size,
+    imessageSshFda: IMESSAGE_SSH_FDA,
     transports: ['sse', 'streamable-http']
   });
 });
@@ -716,10 +891,10 @@ app.get('/health', (_req, res) => {
  * Structured discovery JSON endpoint (2026-07-28 Spec Compliant).
  */
 app.get('/discover', (_req, res) => {
-  const publicBase = `https://${PUBLIC_DOMAIN}`;
+  const publicBase = publicBaseUrl();
   res.json({
     name: 'imessage-mcp-server',
-    version: '1.1.0',
+    version: SERVER_VERSION,
     mcpProtocolVersion: SPEC_VERSION,
     description: 'iMessage MCP Server over HTTP/HTTPS and SSE for macOS (Stateless & MRTR Enabled)',
     publicDomain: PUBLIC_DOMAIN,
@@ -742,7 +917,8 @@ app.get('/discover', (_req, res) => {
       sse: `${publicBase}/sse`,
       health: `${publicBase}/health`,
       discover: `${publicBase}/discover`,
-      oauthMetadata: `${publicBase}/.well-known/oauth-authorization-server`
+      oauthMetadata: `${publicBase}/.well-known/oauth-authorization-server`,
+      protectedResourceMetadata: `${publicBase}/.well-known/oauth-protected-resource/mcp`
     },
     auth: {
       type: 'bearer',
@@ -760,13 +936,23 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('X-Accel-Buffering', 'no');
 
+  let parsedBody: unknown;
+  try {
+    parsedBody = await parseMcpRequestBody(req);
+  } catch (err: any) {
+    if (!res.headersSent) {
+      res.status(400).json({ error: 'Bad Request', message: err.message || String(err) });
+    }
+    return;
+  }
+
   // Handle standalone GET health probe requests (e.g. grok mcp doctor probes)
   if (req.method === 'GET' && !req.headers['mcp-session-id'] && !req.headers['Mcp-Session-Id']) {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.status(200).send(JSON.stringify({
       status: 'ok',
       server: 'imessage-mcp-server',
-      version: '1.1.0',
+      version: SERVER_VERSION,
       mcpProtocolVersion: SPEC_VERSION,
       publicDomain: PUBLIC_DOMAIN,
       transports: ['streamable-http', 'sse']
@@ -775,22 +961,23 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
   }
 
   // Handle ping & notification probes for grok/mcp doctor checks without requiring an active session
-  if (req.body && typeof req.body === 'object') {
-    if (req.body.method === 'ping') {
+  if (parsedBody && typeof parsedBody === 'object') {
+    const body = parsedBody as Record<string, unknown>;
+    if (body.method === 'ping') {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.status(200).send(JSON.stringify({
         jsonrpc: '2.0',
         result: {},
-        id: req.body.id ?? 1
+        id: body.id ?? 1
       }));
       return;
     }
-    if (req.body.method === 'notifications/initialized') {
+    if (body.method === 'notifications/initialized') {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.status(200).send(JSON.stringify({
         jsonrpc: '2.0',
         result: {},
-        id: req.body.id ?? null
+        id: body.id ?? null
       }));
       return;
     }
@@ -824,7 +1011,7 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
     const session = httpSessions.get(reqSessionId)!;
     session.lastAccess = Date.now();
     try {
-      await session.transport.handleRequest(req, res, req.body);
+      await session.transport.handleRequest(req, res, parsedBody);
     } catch (err: any) {
       console.error(`[MCP Session Error] ${reqSessionId}:`, err);
       if (!res.headersSent) {
@@ -845,7 +1032,7 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
     const server = createMcpServer();
     await server.connect(transport);
 
-    await transport.handleRequest(req, res, req.body);
+    await transport.handleRequest(req, res, parsedBody);
 
     if (generatedSessionId) {
       httpSessions.set(generatedSessionId, { transport, server, lastAccess: Date.now() });
@@ -875,6 +1062,7 @@ app.get('/sse', authMiddleware, async (req, res) => {
     console.log(`[MCP] SSE client disconnected: ${transport.sessionId}`);
     sseSessions.delete(transport.sessionId);
     try {
+      await transport.close();
       await server.close();
     } catch (e) {}
   });
@@ -910,24 +1098,26 @@ if (process.env.NODE_ENV !== 'test') {
       cert: fs.readFileSync(certPath)
     };
 
-    https.createServer(options, app).listen(PORT, '0.0.0.0', () => {
+    https.createServer(options, app).listen(PORT, HOST, () => {
       console.log(`=======================================================`);
       console.log(`iMessage MCP Server running over HTTPS:`);
-      console.log(`  Discovery Page:      https://0.0.0.0:${PORT}/`);
-      console.log(`  Streamable HTTP:     https://0.0.0.0:${PORT}/mcp`);
-      console.log(`  SSE Transport:        https://0.0.0.0:${PORT}/sse`);
-      console.log(`  Bearer Token:        ${AUTH_TOKEN}`);
+      console.log(`  Discovery Page:      https://[${HOST}]:${PORT}/`);
+      console.log(`  Streamable HTTP:     https://[${HOST}]:${PORT}/mcp`);
+      console.log(`  SSE Transport:        https://[${HOST}]:${PORT}/sse`);
+      console.log(`  Bearer Token:        ${maskToken(AUTH_TOKEN)} (see .env)`);
       console.log(`=======================================================`);
     });
   } else {
-    http.createServer(app).listen(PORT, '0.0.0.0', () => {
+    http.createServer(app).listen(PORT, HOST, () => {
       console.log(`=======================================================`);
       console.log(`iMessage MCP Server running over HTTP:`);
-      console.log(`  Discovery Page:      http://0.0.0.0:${PORT}/`);
-      console.log(`  Streamable HTTP:     http://0.0.0.0:${PORT}/mcp`);
-      console.log(`  SSE Transport:        http://0.0.0.0:${PORT}/sse`);
-      console.log(`  Bearer Token:        ${AUTH_TOKEN}`);
+      console.log(`  Discovery Page:      http://[${HOST}]:${PORT}/`);
+      console.log(`  Streamable HTTP:     http://[${HOST}]:${PORT}/mcp`);
+      console.log(`  SSE Transport:        http://[${HOST}]:${PORT}/sse`);
+      console.log(`  Bearer Token:        ${maskToken(AUTH_TOKEN)} (see .env)`);
       console.log(`=======================================================`);
     });
   }
 }
+
+export { app };
