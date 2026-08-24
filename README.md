@@ -16,7 +16,7 @@ It connects your local Mac's iMessage database (`~/Library/Messages/chat.db`), m
 - **Full-Text Message Search:** Instant SQLite query across historical iMessage text and rich attributed bodies.
 - **Contact Resolution:** Integrates with macOS Contacts database (`AddressBook-v22.abcddb`) to resolve names, phone numbers, and emails.
 - **Multimodal Attachment Reading:** Exposes attachment metadata (MIME type, size, path) and automatically converts `.heic` photos to `.jpg` for vision-capable LLMs.
-- **Single-Bubble Attachment Sending:** Swift NSPasteboard + System Events paste pipeline that combines text and file attachments into a single message bubble without triggering "Not Delivered" sandboxing failures.
+- **Reliable Attachment Sending:** Sends route through the [imsg](https://github.com/openclaw/imsg) CLI when installed, with a native AppleScript fallback that stages files inside Messages' own attachments directory to avoid "Not Delivered" sandboxing failures. No Accessibility/GUI scripting required.
 - **Group Chat Rosters:** Inspects group conversation member lists and handles.
 - **Bearer Token Auth:** Secures all MCP endpoints behind customizable Bearer token authentication.
 
@@ -40,7 +40,7 @@ It connects your local Mac's iMessage database (`~/Library/Messages/chat.db`), m
                          ▼                                             ▼                                            ▼
            ┌──────────────────────────┐                  ┌──────────────────────────┐                 ┌──────────────────────────┐
            │ Messages DB (Read-Only)  │                  │ Contacts DB (Read-Only)  │                 │ Messages.app Automation  │
-           │ ~/Library/Messages/chat.db│                  │ AddressBook-v22.abcddb   │                 │ Swift NSPasteboard + GUI │
+           │ ~/Library/Messages/chat.db│                  │ AddressBook-v22.abcddb   │                 │ imsg CLI + AppleScript   │
            └──────────────────────────┘                  └──────────────────────────┘                 └──────────────────────────┘
 ```
 
@@ -90,11 +90,9 @@ Due to macOS privacy safeguards (TCC), the process executing the server requires
 1. Open **System Settings → Privacy & Security → Full Disk Access**.
 2. Enable the toggle for **Terminal** (or **sshd-daemon** if running remotely over SSH).
 
-#### B. Accessibility & Automation (Required for sending attachments)
-1. Open **System Settings → Privacy & Security → Accessibility**.
-2. Click **`+`**, press `Cmd + Shift + G`, paste `/usr/libexec/sshd-keygen-wrapper` (or your Terminal app path), and click **Open**.
-3. Ensure the toggle switch is turned **ON**.
-4. Open **System Settings → Privacy & Security → Automation** and ensure **Terminal** / **sshd** has permission to control **System Events** and **Messages**.
+#### B. Automation (Required for sending)
+1. Open **System Settings → Privacy & Security → Automation** and ensure **Terminal** / **sshd** has permission to control **Messages**.
+2. (Recommended) Install the [imsg](https://github.com/openclaw/imsg) CLI for the primary send path: `brew install steipete/tap/imsg`. Without it, sends fall back to native AppleScript with sandbox-safe attachment staging.
 
 ### 4. Build & Start Server
 
@@ -249,7 +247,7 @@ If you wish to log AI agent action executions for security auditing, set `ENABLE
 ## Known Limitations & Considerations
 
 1. **Host Mac Requirement:** Must run on a physical Mac or macOS VM signed into an active Apple ID.
-2. **AppleScript Attachment Sandboxing:** Native AppleScript `send alias` in macOS Sonoma/Sequoia marks attachments as "Not Delivered". This server bypasses that bug using a Swift NSPasteboard paste workflow; therefore, the host Mac must be in an active Aqua GUI session.
+2. **AppleScript Attachment Sandboxing:** Messages' sandbox blocks reading attachments from arbitrary paths (`/tmp`, `~/Desktop`, ...), which historically surfaced as "Not Delivered". This server avoids it by sending through the imsg CLI (which stages files itself), or in the AppleScript fallback by staging files under `~/Library/Messages/Attachments/imessage-mcp/` first (this folder is not pruned automatically). A logged-in user session is still required for Messages automation.
 3. **Read-Only SQLite Access:** Database reads use `URI mode=ro` (`sqlite3.connect('file:chat.db?mode=ro', uri=True)`) to ensure `chat.db` is never locked or corrupted by server reads.
 4. **SMS vs iMessage:** Text-only messages fallback gracefully to SMS if the recipient handle is a mobile phone number registered on your iPhone's Text Message Forwarding network.
 

@@ -5,6 +5,8 @@ import datetime
 import os
 import sys
 import subprocess
+import shutil
+import time
 import glob
 import json
 import base64
@@ -479,89 +481,131 @@ def get_attachment_payload(args):
         print(f"MIME: {mime} ({len(data)} bytes)")
         print(f"Base64 string length: {len(payload['base64'])} characters")
 
-def send_message(args):
-    recipient = args.recipient
-    message = args.message
-    attachment = args.attachment
+IMSG_UNCERTAIN_MARKERS = ('may_have_completed', 'still_in_flight')
+ATTACHMENT_STAGING_DIR = os.path.expanduser("~/Library/Messages/Attachments/imessage-mcp")
 
-    # Resolve recipient against chat.db (group chats, display names, or numeric ROWIDs)
-    target_ident = recipient
+
+def _resolve_chat(recipient):
+    """Resolve recipient to (chat_rowid, chat_identifier) via chat.db; falls back to (None, recipient)."""
     try:
-        conn = get_db_connection()
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
         c = conn.cursor()
         if recipient.isdigit():
-            c.execute("SELECT chat_identifier FROM chat WHERE ROWID = ?", (int(recipient),))
-            row = c.fetchone()
-            if row and row[0]:
-                target_ident = row[0]
+            c.execute("SELECT ROWID, chat_identifier FROM chat WHERE ROWID = ?", (int(recipient),))
         else:
-            c.execute("SELECT chat_identifier FROM chat WHERE display_name LIKE ? OR chat_identifier = ?", (f"%{recipient}%", recipient))
-            row = c.fetchone()
-            if row and row[0]:
-                target_ident = row[0]
+            c.execute("SELECT ROWID, chat_identifier FROM chat WHERE display_name LIKE ? OR chat_identifier = ?", (f"%{recipient}%", recipient))
+        row = c.fetchone()
         conn.close()
+        if row and row[1]:
+            return row[0], row[1]
     except Exception:
         pass
-    
+    return None, recipient
+
+
+def _send_via_imsg(chat_rowid, recipient, message, attachment_path):
+    """Send through the imsg CLI. Returns (status, detail) where status is 'sent', 'uncertain', or 'unavailable'."""
+    imsg_bin = os.environ.get('IMSG_BIN') or shutil.which('imsg') or '/opt/homebrew/bin/imsg'
+    if not os.path.exists(imsg_bin):
+        return 'unavailable', 'imsg CLI not installed'
+
+    cmd = [imsg_bin, 'send']
+    if chat_rowid is not None:
+        cmd += ['--chat-id', str(chat_rowid)]
+    else:
+        cmd += ['--to', recipient]
+    if message:
+        cmd += ['--text', message]
+    if attachment_path:
+        cmd += ['--file', attachment_path]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return 'uncertain', 'imsg send timed out after 180s; outcome unknown, not retrying'
+
+    detail = (res.stderr or res.stdout or '').strip()
+    if res.returncode == 0:
+        return 'sent', detail
+    # imsg reports delivery disposition on failed mutations; anything that may
+    # have reached Messages must not be retried on another transport.
+    if any(marker in detail for marker in IMSG_UNCERTAIN_MARKERS):
+        return 'uncertain', detail
+    return 'unavailable', detail or f'imsg exited with code {res.returncode}'
+
+
+def _stage_attachment(attachment_path):
+    """Copy the file into Messages' own attachments dir; its sandbox blocks reads from /tmp, Desktop, etc."""
+    os.makedirs(ATTACHMENT_STAGING_DIR, exist_ok=True)
+    staged = os.path.join(ATTACHMENT_STAGING_DIR, f"{int(time.time())}_{os.path.basename(attachment_path)}")
+    shutil.copy2(attachment_path, staged)
+    return staged
+
+
+def _send_via_applescript(target_ident, recipient, message, attachment_path):
+    """Fallback: native AppleScript send. Attachment and text arrive as separate bubbles."""
+    script = """on run argv
+    set chatIdent to item 1 of argv
+    set rawRecipient to item 2 of argv
+    set messageText to item 3 of argv
+    set filePath to item 4 of argv
+    tell application "Messages"
+        try
+            set targetChat to first chat whose id contains chatIdent or guid contains chatIdent
+            if filePath is not "" then send POSIX file filePath to targetChat
+            if messageText is not "" then send messageText to targetChat
+            return
+        on error
+        end try
+        try
+            if filePath is not "" then send POSIX file filePath to buddy chatIdent
+            if messageText is not "" then send messageText to buddy chatIdent
+            return
+        on error
+        end try
+        if filePath is not "" then send POSIX file filePath to buddy rawRecipient
+        if messageText is not "" then send messageText to buddy rawRecipient
+    end tell
+end run"""
+    staged_path = _stage_attachment(attachment_path) if attachment_path else ''
+    res = subprocess.run(
+        ['osascript', '-e', script, target_ident, recipient, message or '', staged_path],
+        capture_output=True, text=True
+    )
+    if res.returncode != 0:
+        print(f"ERROR: AppleScript send failed: {res.stderr or res.stdout}", file=sys.stderr)
+        sys.exit(1)
+
+
+def send_message(args):
+    recipient = args.recipient
+    message = args.message or ''
+    attachment = args.attachment
+
+    attachment_path = None
     if attachment:
         attachment_path = os.path.abspath(os.path.expanduser(attachment))
         if not os.path.exists(attachment_path):
             print(f"ERROR: Attachment file not found at '{attachment_path}'", file=sys.stderr)
             sys.exit(1)
-            
-        swift_script = f"""import Cocoa
-let url = URL(fileURLWithPath: "{attachment_path}")
-let pb = NSPasteboard.general
-pb.clearContents()
-pb.writeObjects([url as NSURL])
-"""
-        subprocess.run(['swift', '-'], input=swift_script, text=True, check=True)
-        
-        msg_str = (message or '').replace('\\', '\\\\').replace('"', '\\"')
-        type_code = f'keystroke "{msg_str}"' if msg_str else ''
 
-        applescript_att = f'''open location "imessage://{target_ident}"
-delay 0.8
-tell application "System Events"
-    tell process "Messages"
-        keystroke "v" using {{command down}}
-        delay 0.5
-        {type_code}
-        delay 0.3
-        key code 36
-    end tell
-end tell'''
-        res = subprocess.run(['osascript', '-e', applescript_att], capture_output=True, text=True)
-        if res.returncode != 0:
-            print(f"ERROR: Could not paste/send attachment: {res.stderr or res.stdout}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Attachment '{attachment_path}' sent to '{recipient}' ({target_ident}) successfully!")
+    if not message and not attachment_path:
+        print("ERROR: Nothing to send: provide --message and/or --attachment", file=sys.stderr)
+        sys.exit(1)
 
-    elif message:
-        applescript_msg = """on run argv
-    set chatIdent to item 1 of argv
-    set rawRecipient to item 2 of argv
-    set messageText to item 3 of argv
-    tell application "Messages"
-        try
-            set targetChat to first chat whose id contains chatIdent or guid contains chatIdent
-            send messageText to targetChat
-            return
-        on error
-        end try
-        try
-            send messageText to buddy chatIdent
-            return
-        on error
-        end try
-        send messageText to buddy rawRecipient
-    end tell
-end run"""
-        res = subprocess.run(['osascript', '-e', applescript_msg, target_ident, recipient, message], capture_output=True, text=True)
-        if res.returncode != 0:
-            print(f"ERROR: Could not send text message: {res.stderr or res.stdout}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Message sent to '{recipient}' ({target_ident}) successfully!")
+    chat_rowid, target_ident = _resolve_chat(recipient)
+
+    status, detail = _send_via_imsg(chat_rowid, recipient, message, attachment_path)
+    if status == 'sent':
+        print(f"Message sent to '{recipient}' ({target_ident}) via imsg successfully!")
+        return
+    if status == 'uncertain':
+        print(f"ERROR: imsg send outcome uncertain, not retrying to avoid double-send: {detail}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"imsg unavailable ({detail}); falling back to AppleScript", file=sys.stderr)
+    _send_via_applescript(target_ident, recipient, message, attachment_path)
+    print(f"Message sent to '{recipient}' ({target_ident}) via AppleScript successfully!")
 
 def get_recent_messages(args):
     conn = get_db_connection()
