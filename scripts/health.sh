@@ -17,7 +17,7 @@ else
 fi
 
 # 2. Cloudflare Tunnel Service Check
-TUNNEL_ACTIVE=$(launchctl list 2>/dev/null | grep "com.genericservice.imessage-tunnel" || true)
+TUNNEL_ACTIVE=$(launchctl list 2>/dev/null | grep -E "com.genericservice.imessage-cloudflared|com.genericservice.imessage-tunnel" || true)
 if [[ -n "$TUNNEL_ACTIVE" ]]; then
   printf "  %-30s ${GREEN}OK (Active Launchd Service)${NC}\n" "Cloudflare Tunnel Service"
 else
