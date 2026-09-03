@@ -169,6 +169,85 @@ export function verifyJwt(token: string): Record<string, any> | null {
   }
 }
 
+export const SESSION_COOKIE_NAME = 'imessage_session';
+export const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+/**
+ * Validate logon credentials against configured username/password or master token fallback.
+ */
+export function validateLogonCredentials(username: string, password: string): boolean {
+  if (!password) return false;
+
+  const expectedUser = process.env.AUTH_USERNAME || 'matthias';
+  const expectedPass = process.env.AUTH_PASSWORD;
+  const masterToken = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || '';
+
+  // 1. Password check against configured AUTH_PASSWORD
+  if (expectedPass && secretsEqual(password, expectedPass)) {
+    if (!expectedUser || secretsEqual(username || expectedUser, expectedUser)) {
+      return true;
+    }
+  }
+
+  // 2. Backward compatibility: master BEARER_TOKEN accepted in password field
+  if (masterToken && secretsEqual(password, masterToken)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Sign an HMAC-SHA256 session cookie for browser persistence.
+ */
+export function createSessionCookie(username: string): string {
+  const payload = JSON.stringify({
+    user: username,
+    exp: Date.now() + SESSION_MAX_AGE_MS
+  });
+  const encodedPayload = base64UrlEncode(payload);
+  const signature = crypto.createHmac('sha256', JWT_SECRET).update(encodedPayload).digest();
+  const encodedSig = base64UrlEncode(signature);
+  return `${encodedPayload}.${encodedSig}`;
+}
+
+/**
+ * Verify and decode an HMAC-SHA256 session cookie.
+ */
+export function verifySessionCookie(cookieValue: string): { user: string; exp: number } | null {
+  try {
+    if (!cookieValue || !cookieValue.includes('.')) return null;
+    const [encodedPayload, encodedSig] = cookieValue.split('.');
+    if (!encodedPayload || !encodedSig) return null;
+
+    const expectedSig = base64UrlEncode(crypto.createHmac('sha256', JWT_SECRET).update(encodedPayload).digest());
+    if (!secretsEqual(encodedSig, expectedSig)) return null;
+
+    const payload = JSON.parse(base64UrlDecode(encodedPayload));
+    if (!payload.exp || Date.now() > payload.exp) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Minimal request cookie header parser.
+ */
+export function parseCookies(req: Request): Record<string, string> {
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return {};
+  const cookies: Record<string, string> = {};
+  for (const pair of cookieHeader.split(';')) {
+    const idx = pair.indexOf('=');
+    if (idx < 0) continue;
+    const key = pair.substring(0, idx).trim();
+    const val = pair.substring(idx + 1).trim();
+    cookies[key] = decodeURIComponent(val);
+  }
+  return cookies;
+}
+
 /**
  * OAuth 2.0 Server Metadata Endpoint (RFC 8414)
  */
@@ -177,10 +256,10 @@ export function getOAuthMetadata(baseUrl: string) {
     issuer: baseUrl,
     authorization_endpoint: `${baseUrl}/oauth/authorize`,
     token_endpoint: `${baseUrl}/oauth/token`,
-    // Registration is not public; clients must use a backend-minted bearer token.
+    registration_endpoint: `${baseUrl}/oauth/register`,
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'client_credentials', 'refresh_token'],
-    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_basic', 'client_secret_post'],
     code_challenge_methods_supported: ['S256'],
     scopes_supported: ['imessage:read', 'imessage:write', 'imessage:all']
   };
@@ -202,11 +281,9 @@ export function getProtectedResourceMetadata(baseUrl: string, resourcePath = '/m
 }
 
 /**
- * RFC 7591 Dynamic Client Registration (required by Grok/Cursor OAuth connectors).
+ * RFC 7591 Dynamic Client Registration (open for client apps using PKCE or client secrets).
  */
 export function handleRegisterPost(req: Request, res: Response) {
-  if (!requireAdminToken(req, res)) return;
-
   const body = req.body || {};
   const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.map(String) : [];
   if (redirectUris.length === 0) {
@@ -216,7 +293,7 @@ export function handleRegisterPost(req: Request, res: Response) {
     });
   }
 
-  const authMethod = String(body.token_endpoint_auth_method || 'client_secret_post');
+  const authMethod = String(body.token_endpoint_auth_method || 'none');
   const isPublic = authMethod === 'none';
   const clientId = crypto.randomUUID();
   const issuedAt = Math.floor(Date.now() / 1000);
@@ -260,6 +337,59 @@ export function handleAuthorizeGet(req: Request, res: Response) {
     return res.status(400).send('Unsupported response_type. Must be "code".');
   }
 
+  const dyn = getDynamicClient(clientId);
+  const clientDisplayName = dyn?.clientName || clientId || 'Gemini Desktop / MCP Client';
+
+  // Check for active session cookie
+  const cookies = parseCookies(req);
+  const sessionCookie = cookies[SESSION_COOKIE_NAME];
+  const session = sessionCookie ? verifySessionCookie(sessionCookie) : null;
+  const defaultUsername = process.env.AUTH_USERNAME || 'matthias';
+
+  const bodyContent = session ? `
+    <h2>Authorize Client Access</h2>
+    <p>Signed in as <strong style="color:#d4a843;">${escapeHtml(session.user)}</strong></p>
+    <div class="client-box">
+      <strong>Application:</strong> ${escapeHtml(clientDisplayName)}<br>
+      <strong>Client ID:</strong> ${escapeHtml(clientId || 'Default Client')}<br>
+      <strong>Redirect URI:</strong> ${escapeHtml(redirectUri || 'Loopback')}
+    </div>
+    <form method="POST" action="/oauth/authorize">
+      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
+      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
+      <input type="hidden" name="state" value="${escapeHtml(state)}">
+      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
+      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}">
+      <button type="submit" class="btn">Approve & Grant Access</button>
+      <div style="margin-top:16px;text-align:center;">
+        <a href="/oauth/logout?redirect_uri=${encodeURIComponent(req.originalUrl || req.url)}" style="color:#a3a3a3;font-size:0.8rem;text-decoration:none;">Log out or switch user</a>
+      </div>
+    </form>` : `
+    <h2>Sign in to iMessage MCP</h2>
+    <p>Enter your credentials to approve application access to iMessage.</p>
+    <div class="client-box">
+      <strong>Application:</strong> ${escapeHtml(clientDisplayName)}<br>
+      <strong>Client ID:</strong> ${escapeHtml(clientId || 'Default Client')}
+    </div>
+    <form method="POST" action="/oauth/authorize">
+      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
+      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
+      <input type="hidden" name="state" value="${escapeHtml(state)}">
+      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
+      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}">
+      <label style="display:block;margin:0 0 6px;color:#a3a3a3;font-size:0.85rem;">Username</label>
+      <input type="text" name="username" value="${escapeHtml(defaultUsername)}" required
+        style="width:100%;box-sizing:border-box;margin-bottom:12px;padding:10px;border-radius:6px;border:1px solid #404040;background:#0a0a0a;color:#f5f0eb;">
+      <label style="display:block;margin:0 0 6px;color:#a3a3a3;font-size:0.85rem;">Password</label>
+      <input type="password" name="password" autocomplete="current-password" required
+        style="width:100%;box-sizing:border-box;margin-bottom:12px;padding:10px;border-radius:6px;border:1px solid #404040;background:#0a0a0a;color:#f5f0eb;">
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:16px;color:#a3a3a3;font-size:0.85rem;cursor:pointer;">
+        <input type="checkbox" name="remember_me" value="true" checked style="accent-color:#d4a843;">
+        Remember this browser for 30 days
+      </label>
+      <button type="submit" class="btn">Sign In & Authorize</button>
+    </form>`;
+
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -270,7 +400,7 @@ export function handleAuthorizeGet(req: Request, res: Response) {
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0a0a0a; color: #f5f0eb; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
     .card { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 32px; width: 100%; max-width: 420px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }
     h2 { margin-top: 0; color: #d4a843; font-size: 1.25rem; font-weight: 600; }
-    p { color: #a3a3a3; font-size: 0.9rem; line-height: 1.5; }
+    p { color: #a3a3a3; font-size: 0.9rem; line-height: 1.5; margin-bottom: 16px; }
     .client-box { background: #262626; padding: 12px; border-radius: 8px; font-size: 0.85rem; word-break: break-all; margin: 16px 0; color: #e5e5e5; }
     .btn { background: #d4a843; color: #0a0a0a; border: none; padding: 12px 20px; border-radius: 6px; font-weight: 600; cursor: pointer; width: 100%; font-size: 0.95rem; }
     .btn:hover { background: #e5b954; }
@@ -278,23 +408,7 @@ export function handleAuthorizeGet(req: Request, res: Response) {
 </head>
 <body>
   <div class="card">
-    <h2>Authorize Client Access</h2>
-    <p>This approval is gated by the backend bearer token. Random visitors cannot grant access.</p>
-    <div class="client-box">
-      <strong>Client ID:</strong> ${escapeHtml(clientId || 'Default Client')}<br>
-      <strong>Redirect URI:</strong> ${escapeHtml(redirectUri || 'None')}
-    </div>
-    <form method="POST" action="/oauth/authorize">
-      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
-      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
-      <input type="hidden" name="state" value="${escapeHtml(state)}">
-      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
-      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}">
-      <label style="display:block;margin:0 0 8px;color:#a3a3a3;font-size:0.85rem;">Backend token</label>
-      <input type="password" name="admin_token" autocomplete="current-password" required
-        style="width:100%;box-sizing:border-box;margin-bottom:16px;padding:10px;border-radius:6px;border:1px solid #404040;background:#0a0a0a;color:#f5f0eb;">
-      <button type="submit" class="btn">Approve & Grant Access</button>
-    </form>
+    ${bodyContent}
   </div>
 </body>
 </html>`;
@@ -307,11 +421,37 @@ export function handleAuthorizeGet(req: Request, res: Response) {
  * Handle Authorization Submission (POST /oauth/authorize)
  */
 export function handleAuthorizePost(req: Request, res: Response) {
-  if (!requireAdminToken(req, res)) return;
-
-  const { client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.body;
+  const { client_id, redirect_uri, state, code_challenge, code_challenge_method, username, password, admin_token, remember_me } = req.body;
   const clientId = String(client_id || DEFAULT_CLIENT_ID);
   const redirectUri = String(redirect_uri || '');
+
+  // 1. Verify session or credentials
+  const cookies = parseCookies(req);
+  const sessionCookie = cookies[SESSION_COOKIE_NAME];
+  const existingSession = sessionCookie ? verifySessionCookie(sessionCookie) : null;
+
+  let authenticatedUser = existingSession?.user;
+
+  if (!authenticatedUser) {
+    const candidateUser = String(username || '').trim();
+    const candidatePass = String(password || admin_token || '').trim();
+
+    if (!validateLogonCredentials(candidateUser, candidatePass)) {
+      authFailure(req, res, 401, {
+        error: 'unauthorized',
+        error_description: 'Invalid credentials. Enter valid username and password.'
+      });
+      return;
+    }
+    authenticatedUser = candidateUser || process.env.AUTH_USERNAME || 'matthias';
+
+    // Set 30-day session cookie if requested
+    if (remember_me !== 'false') {
+      const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.USE_HTTPS === 'true';
+      const cookieVal = createSessionCookie(authenticatedUser);
+      res.setHeader('Set-Cookie', `${SESSION_COOKIE_NAME}=${encodeURIComponent(cookieVal)}; Path=/oauth; HttpOnly; SameSite=Lax; Max-Age=${SESSION_MAX_AGE_MS / 1000}${isSecure ? '; Secure' : ''}`);
+    }
+  }
 
   const dyn = getDynamicClient(clientId);
   if (dyn && redirectUri && !dyn.redirectUris.includes(redirectUri)) {
@@ -335,6 +475,18 @@ export function handleAuthorizePost(req: Request, res: Response) {
   }
 
   res.json({ code, state, message: 'Authorization code generated successfully.' });
+}
+
+/**
+ * Handle Logout (GET /oauth/logout)
+ */
+export function handleLogoutGet(req: Request, res: Response) {
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE_NAME}=; Path=/oauth; HttpOnly; SameSite=Lax; Max-Age=0`);
+  const redirectUri = req.query.redirect_uri || req.query.return_to;
+  if (redirectUri && typeof redirectUri === 'string' && (redirectUri.startsWith('/') || redirectUri.startsWith('http'))) {
+    return res.redirect(redirectUri);
+  }
+  res.send('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Logged Out</title><style>body{font-family:sans-serif;background:#0a0a0a;color:#f5f0eb;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}</style></head><body><div style="background:#171717;border:1px solid #262626;border-radius:12px;padding:32px;text-align:center;"><h2>Signed Out</h2><p style="color:#a3a3a3;">You have been logged out of iMessage OAuth sessions.</p></div></body></html>');
 }
 
 /**

@@ -176,8 +176,22 @@ The server embeds a native **OAuth 2.0 Authorization Server** supporting RFC 841
 * **Discovery URL:** `https://imessage.genericservice.app/.well-known/oauth-authorization-server`
 * **Authorization Endpoint:** `https://imessage.genericservice.app/oauth/authorize`
 * **Token Endpoint:** `https://imessage.genericservice.app/oauth/token`
+* **Registration Endpoint:** `https://imessage.genericservice.app/oauth/register`
 
-### 2. Client Credentials Token Exchange (CLI & Headless Agents)
+### 2. Zero-Config Client Connection (RFC 7591 Dynamic Registration)
+Clients supporting RFC 7591 (such as Gemini Desktop or Cursor) connect automatically without requiring manually provisioned client IDs or secrets:
+1. Provide the MCP server URL (`https://imessage.genericservice.app/mcp`) in the client.
+2. The client discovers `registration_endpoint` and automatically registers its own identity using PKCE (`token_endpoint_auth_method: none`).
+3. The client opens your browser to `/oauth/authorize` for logon approval.
+
+### 3. Browser Logon & Session Persistence
+The authorization endpoint provides a browser logon screen:
+* Log in with `AUTH_USERNAME` and `AUTH_PASSWORD` (or your master `BEARER_TOKEN`).
+* Checking **"Remember this browser"** issues a signed, 30-day `HttpOnly` session cookie (`imessage_session`).
+* Subsequent client connections from that browser only require a single **"Approve"** click without re-typing credentials.
+* To clear sessions, navigate to `/oauth/logout`.
+
+### 4. Client Credentials Token Exchange (CLI & Headless Agents)
 Agents can exchange `client_id` and `client_secret` for a signed HS256 JWT access token:
 
 ```bash
@@ -200,11 +214,6 @@ Returns:
   "scope": "imessage:all"
 }
 ```
-
-### 3. Interactive Web & Online Agents (ChatGPT / Web Apps)
-1. Point your client to `https://imessage.genericservice.app/oauth/authorize`.
-2. The user sees a branded authorization consent screen on the Mac host.
-3. Upon approval, the server redirects with an authorization code exchanged at `/oauth/token`.
 
 ---
 

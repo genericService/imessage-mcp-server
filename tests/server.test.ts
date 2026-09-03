@@ -146,15 +146,15 @@ describe('OAuth 2.0 Auth Server & JWT Verification', () => {
     expect(verifyJwt('eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.tampered_signature')).toBeNull();
   });
 
-  it('should generate RFC 8414 OAuth server metadata', async () => {
+  it('should generate RFC 8414 OAuth server metadata with registration endpoint and PKCE support', async () => {
     const { getOAuthMetadata } = await import('../src/oauth.js');
     const meta = getOAuthMetadata('https://imessage.genericservice.app');
     expect(meta.issuer).toBe('https://imessage.genericservice.app');
     expect(meta.token_endpoint).toBe('https://imessage.genericservice.app/oauth/token');
     expect(meta.authorization_endpoint).toBe('https://imessage.genericservice.app/oauth/authorize');
-    expect(meta.registration_endpoint).toBeUndefined();
+    expect(meta.registration_endpoint).toBe('https://imessage.genericservice.app/oauth/register');
     expect(meta.grant_types_supported).toContain('authorization_code');
-    expect(meta.token_endpoint_auth_methods_supported).not.toContain('none');
+    expect(meta.token_endpoint_auth_methods_supported).toContain('none');
   });
 
   it('should generate RFC 9728 protected resource metadata for /mcp', async () => {
@@ -165,7 +165,7 @@ describe('OAuth 2.0 Auth Server & JWT Verification', () => {
     expect(meta.bearer_methods_supported).toContain('header');
   });
 
-  it('should reject unauthenticated dynamic client registration', async () => {
+  it('should register dynamic OAuth clients without requiring a master admin token (RFC 7591)', async () => {
     const { handleRegisterPost } = await import('../src/oauth.js');
     const json = vi.fn();
     const status = vi.fn(() => ({ json }));
@@ -173,38 +173,160 @@ describe('OAuth 2.0 Auth Server & JWT Verification', () => {
     const req = {
       headers: {},
       body: {
-        redirect_uris: ['https://grok.example/callback'],
+        redirect_uris: ['http://localhost:54321/callback'],
         token_endpoint_auth_method: 'none',
-        client_name: 'grok-test'
-      }
-    } as any;
-
-    handleRegisterPost(req, res);
-    expect(status).toHaveBeenCalledWith(401);
-  });
-
-  it('should register dynamic OAuth clients only with the backend token', async () => {
-    const token = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN;
-    if (!token) return;
-
-    const { handleRegisterPost } = await import('../src/oauth.js');
-    const json = vi.fn();
-    const status = vi.fn(() => ({ json }));
-    const res = { setHeader: vi.fn(), status, json } as any;
-    const req = {
-      headers: { authorization: `Bearer ${token}` },
-      body: {
-        redirect_uris: ['https://grok.example/callback'],
-        token_endpoint_auth_method: 'none',
-        client_name: 'grok-test'
+        client_name: 'gemini-desktop-test'
       }
     } as any;
 
     handleRegisterPost(req, res);
     expect(status).toHaveBeenCalledWith(201);
     expect(json.mock.calls[0][0].client_id).toBeTruthy();
-    expect(json.mock.calls[0][0].redirect_uris).toEqual(['https://grok.example/callback']);
+    expect(json.mock.calls[0][0].redirect_uris).toEqual(['http://localhost:54321/callback']);
     expect(json.mock.calls[0][0].client_secret).toBeUndefined();
+  });
+
+  it('should reject dynamic client registration when redirect_uris is missing or empty', async () => {
+    const { handleRegisterPost } = await import('../src/oauth.js');
+    const json = vi.fn();
+    const status = vi.fn(() => ({ json }));
+    const res = { setHeader: vi.fn(), status, json } as any;
+    const req = {
+      headers: {},
+      body: {
+        redirect_uris: [],
+        client_name: 'invalid-client'
+      }
+    } as any;
+
+    handleRegisterPost(req, res);
+    expect(status).toHaveBeenCalledWith(400);
+    expect(json.mock.calls[0][0].error).toBe('invalid_client_metadata');
+  });
+
+  it('should validate logon credentials against username/password and fallback token', async () => {
+    const { validateLogonCredentials } = await import('../src/oauth.js');
+    process.env.AUTH_USERNAME = 'paul-atreides';
+    process.env.AUTH_PASSWORD = 'fear-is-the-mind-killer';
+    const masterToken = process.env.BEARER_TOKEN || '';
+
+    // Valid username + password
+    expect(validateLogonCredentials('paul-atreides', 'fear-is-the-mind-killer')).toBe(true);
+
+    // Invalid password
+    expect(validateLogonCredentials('paul-atreides', 'wrong-pass')).toBe(false);
+
+    // Invalid username
+    expect(validateLogonCredentials('feyd-rautha', 'fear-is-the-mind-killer')).toBe(false);
+
+    // Master token fallback in password field
+    if (masterToken) {
+      expect(validateLogonCredentials('', masterToken)).toBe(true);
+      expect(validateLogonCredentials('any-user', masterToken)).toBe(true);
+    }
+  });
+
+  it('should sign and verify session cookies with HMAC protection', async () => {
+    const { createSessionCookie, verifySessionCookie } = await import('../src/oauth.js');
+    const cookie = createSessionCookie('paul-atreides');
+    expect(typeof cookie).toBe('string');
+    expect(cookie).toContain('.');
+
+    const session = verifySessionCookie(cookie);
+    expect(session).not.toBeNull();
+    expect(session?.user).toBe('paul-atreides');
+
+    // Tampered cookie must be rejected
+    expect(verifySessionCookie(`${cookie}tampered`)).toBeNull();
+    expect(verifySessionCookie('invalid.cookie')).toBeNull();
+  });
+
+  it('should render logon form on handleAuthorizeGet when no session is present', async () => {
+    const { handleAuthorizeGet } = await import('../src/oauth.js');
+    let htmlOutput = '';
+    const res = {
+      setHeader: vi.fn(),
+      send: vi.fn((content: string) => { htmlOutput = content; }),
+      status: vi.fn(() => res)
+    } as any;
+    const req = {
+      headers: {},
+      query: { client_id: 'test-client', response_type: 'code' }
+    } as any;
+
+    handleAuthorizeGet(req, res);
+    expect(htmlOutput).toContain('Sign in to iMessage MCP');
+    expect(htmlOutput).toContain('name="username"');
+    expect(htmlOutput).toContain('name="password"');
+  });
+
+  it('should render approval form on handleAuthorizeGet when valid session is present', async () => {
+    const { handleAuthorizeGet, createSessionCookie, SESSION_COOKIE_NAME } = await import('../src/oauth.js');
+    const validCookie = createSessionCookie('paul-atreides');
+    let htmlOutput = '';
+    const res = {
+      setHeader: vi.fn(),
+      send: vi.fn((content: string) => { htmlOutput = content; }),
+      status: vi.fn(() => res)
+    } as any;
+    const req = {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${validCookie}` },
+      query: { client_id: 'test-client', response_type: 'code' }
+    } as any;
+
+    handleAuthorizeGet(req, res);
+    expect(htmlOutput).toContain('Authorize Client Access');
+    expect(htmlOutput).toContain('paul-atreides');
+    expect(htmlOutput).toContain('Approve & Grant Access');
+    expect(htmlOutput).not.toContain('name="password"');
+  });
+
+  it('should authorize and set session cookie on handleAuthorizePost with valid credentials', async () => {
+    const { handleAuthorizePost } = await import('../src/oauth.js');
+    process.env.AUTH_USERNAME = 'paul-atreides';
+    process.env.AUTH_PASSWORD = 'fear-is-the-mind-killer';
+    const json = vi.fn();
+    const setHeader = vi.fn();
+    const res = {
+      setHeader,
+      status: vi.fn(() => res),
+      json,
+      redirect: vi.fn()
+    } as any;
+    const req = {
+      headers: {},
+      body: {
+        client_id: 'test-client',
+        username: 'paul-atreides',
+        password: 'fear-is-the-mind-killer'
+      }
+    } as any;
+
+    handleAuthorizePost(req, res);
+    expect(json).toHaveBeenCalled();
+    expect(json.mock.calls[0][0].code).toMatch(/^code_/);
+    expect(setHeader).toHaveBeenCalledWith('Set-Cookie', expect.stringContaining('imessage_session='));
+  });
+
+  it('should authorize with session cookie on handleAuthorizePost without password', async () => {
+    const { handleAuthorizePost, createSessionCookie, SESSION_COOKIE_NAME } = await import('../src/oauth.js');
+    const validCookie = createSessionCookie('paul-atreides');
+    const json = vi.fn();
+    const setHeader = vi.fn();
+    const res = {
+      setHeader,
+      status: vi.fn(() => res),
+      json,
+      redirect: vi.fn()
+    } as any;
+    const req = {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${validCookie}` },
+      body: { client_id: 'test-client' }
+    } as any;
+
+    handleAuthorizePost(req, res);
+    expect(json).toHaveBeenCalled();
+    expect(json.mock.calls[0][0].code).toMatch(/^code_/);
   });
 
   it('should return a Map from getClientRegistry()', async () => {
@@ -303,13 +425,13 @@ describe('Express HTTP Endpoints & Transport Integration', () => {
     expect(data.error).toContain('Unauthorized');
   });
 
-  integration('should reject unauthenticated OAuth register and authorize', async () => {
+  integration('should handle dynamic client registration and reject unauthenticated authorize', async () => {
     const register = await fetch(`${LOCAL_URL}/oauth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ redirect_uris: ['https://example.com/cb'] })
     });
-    expect(register.status).toBe(401);
+    expect(register.status).toBe(201);
 
     const authorize = await fetch(`${LOCAL_URL}/oauth/authorize`, {
       method: 'POST',

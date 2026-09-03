@@ -27,6 +27,7 @@ import {
   getProtectedResourceMetadata,
   handleAuthorizeGet,
   handleAuthorizePost,
+  handleLogoutGet,
   handleRegisterPost,
   handleTokenPost,
   verifyJwt,
@@ -45,9 +46,18 @@ const SSH_BIN = process.env.SSH_BIN || '/usr/bin/ssh';
 const SSH_FDA_HOST = process.env.IMESSAGE_SSH_FDA_HOST || 'localhost';
 const CLI_MAX_BUFFER = 32 * 1024 * 1024;
 
+// ssh joins remote command words with spaces and hands them to the login
+// shell unquoted, so every word must be single-quoted to survive the hop.
+function shellQuote(arg: string): string {
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
 async function runImessageCli(cliArgs: string[]): Promise<string> {
   try {
     if (IMESSAGE_SSH_FDA) {
+      const remoteCommand = [PYTHON_BIN, CLI_PATH, ...cliArgs]
+        .map(shellQuote)
+        .join(' ');
       const { stdout } = await execFileAsync(
         SSH_BIN,
         [
@@ -57,9 +67,7 @@ async function runImessageCli(cliArgs: string[]): Promise<string> {
           '-o', 'ConnectTimeout=15',
           '-o', 'LogLevel=ERROR',
           SSH_FDA_HOST,
-          PYTHON_BIN,
-          CLI_PATH,
-          ...cliArgs,
+          remoteCommand,
         ],
         { maxBuffer: CLI_MAX_BUFFER },
       );
@@ -714,6 +722,7 @@ app.get('/mcp/.well-known/oauth-protected-resource', sendProtectedResourceMetada
 
 app.get('/oauth/authorize', handleAuthorizeGet);
 app.post('/oauth/authorize', handleAuthorizePost);
+app.get('/oauth/logout', handleLogoutGet);
 app.post('/oauth/token', handleTokenPost);
 app.post('/oauth/register', handleRegisterPost);
 
