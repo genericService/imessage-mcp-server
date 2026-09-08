@@ -244,7 +244,7 @@ const TOOLS: Tool[] = [
         },
         attachment: {
           type: 'string',
-          description: 'Optional local POSIX file path of an attachment to send (e.g. "/Users/matthias/Pictures/photo.jpg").'
+          description: 'Optional local POSIX file path of an attachment to send (e.g. "/Users/shared/Pictures/sandworm.jpg").'
         },
         dry_run: {
           type: 'boolean',
@@ -267,7 +267,7 @@ const TOOLS: Tool[] = [
       properties: {
         chat: {
           type: 'string',
-          description: 'Target chat ROWID, display name, or handle (e.g. "46" or "Sarah").'
+          description: 'Target chat ROWID, display name, or handle (e.g. "46" or "Chani").'
         },
         limit: {
           type: 'number',
@@ -280,14 +280,14 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_search_group_chats',
     description:
-      'Search for multi-party group chats matching an exact set of participant names or phone numbers (e.g. ["Sarah", "Susie"]). Returns only threads where all requested participants exist.',
+      'Search for multi-party group chats matching an exact set of participant names or phone numbers (e.g. ["Chani", "Paul Atreides"]). Returns only threads where all requested participants exist.',
     inputSchema: {
       type: 'object',
       properties: {
         participants: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of participant names or phone numbers to match (e.g. ["Sarah", "Susie"]).'
+          description: 'Array of participant names or phone numbers to match (e.g. ["Chani", "Paul Atreides"]).'
         }
       },
       required: ['participants']

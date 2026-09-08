@@ -1,8 +1,42 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Certificates and secrets
 certs/
 .env
+.env.*
+!.env.example
+token.txt
+*.token
+*.key
+*.pem
+
+# Logs and audit
 *.log
 logs/
+
+# Backups, editor, and OS files
+*.bak
+*.bak.*
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Knowledge graph generated files
 graphify-out/
+
+# Scratch test and proxy scripts
+tcp-proxy.*
+test-202.*
+test-mcp.js
+
 

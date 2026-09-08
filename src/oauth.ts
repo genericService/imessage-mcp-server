@@ -178,7 +178,7 @@ export const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 export function validateLogonCredentials(username: string, password: string): boolean {
   if (!password) return false;
 
-  const expectedUser = process.env.AUTH_USERNAME || 'matthias';
+  const expectedUser = process.env.AUTH_USERNAME || 'admin';
   const expectedPass = process.env.AUTH_PASSWORD;
   const masterToken = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || '';
 
@@ -344,7 +344,7 @@ export function handleAuthorizeGet(req: Request, res: Response) {
   const cookies = parseCookies(req);
   const sessionCookie = cookies[SESSION_COOKIE_NAME];
   const session = sessionCookie ? verifySessionCookie(sessionCookie) : null;
-  const defaultUsername = process.env.AUTH_USERNAME || 'matthias';
+  const defaultUsername = process.env.AUTH_USERNAME || 'admin';
 
   const bodyContent = session ? `
     <h2>Authorize Client Access</h2>
@@ -443,7 +443,7 @@ export function handleAuthorizePost(req: Request, res: Response) {
       });
       return;
     }
-    authenticatedUser = candidateUser || process.env.AUTH_USERNAME || 'matthias';
+    authenticatedUser = candidateUser || process.env.AUTH_USERNAME || 'admin';
 
     // Set 30-day session cookie if requested
     if (remember_me !== 'false') {

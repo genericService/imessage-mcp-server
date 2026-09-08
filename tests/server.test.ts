@@ -131,7 +131,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   });
 
   it('should return valid JSON for search-group CLI command', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search-group', 'Sarah', '--json']);
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search-group', 'Paul Atreides', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
   });
@@ -178,7 +178,7 @@ describe('Local Action Audit Logger (Security & Privacy)', () => {
     logAuditEvent({
       timestamp: new Date().toISOString(),
       tool: 'imessage_send_message',
-      target: 'Sarah (+15550199480)',
+      target: 'Chani (+15550199480)',
       dry_run: true,
       status: 'success',
       duration_ms: 42
@@ -187,7 +187,7 @@ describe('Local Action Audit Logger (Security & Privacy)', () => {
     expect(fs.existsSync(auditFile)).toBe(true);
     const content = fs.readFileSync(auditFile, 'utf8');
     expect(content).toContain('imessage_send_message');
-    expect(content).toContain('Sarah (+15550199480)');
+    expect(content).toContain('Chani (+15550199480)');
     expect(content).not.toContain('message_text');
   });
 

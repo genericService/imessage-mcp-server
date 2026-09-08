@@ -283,7 +283,7 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | `send` | Send message or attachment to contact or chat ID | `bin/imessage send "+15550199808" --message "Hello" --dry-run` |
 | `contacts` | Search AddressBook contacts by name, email, or phone | `bin/imessage contacts "Paul Atreides" --json` |
 | `members` | List members and handles in a group chat | `bin/imessage members 1767 --json` |
-| `group-search` | Search group chats by exact participant set | `bin/imessage group-search "paul@caladan.org" "chani@sietch.net"` |
+| `search-group` | Search group chats by exact participant set | `bin/imessage search-group "paul@caladan.org" "chani@sietch.net"` |
 | `attachment` | Inspect attachment file metadata and base64 payload | `bin/imessage attachment "~/Library/Messages/Attachments/..."` |
 
 ---
@@ -298,7 +298,7 @@ If you wish to log AI agent action executions for security auditing, set `ENABLE
 {
   "timestamp": "2026-07-25T00:46:45Z",
   "tool": "imessage_send_message",
-  "target": "Sarah (+15550199480)",
+  "target": "Chani (+15550199480)",
   "dry_run": true,
   "status": "success",
   "duration_ms": 42
