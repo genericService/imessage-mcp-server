@@ -14,34 +14,66 @@ It connects your local Mac's iMessage database (`~/Library/Messages/chat.db`), m
 
 - **Dual MCP Transports:** Supports modern Streamable HTTP (`/mcp`) and Server-Sent Events (`/sse`).
 - **Full-Text Message Search:** Instant SQLite query across historical iMessage text and rich attributed bodies.
+- **Message Rewrite & Edit History:** Surfaces edit status indicators (`is_edited`, `has_edits`, `edit_count`, `last_edited`) on pulled messages, decoding binary property lists (`message_summary_info`) in `chat.db` for full chronological revision histories.
+- **Message Editing:** Programmatically edit sent messages within Apple's 15-minute protocol window (up to 5 revisions) via `imessage_edit_message` and `imessage edit`, routing through the IMCore bridge.
 - **Contact Resolution:** Integrates with macOS Contacts database (`AddressBook-v22.abcddb`) to resolve names, phone numbers, and emails.
 - **Multimodal Attachment Reading:** Exposes attachment metadata (MIME type, size, path) and automatically converts `.heic` photos to `.jpg` for vision-capable LLMs.
 - **Reliable Attachment Sending:** Sends route through the [imsg](https://github.com/openclaw/imsg) CLI when installed, with a native AppleScript fallback that stages files inside Messages' own attachments directory to avoid "Not Delivered" sandboxing failures. No Accessibility/GUI scripting required.
 - **Group Chat Rosters:** Inspects group conversation member lists and handles.
-- **Bearer Token Auth:** Secures all MCP endpoints behind customizable Bearer token authentication.
+- **OAuth 2.0 Auth Server & Bearer Auth:** Embedded authorization server supporting RFC 8414 metadata, Authorization Code flow with PKCE, Client Credentials grant, and RFC 7591 dynamic client registration alongside customizable static Bearer tokens.
 
 ---
 
 ## Architecture Overview
 
+```mermaid
+flowchart TD
+    Client["AI Assistant / Client (Claude Desktop, Antigravity, Cursor)"]
+
+    subgraph Server["iMessage MCP Server (Node.js / Express / TypeScript)"]
+        direction TB
+        Endpoints["Transports: Streamable HTTP (/mcp) and SSE (/sse)"]
+        Auth["Auth: Bearer Token and OAuth 2.0 PKCE (RFC 7591)"]
+        Audit["Local Action Audit Logger (logs/audit.log)"]
+    end
+
+    CLI["macOS iMessage Engine (bin/imessage Python Script)"]
+
+    subgraph Storage["macOS System and Data Integration"]
+        direction TB
+        ChatDB[("Messages Database: ~/Library/Messages/chat.db (Read-Only SQLite, Edit History bplist)")]
+        ContactsDB[("Contacts Database: AddressBook-v22.abcddb (Read-Only SQLite)")]
+        Automation["Messages.app Automation: imsg CLI (Sending and IMCore Edits) + AppleScript Fallback"]
+    end
+
+    Client -->|"HTTP / SSE (Bearer or OAuth PKCE)"| Server
+    Server -->|"Child Process JSON IPC"| CLI
+    CLI -->|"Read-only SQLite query"| ChatDB
+    CLI -->|"Read-only SQLite query"| ContactsDB
+    CLI -->|"imsg / AppleScript execution"| Automation
 ```
-┌─────────────────────────┐          HTTP/SSE           ┌──────────────────────────────┐
-│  AI Assistant / Client  │  ─────────────────────────> │   iMessage MCP Server        │
-│  (Claude, Antigravity)  │  <Authorization: Bearer>   │   (Node.js / Express / TS)   │
-└─────────────────────────┘                             └──────────────┬───────────────┘
-                                                                       │
-                                                                       ▼
-                                                        ┌──────────────────────────────┐
-                                                        │   macOS iMessage CLI         │
-                                                        │   (bin/imessage python script)│
-                                                        └──────────────┬───────────────┘
-                                                                       │
-                         ┌─────────────────────────────────────────────┼────────────────────────────────────────────┐
-                         ▼                                             ▼                                            ▼
-           ┌──────────────────────────┐                  ┌──────────────────────────┐                 ┌──────────────────────────┐
-           │ Messages DB (Read-Only)  │                  │ Contacts DB (Read-Only)  │                 │ Messages.app Automation  │
-           │ ~/Library/Messages/chat.db│                  │ AddressBook-v22.abcddb   │                 │ imsg CLI + AppleScript   │
-           └──────────────────────────┘                  └──────────────────────────┘                 └──────────────────────────┘
+
+```
+┌─────────────────────────┐          HTTP / SSE           ┌──────────────────────────────────┐
+│  AI Assistant / Client  │  ───────────────────────────> │       iMessage MCP Server        │
+│  (Claude, Antigravity)  │  <── Authorization: Bearer ── │     (Node.js / Express / TS)     │
+└─────────────────────────┘                               └─────────────────┬────────────────┘
+                                                                            │
+                                                                            │ Child Process (JSON IPC)
+                                                                            ▼
+                                                          ┌──────────────────────────────────┐
+                                                          │        macOS iMessage CLI        │
+                                                          │   (bin/imessage Python Script)   │
+                                                          └─────────────────┬────────────────┘
+                                                                            │
+                            ┌───────────────────────────────────────────────┼───────────────────────────────────────────────┐
+                            │                                               │                                               │
+                            ▼                                               ▼                                               ▼
+             ┌──────────────────────────────┐                ┌──────────────────────────────┐                ┌──────────────────────────────┐
+             │   Messages DB (Read-Only)    │                │   Contacts DB (Read-Only)    │                │   Messages.app Automation    │
+             │  ~/Library/Messages/chat.db  │                │    AddressBook-v22.abcddb    │                │    imsg CLI + AppleScript    │
+             │ • History & Edit bplists     │                │ • Contact & Name Resolution  │                │ • Sending & IMCore Edits     │
+             └──────────────────────────────┘                └──────────────────────────────┘                └──────────────────────────────┘
 ```
 
 ---
@@ -90,9 +122,9 @@ Due to macOS privacy safeguards (TCC), the process executing the server requires
 1. Open **System Settings → Privacy & Security → Full Disk Access**.
 2. Enable the toggle for **Terminal** (or **sshd-daemon** if running remotely over SSH).
 
-#### B. Automation (Required for sending)
+#### B. Automation (Required for sending and editing)
 1. Open **System Settings → Privacy & Security → Automation** and ensure **Terminal** / **sshd** has permission to control **Messages**.
-2. (Recommended) Install the [imsg](https://github.com/openclaw/imsg) CLI for the primary send path: `brew install steipete/tap/imsg`. Without it, sends fall back to native AppleScript with sandbox-safe attachment staging.
+2. (Recommended) Install the [imsg](https://github.com/openclaw/imsg) CLI for the primary send path: `brew install steipete/tap/imsg`. Without it, sends fall back to native AppleScript with sandbox-safe attachment staging. Note: `imsg` also powers the private IMCore bridge into Messages.app for editing sent messages.
 
 ### 4. Build & Start Server
 
@@ -233,6 +265,26 @@ Returns:
 | `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports dry_run preview & confirm_token) | `recipient` (string, required), `message`, `attachment`, `dry_run`, `confirm_token` |
 | `imessage_edit_message` | Edit a previously sent message by ROWID (subject to 15-minute Apple protocol window and 5-edit limit) | `message_id` (number, required), `text` (string, required) |
 | `imessage_get_readme` | Retrieve full server README documentation & usage guide | *(none)* |
+
+---
+
+## CLI Reference (`bin/imessage`)
+
+The underlying Python engine can be executed directly as a standalone CLI for local administration, scripting, or automated pipelines. All commands support the `--json` flag for structured machine-readable output:
+
+| Command | Description | Example |
+| :--- | :--- | :--- |
+| `list` | List recent conversations with participant handles | `bin/imessage list --limit 10 --json` |
+| `read` | Read chat history for a contact or group chat | `bin/imessage read "+15550199808" --days 7` |
+| `recent` | Preview last N messages in a conversation thread | `bin/imessage recent "+15550199808" --limit 5 --json` |
+| `search` | Search message history by keyword or phrase | `bin/imessage search "Arrakis" --limit 20` |
+| `edits` | Inspect complete rewrite and revision history for a message | `bin/imessage edits 198097 --json` |
+| `edit` | Edit a previously sent outgoing message | `bin/imessage edit 198097 --text "Paul Atreides revised" --json` |
+| `send` | Send message or attachment to contact or chat ID | `bin/imessage send "+15550199808" --message "Hello" --dry-run` |
+| `contacts` | Search AddressBook contacts by name, email, or phone | `bin/imessage contacts "Paul Atreides" --json` |
+| `members` | List members and handles in a group chat | `bin/imessage members 1767 --json` |
+| `group-search` | Search group chats by exact participant set | `bin/imessage group-search "paul@caladan.org" "chani@sietch.net"` |
+| `attachment` | Inspect attachment file metadata and base64 payload | `bin/imessage attachment "~/Library/Messages/Attachments/..."` |
 
 ---
 
