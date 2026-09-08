@@ -23,10 +23,11 @@ describe('iMessage MCP Tool Schemas (SDD)', () => {
       'imessage_get_readme',
       'imessage_get_recent_messages',
       'imessage_search_group_chats',
-      'imessage_get_edit_history'
+      'imessage_get_edit_history',
+      'imessage_edit_message'
     ];
 
-    expect(requiredTools).toHaveLength(11);
+    expect(requiredTools).toHaveLength(12);
   });
 
   it('should have a readable README.md documentation file', async () => {
@@ -138,6 +139,32 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   it('should support recipient parameter targeting group chats or phone numbers', async () => {
     const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'send', '--help']);
     expect(stdout).toContain('Recipient identifier');
+  });
+
+  it('should support CLI help for imessage edit command', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edit', '--help']);
+    expect(stdout).toContain('message_id');
+    expect(stdout).toContain('--text');
+  });
+
+  it('should reject editing incoming messages with an error', async () => {
+    try {
+      await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edit', '1', '--text', 'Trying to edit incoming message', '--json']);
+      expect.unreachable('Should have thrown an error for incoming message');
+    } catch (err: any) {
+      const output = err.stdout || err.stderr || err.message;
+      expect(output).toContain('incoming');
+    }
+  });
+
+  it('should reject editing messages older than 15 minutes', async () => {
+    try {
+      await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edit', '198100', '--text', 'Paul Atreides revised message', '--json']);
+      expect.unreachable('Should have thrown an error for expired message');
+    } catch (err: any) {
+      const output = err.stdout || err.stderr || err.message;
+      expect(output).toContain('15 minutes');
+    }
   });
 });
 

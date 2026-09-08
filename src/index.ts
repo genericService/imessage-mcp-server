@@ -309,6 +309,25 @@ const TOOLS: Tool[] = [
     }
   },
   {
+    name: 'imessage_edit_message',
+    description:
+      'Edit a previously sent outgoing iMessage by its numeric message ROWID. Apple limits edits to outgoing messages sent within the last 15 minutes (max 5 edits). Note: Editing requires the imsg IMCore bridge into Messages.app with SIP disabled, as Apple does not provide AppleScript dictionary support for message edits.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: {
+          type: 'number',
+          description: 'Numeric message ROWID of the outgoing message to edit.'
+        },
+        new_text: {
+          type: 'string',
+          description: 'New revised text content for the message.'
+        }
+      },
+      required: ['message_id', 'new_text']
+    }
+  },
+  {
     name: 'imessage_get_readme',
     description:
       'Retrieve the full iMessage MCP Server README documentation (markdown), setup guides, client configurations, and API signatures.',
@@ -360,9 +379,10 @@ iMessage MCP Server Instructions:
 2. Search: Call 'imessage_search_messages' to search past message history by keyword, or 'imessage_search_contacts' to find contacts.
 3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' using a chat ID or contact identifier to review past messages. Messages indicate whether edits exist.
 4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
-5. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
-6. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
-7. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
+5. Editing: Call 'imessage_edit_message' with message_id and new_text to edit an outgoing message sent within the last 15 minutes.
+6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
+7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
+8. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
 `.trim()
     }
   );
@@ -421,7 +441,7 @@ iMessage MCP Server Instructions:
       targetParam = String(args?.query || '');
     } else if (name === 'imessage_get_attachment_payload') {
       targetParam = String(args?.path || '');
-    } else if (name === 'imessage_get_edit_history') {
+    } else if (name === 'imessage_get_edit_history' || name === 'imessage_edit_message') {
       targetParam = String(args?.message_id || '');
     }
 
@@ -509,6 +529,19 @@ iMessage MCP Server Instructions:
           throw new Error('Missing or invalid required parameter "message_id" (positive integer ROWID expected)');
         }
         const stdout = await runImessageCli(['edits', String(messageId), '--json']);
+        result = {
+          content: [{ type: 'text', text: stdout }]
+        };
+      } else if (name === 'imessage_edit_message') {
+        const messageId = typeof args?.message_id === 'number' ? Math.floor(args.message_id) : parseInt(String(args?.message_id || ''), 10);
+        const newText = String(args?.new_text || '').trim();
+        if (isNaN(messageId) || messageId <= 0) {
+          throw new Error('Missing or invalid required parameter "message_id" (positive integer ROWID expected)');
+        }
+        if (!newText) {
+          throw new Error('Missing or empty required parameter "new_text"');
+        }
+        const stdout = await runImessageCli(['edit', String(messageId), '--text', newText, '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -900,6 +933,7 @@ app.get('/', (_req, res) => {
     <li><code>imessage_get_recent_messages</code>: Preview last N messages before sending.</li>
     <li><code>imessage_search_group_chats</code>: Find group chats by participant set.</li>
     <li><code>imessage_get_edit_history</code>: Inspect rewrite and edit history of a message by ROWID.</li>
+    <li><code>imessage_edit_message</code>: Edit a sent outgoing iMessage within Apple's 15-minute window.</li>
     <li><code>imessage_get_readme</code>: Full server README and setup guide.</li>
   </ul>
 </body>

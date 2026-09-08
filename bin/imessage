@@ -917,6 +917,152 @@ def get_edit_history(args):
             print(f"Text: {msg_text}")
     conn.close()
 
+def edit_message(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    msg_id = args.message_id
+    new_text = args.text
+    if not new_text or not new_text.strip():
+        if getattr(args, 'json', False):
+            print(json.dumps({'error': 'Replacement text cannot be empty', 'success': False}))
+        else:
+            print("ERROR: Replacement text cannot be empty", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    query = """
+    SELECT 
+        m.ROWID,
+        m.guid,
+        m.date,
+        m.is_from_me,
+        c.guid,
+        c.chat_identifier,
+        COALESCE(c.display_name, ''),
+        m.text,
+        m.message_summary_info
+    FROM message m
+    JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    JOIN chat c ON cmj.chat_id = c.ROWID
+    WHERE m.ROWID = ?
+    LIMIT 1
+    """
+    cursor.execute(query, (msg_id,))
+    row = cursor.fetchone()
+    if not row:
+        err_msg = f"Message #{msg_id} not found"
+        if getattr(args, 'json', False):
+            print(json.dumps({'error': err_msg, 'success': False}))
+        else:
+            print(f"ERROR: {err_msg}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    row_id, message_guid, date_ns, is_from_me, chat_guid, chat_ident, display_name, current_text, summary_blob = row
+
+    if not is_from_me:
+        err_msg = f"Cannot edit message #{msg_id}: only outgoing messages sent by you can be edited (this is an incoming message)."
+        if getattr(args, 'json', False):
+            print(json.dumps({'error': err_msg, 'success': False}))
+        else:
+            print(f"ERROR: {err_msg}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    # Apple 15-minute edit window check
+    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+    sec = (date_ns or 0) / 1_000_000_000
+    msg_dt = apple_epoch + datetime.timedelta(seconds=sec)
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    elapsed_seconds = (now_dt - msg_dt).total_seconds()
+
+    if elapsed_seconds > 900:
+        elapsed_mins = int(elapsed_seconds / 60)
+        err_msg = f"Cannot edit message #{msg_id}: iMessage only permits editing messages within 15 minutes of sending. This message was sent {elapsed_mins} minutes ago ({msg_dt.astimezone().strftime('%Y-%m-%d %I:%M %p')})."
+        if getattr(args, 'json', False):
+            print(json.dumps({'error': err_msg, 'success': False}))
+        else:
+            print(f"ERROR: {err_msg}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    # Edit count check (Apple limits to 5 edits)
+    is_ed, count, last_ts, hist = parse_edit_history(summary_blob, 0, date_ns)
+    if count >= 5:
+        err_msg = f"Cannot edit message #{msg_id}: maximum edit limit of 5 revisions reached."
+        if getattr(args, 'json', False):
+            print(json.dumps({'error': err_msg, 'success': False}))
+        else:
+            print(f"ERROR: {err_msg}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    conn.close()
+
+    # Dispatch via imsg
+    imsg_bin = os.environ.get('IMSG_BIN') or shutil.which('imsg') or '/opt/homebrew/bin/imsg'
+    if not os.path.exists(imsg_bin):
+        err_msg = "imsg CLI tool not found at /opt/homebrew/bin/imsg. Install imsg or build the dylib bridge to edit messages."
+        if getattr(args, 'json', False):
+            print(json.dumps({'error': err_msg, 'success': False}))
+        else:
+            print(f"ERROR: {err_msg}", file=sys.stderr)
+        sys.exit(1)
+
+    target_chat = chat_guid or chat_ident
+    cmd = [
+        imsg_bin, 'edit',
+        '--chat', target_chat,
+        '--message', message_guid,
+        '--new-text', new_text,
+        '--json'
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        err_msg = "imsg edit timed out after 30 seconds."
+        if getattr(args, 'json', False):
+            print(json.dumps({'error': err_msg, 'success': False}))
+        else:
+            print(f"ERROR: {err_msg}", file=sys.stderr)
+        sys.exit(1)
+
+    stdout_str = (res.stdout or '').strip()
+    stderr_str = (res.stderr or '').strip()
+
+    if res.returncode == 0:
+        if getattr(args, 'json', False):
+            try:
+                parsed = json.loads(stdout_str)
+                print(json.dumps(parsed, indent=2))
+            except Exception:
+                print(json.dumps({
+                    'success': True,
+                    'msg_id': msg_id,
+                    'message_guid': message_guid,
+                    'new_text': new_text,
+                    'output': stdout_str
+                }, indent=2))
+        else:
+            print(f"Message #{msg_id} edited successfully to: '{new_text}'")
+        return
+
+    # Handle error from imsg
+    err_detail = stderr_str or stdout_str or f"imsg exited with code {res.returncode}"
+    if 'SIP' in err_detail or 'bridge' in err_detail or 'not_started' in err_detail:
+        err_detail = (
+            "imsg edit requires the IMCore bridge into Messages.app, which requires System Integrity Protection (SIP) "
+            "to be disabled. Apple does not expose an edit command in its standard AppleScript dictionary. "
+            f"Details: {err_detail}"
+        )
+
+    if getattr(args, 'json', False):
+        print(json.dumps({'error': err_detail, 'success': False}, indent=2))
+    else:
+        print(f"ERROR: Failed to edit message #{msg_id}: {err_detail}", file=sys.stderr)
+    sys.exit(1)
+
 def search_group_chats(args):
     raw_participants = args.participants
     if isinstance(raw_participants, str):
@@ -1036,6 +1182,12 @@ def main():
     edits_parser.add_argument("message_id", type=int, help="Message ROWID")
     edits_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     edits_parser.set_defaults(func=get_edit_history)
+
+    edit_parser = subparsers.add_parser("edit", help="Edit a previously sent iMessage")
+    edit_parser.add_argument("message_id", type=int, help="Message ROWID to edit")
+    edit_parser.add_argument("--text", "-t", required=True, help="New replacement message text")
+    edit_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    edit_parser.set_defaults(func=edit_message)
     
     args = parser.parse_args()
     args.func(args)
