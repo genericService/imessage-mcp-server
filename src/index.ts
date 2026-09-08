@@ -148,7 +148,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_read_messages',
     description:
-      'Read recent message history from a specific iMessage chat. Accepts a numeric chat ROWID, contact display name, or phone number/email address.',
+      'Read recent message history from a specific iMessage chat. Accepts a numeric chat ROWID, contact display name, or phone number/email address. Returned messages indicate edit state (is_edited, has_edits, edit_count, last_edited) and include revision history.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -167,7 +167,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_search_messages',
     description:
-      'Full-text search across all historical iMessage conversations. Returns matching messages, dates, chat IDs, and senders.',
+      'Full-text search across all historical iMessage conversations. Returns matching messages, dates, chat IDs, senders, edit state (is_edited, edit_count), and revision history.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -261,7 +261,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_get_recent_messages',
     description:
-      'Preview the last N recent messages from a chat to quickly verify thread context, participants, and conversation topic before sending a reply.',
+      'Preview the last N recent messages from a chat to quickly verify thread context, participants, conversation topic, and message edit history before sending a reply.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -291,6 +291,21 @@ const TOOLS: Tool[] = [
         }
       },
       required: ['participants']
+    }
+  },
+  {
+    name: 'imessage_get_edit_history',
+    description:
+      'Retrieve the full rewrite/edit history for a specific iMessage by its numeric message ROWID. Returns original draft, chronological revisions, edit timestamps, and final edited text.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: {
+          type: 'number',
+          description: 'Numeric message ROWID (e.g. 198097) to inspect rewrite and edit history for.'
+        }
+      },
+      required: ['message_id']
     }
   },
   {
@@ -343,10 +358,11 @@ function createMcpServer(): Server {
 iMessage MCP Server Instructions:
 1. Discovery: Call 'imessage_list_chats' to discover available conversation IDs, display names, and handles.
 2. Search: Call 'imessage_search_messages' to search past message history by keyword, or 'imessage_search_contacts' to find contacts.
-3. Reading: Call 'imessage_read_messages' using a chat ID or contact identifier to review past messages.
-4. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
-5. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
-6. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
+3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' using a chat ID or contact identifier to review past messages. Messages indicate whether edits exist.
+4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
+5. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
+6. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
+7. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
 `.trim()
     }
   );
@@ -405,6 +421,8 @@ iMessage MCP Server Instructions:
       targetParam = String(args?.query || '');
     } else if (name === 'imessage_get_attachment_payload') {
       targetParam = String(args?.path || '');
+    } else if (name === 'imessage_get_edit_history') {
+      targetParam = String(args?.message_id || '');
     }
 
     try {
@@ -482,6 +500,15 @@ iMessage MCP Server Instructions:
           throw new Error('Missing required parameter "path"');
         }
         const stdout = await runImessageCli(['attachment', filePath, '--json']);
+        result = {
+          content: [{ type: 'text', text: stdout }]
+        };
+      } else if (name === 'imessage_get_edit_history') {
+        const messageId = typeof args?.message_id === 'number' ? Math.floor(args.message_id) : parseInt(String(args?.message_id || ''), 10);
+        if (isNaN(messageId) || messageId <= 0) {
+          throw new Error('Missing or invalid required parameter "message_id" (positive integer ROWID expected)');
+        }
+        const stdout = await runImessageCli(['edits', String(messageId), '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -872,6 +899,7 @@ app.get('/', (_req, res) => {
     <li><code>imessage_send_message</code>: Send an iMessage with text and/or attachments.</li>
     <li><code>imessage_get_recent_messages</code>: Preview last N messages before sending.</li>
     <li><code>imessage_search_group_chats</code>: Find group chats by participant set.</li>
+    <li><code>imessage_get_edit_history</code>: Inspect rewrite and edit history of a message by ROWID.</li>
     <li><code>imessage_get_readme</code>: Full server README and setup guide.</li>
   </ul>
 </body>

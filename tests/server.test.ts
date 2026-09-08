@@ -22,10 +22,11 @@ describe('iMessage MCP Tool Schemas (SDD)', () => {
       'imessage_send_message',
       'imessage_get_readme',
       'imessage_get_recent_messages',
-      'imessage_search_group_chats'
+      'imessage_search_group_chats',
+      'imessage_get_edit_history'
     ];
 
-    expect(requiredTools).toHaveLength(10);
+    expect(requiredTools).toHaveLength(11);
   });
 
   it('should have a readable README.md documentation file', async () => {
@@ -52,6 +53,12 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search', 'the', '--limit', '2', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
+    if (data.length > 0) {
+      expect(data[0]).toHaveProperty('is_edited');
+      expect(data[0]).toHaveProperty('has_edits');
+      expect(data[0]).toHaveProperty('edit_count');
+      expect(data[0]).toHaveProperty('edit_history');
+    }
   });
 
   it('should return valid JSON when --json flag is passed to imessage contacts', async () => {
@@ -60,10 +67,66 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     expect(Array.isArray(data)).toBe(true);
   });
 
-  it('should return valid JSON for recent messages CLI command', async () => {
+  it('should return valid JSON for recent messages CLI command with edit fields', async () => {
     const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'recent', '1', '--limit', '2', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
+    if (data.length > 0) {
+      expect(data[0]).toHaveProperty('is_edited');
+      expect(data[0]).toHaveProperty('has_edits');
+      expect(data[0]).toHaveProperty('edit_count');
+      expect(data[0]).toHaveProperty('edit_history');
+      expect(typeof data[0].is_edited).toBe('boolean');
+      expect(Array.isArray(data[0].edit_history)).toBe(true);
+    }
+  });
+
+  it('should support inspecting edit history for a specific message via CLI edits command', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edits', '198097', '--json']);
+    const data = JSON.parse(stdout);
+    expect(data).toHaveProperty('msg_id', 198097);
+    expect(data).toHaveProperty('is_edited', true);
+    expect(data).toHaveProperty('has_edits', true);
+    expect(data).toHaveProperty('edit_count');
+    expect(data.edit_count).toBeGreaterThan(0);
+    expect(data).toHaveProperty('edit_history');
+    expect(Array.isArray(data.edit_history)).toBe(true);
+    expect(data.edit_history.length).toBeGreaterThanOrEqual(2);
+    expect(data.edit_history[0]).toHaveProperty('revision', 0);
+    expect(data.edit_history[0]).toHaveProperty('text');
+  });
+
+  it('should format edit indicator in CLI text output for edited messages', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edits', '198097']);
+    expect(stdout).toContain('EDIT HISTORY FOR MESSAGE #198097');
+    expect(stdout).toContain('[Original]');
+    expect(stdout).toContain('[Edit');
+  });
+
+  it('should return unedited message payload with is_edited false and original revision in edit_history', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edits', '1', '--json']);
+    const data = JSON.parse(stdout);
+    expect(data).toHaveProperty('msg_id', 1);
+    expect(data.is_edited).toBe(false);
+    expect(data.has_edits).toBe(false);
+    expect(data.edit_count).toBe(0);
+    expect(data.last_edited).toBeNull();
+    expect(data.edit_history).toHaveLength(1);
+    expect(data.edit_history[0].label).toBe('original');
+  });
+
+  it('should return valid JSON with edit fields for imessage read', async () => {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'read', '1', '--days', '14', '--json'], {
+      maxBuffer: 32 * 1024 * 1024
+    });
+    const data = JSON.parse(stdout);
+    expect(Array.isArray(data)).toBe(true);
+    if (data.length > 0) {
+      expect(data[0]).toHaveProperty('is_edited');
+      expect(data[0]).toHaveProperty('has_edits');
+      expect(data[0]).toHaveProperty('edit_count');
+      expect(data[0]).toHaveProperty('edit_history');
+    }
   });
 
   it('should return valid JSON for search-group CLI command', async () => {

@@ -10,6 +10,7 @@ import time
 import glob
 import json
 import base64
+import plistlib
 
 DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
 
@@ -140,19 +141,114 @@ def parse_attributed_body(blob):
             if idx != -1:
                 start = idx + len(marker)
                 if start < len(blob):
-                    length = blob[start]
-                    if length == 0x81:
-                        if start + 2 < len(blob):
+                    flag = blob[start]
+                    if flag == 0x81:
+                        if start + 3 <= len(blob):
+                            length = int.from_bytes(blob[start+1:start+3], byteorder='little')
+                            if 0 < length <= len(blob) - (start + 3):
+                                return blob[start + 3 : start + 3 + length].decode('utf-8', errors='ignore').strip('\x00\x01\ufffc')
+                        if start + 2 <= len(blob):
                             length = blob[start+1]
-                            start += 1
-                    elif length == 0x82:
-                        if start + 3 < len(blob):
+                            if 0 < length <= len(blob) - (start + 2):
+                                return blob[start + 2 : start + 2 + length].decode('utf-8', errors='ignore').strip('\x00\x01\ufffc')
+                    elif flag == 0x82:
+                        if start + 3 <= len(blob):
                             length = int.from_bytes(blob[start+1:start+3], byteorder='big')
-                            start += 2
-                    if 0 < length < len(blob) - start:
-                        return blob[start + 1 : start + 1 + length].decode('utf-8', errors='ignore')
+                            if 0 < length <= len(blob) - (start + 3):
+                                return blob[start + 3 : start + 3 + length].decode('utf-8', errors='ignore').strip('\x00\x01\ufffc')
+                    else:
+                        length = flag
+                        if 0 < length <= len(blob) - (start + 1):
+                            return blob[start + 1 : start + 1 + length].decode('utf-8', errors='ignore').strip('\x00\x01\ufffc')
     except: pass
     return ""
+
+def parse_edit_history(blob, date_edited_ns=0, message_date_ns=0):
+    """
+    Parses message_summary_info and date_edited to extract rewrite history.
+    Returns: (is_edited: bool, edit_count: int, last_edited: str | None, edit_history: list)
+    """
+    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+
+    if not blob:
+        if date_edited_ns and date_edited_ns > 0:
+            sec = date_edited_ns / 1_000_000_000
+            dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
+            last_ts = dt.strftime("%Y-%m-%d %I:%M %p")
+            return True, 1, last_ts, []
+        return False, 0, None, []
+
+    try:
+        data = plistlib.loads(blob)
+    except Exception:
+        if date_edited_ns and date_edited_ns > 0:
+            sec = date_edited_ns / 1_000_000_000
+            dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
+            last_ts = dt.strftime("%Y-%m-%d %I:%M %p")
+            return True, 1, last_ts, []
+        return False, 0, None, []
+
+    ec = data.get('ec')
+    if not ec or not isinstance(ec, dict):
+        if date_edited_ns and date_edited_ns > 0:
+            sec = date_edited_ns / 1_000_000_000
+            dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
+            last_ts = dt.strftime("%Y-%m-%d %I:%M %p")
+            return True, 1, last_ts, []
+        return False, 0, None, []
+
+    sorted_parts = sorted(ec.keys(), key=lambda k: int(k) if str(k).isdigit() else str(k))
+    if not sorted_parts:
+        return False, 0, None, []
+
+    max_revisions = max((len(ec[k]) for k in sorted_parts if isinstance(ec[k], list)), default=0)
+    if max_revisions <= 1:
+        if date_edited_ns and date_edited_ns > 0:
+            sec = date_edited_ns / 1_000_000_000
+            dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
+            last_ts = dt.strftime("%Y-%m-%d %I:%M %p")
+            return True, 1, last_ts, []
+        return False, 0, None, []
+
+    history = []
+    for rev_idx in range(max_revisions):
+        part_texts = []
+        rev_date = None
+        for p_key in sorted_parts:
+            part_edits = ec[p_key]
+            if not isinstance(part_edits, list) or not part_edits:
+                continue
+            item = part_edits[rev_idx] if rev_idx < len(part_edits) else part_edits[-1]
+            if rev_date is None and item.get('d'):
+                rev_date = item.get('d')
+            t_str = parse_attributed_body(item.get('t'))
+            if t_str:
+                part_texts.append(t_str)
+
+        ts_str = ''
+        if rev_date:
+            dt = (apple_epoch + datetime.timedelta(seconds=rev_date)).astimezone()
+            ts_str = dt.strftime("%Y-%m-%d %I:%M %p")
+        elif rev_idx == 0 and message_date_ns:
+            dt = (apple_epoch + datetime.timedelta(seconds=message_date_ns / 1_000_000_000)).astimezone()
+            ts_str = dt.strftime("%Y-%m-%d %I:%M %p")
+
+        label = "original" if rev_idx == 0 else f"edit_{rev_idx}"
+        history.append({
+            'revision': rev_idx,
+            'label': label,
+            'timestamp': ts_str,
+            'text': " ".join(part_texts)
+        })
+
+    edit_count = max_revisions - 1
+    last_edited = history[-1]['timestamp'] if history and history[-1]['timestamp'] else None
+    if not last_edited and date_edited_ns and date_edited_ns > 0:
+        sec = date_edited_ns / 1_000_000_000
+        dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
+        last_edited = dt.strftime("%Y-%m-%d %I:%M %p")
+
+    return True, edit_count, last_edited, history
 
 def read_messages(args):
     conn = get_db_connection()
@@ -193,7 +289,9 @@ def read_messages(args):
         m.is_from_me,
         h.id,
         m.text,
-        m.attributedBody
+        m.attributedBody,
+        m.date_edited,
+        m.message_summary_info
     FROM message m
     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     JOIN chat c ON cmj.chat_id = c.ROWID
@@ -231,7 +329,7 @@ def read_messages(args):
             })
 
     messages = []
-    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body in rows:
+    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob in rows:
         sec = date_ns / 1_000_000_000
         dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
         dt_local = dt_utc.astimezone()
@@ -241,6 +339,7 @@ def read_messages(args):
         msg_text = text or ""
         if not msg_text or msg_text.strip() == "":
             msg_text = parse_attributed_body(attr_body)
+        is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
         att_list = attachments_map.get(msg_id, [])
         messages.append({
             'msg_id': msg_id,
@@ -249,6 +348,11 @@ def read_messages(args):
             'sender': sender,
             'is_from_me': bool(is_from_me),
             'text': msg_text or "<empty message>",
+            'is_edited': is_edited,
+            'has_edits': is_edited,
+            'edit_count': edit_count,
+            'last_edited': last_edited,
+            'edit_history': edit_history,
             'attachments': att_list
         })
 
@@ -266,7 +370,8 @@ def read_messages(args):
                     att_strs.append(f"[Attachment: {att['transfer_name']} ({att['mime_type']}, {att['size']}{path_str})]")
                 att_desc = " ".join(att_strs)
                 msg_text = f"{msg_text} {att_desc}".strip() if msg_text != "<empty message>" else att_desc
-            print(f"[{m['timestamp']}] [{m['chat']}] {m['sender']}: {msg_text}")
+            edit_marker = f" [Edited ({m['edit_count']}x)]" if m['is_edited'] else ""
+            print(f"[{m['timestamp']}]{edit_marker} [{m['chat']}] {m['sender']}: {msg_text}")
     conn.close()
 
 def search_messages(args):
@@ -285,7 +390,9 @@ def search_messages(args):
         m.is_from_me,
         h.id,
         m.text,
-        m.attributedBody
+        m.attributedBody,
+        m.date_edited,
+        m.message_summary_info
     FROM message m
     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     JOIN chat c ON cmj.chat_id = c.ROWID
@@ -299,7 +406,7 @@ def search_messages(args):
     
     apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
     results = []
-    for msg_id, chat_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body in rows:
+    for msg_id, chat_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob in rows:
         sec = date_ns / 1_000_000_000
         dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
         dt_local = dt_utc.astimezone()
@@ -307,6 +414,7 @@ def search_messages(args):
         sender = "Me" if is_from_me else (handle or "Unknown")
         chat = display_name if display_name else chat_ident
         msg_text = text or parse_attributed_body(attr_body) or "<empty message>"
+        is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
         results.append({
             'msg_id': msg_id,
             'chat_id': chat_id,
@@ -314,7 +422,12 @@ def search_messages(args):
             'timestamp': ts,
             'sender': sender,
             'is_from_me': bool(is_from_me),
-            'text': msg_text
+            'text': msg_text,
+            'is_edited': is_edited,
+            'has_edits': is_edited,
+            'edit_count': edit_count,
+            'last_edited': last_edited,
+            'edit_history': edit_history
         })
 
     if getattr(args, 'json', False):
@@ -323,7 +436,8 @@ def search_messages(args):
         print(f"SEARCH RESULTS FOR '{query_str}' ({len(results)} matching messages found):")
         print("=" * 85)
         for r in results:
-            print(f"[{r['timestamp']}] [Chat {r['chat_id']}: {r['chat']}] {r['sender']}: {r['text']}")
+            edit_marker = f" [Edited ({r['edit_count']}x)]" if r['is_edited'] else ""
+            print(f"[{r['timestamp']}]{edit_marker} [Chat {r['chat_id']}: {r['chat']}] {r['sender']}: {r['text']}")
     conn.close()
 
 def search_contacts(args):
@@ -644,7 +758,9 @@ def get_recent_messages(args):
         m.is_from_me,
         h.id,
         m.text,
-        m.attributedBody
+        m.attributedBody,
+        m.date_edited,
+        m.message_summary_info
     FROM message m
     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     JOIN chat c ON cmj.chat_id = c.ROWID
@@ -659,7 +775,7 @@ def get_recent_messages(args):
     
     cmap = get_contacts_map()
     messages = []
-    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body in rows:
+    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob in rows:
         sec = date_ns / 1_000_000_000
         dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
         dt_local = dt_utc.astimezone()
@@ -675,6 +791,8 @@ def get_recent_messages(args):
         if not msg_text or msg_text.strip() == "":
             msg_text = parse_attributed_body(attr_body)
             
+        is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
+
         messages.append({
             'msg_id': msg_id,
             'timestamp': ts,
@@ -682,7 +800,12 @@ def get_recent_messages(args):
             'sender': sender_name,
             'handle': handle or "",
             'is_from_me': bool(is_from_me),
-            'text': msg_text or "<empty message>"
+            'text': msg_text or "<empty message>",
+            'is_edited': is_edited,
+            'has_edits': is_edited,
+            'edit_count': edit_count,
+            'last_edited': last_edited,
+            'edit_history': edit_history
         })
 
     if getattr(args, 'json', False):
@@ -691,7 +814,107 @@ def get_recent_messages(args):
         print(f"LAST {len(messages)} RECENT MESSAGES FOR '{target}':")
         print("=" * 85)
         for m in messages:
-            print(f"[{m['timestamp']}] {m['sender']}: {m['text']}")
+            edit_marker = f" [Edited ({m['edit_count']}x)]" if m['is_edited'] else ""
+            print(f"[{m['timestamp']}]{edit_marker} {m['sender']}: {m['text']}")
+    conn.close()
+
+def get_edit_history(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    msg_id = args.message_id
+
+    query = """
+    SELECT 
+        m.ROWID,
+        c.ROWID as chat_id,
+        COALESCE(c.display_name, ''),
+        c.chat_identifier,
+        m.date,
+        m.date_edited,
+        m.is_from_me,
+        h.id,
+        m.text,
+        m.attributedBody,
+        m.message_summary_info
+    FROM message m
+    LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    WHERE m.ROWID = ?
+    LIMIT 1
+    """
+    cursor.execute(query, (msg_id,))
+    row = cursor.fetchone()
+    if not row:
+        if getattr(args, 'json', False):
+            print(json.dumps({'error': f'Message #{msg_id} not found'}))
+        else:
+            print(f"ERROR: Message #{msg_id} not found", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    row_id, chat_id, display_name, chat_ident, date_ns, date_edited_ns, is_from_me, handle, text, attr_body, summary_blob = row
+
+    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+    sec = (date_ns or 0) / 1_000_000_000
+    dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
+    dt_local = dt_utc.astimezone()
+    ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
+
+    cmap = get_contacts_map()
+    sender_name = "Me"
+    if not is_from_me:
+        norm = normalize_handle(handle)
+        sender_name = cmap.get(norm, handle or "Unknown")
+
+    chat = display_name if display_name else (chat_ident or "Unknown")
+    msg_text = text or ""
+    if not msg_text or msg_text.strip() == "":
+        msg_text = parse_attributed_body(attr_body)
+    if not msg_text:
+        msg_text = "<empty message>"
+
+    is_edited, edit_count, last_edited, history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
+
+    if not history:
+        history = [{
+            'revision': 0,
+            'label': 'original',
+            'timestamp': ts,
+            'text': msg_text
+        }]
+
+    result = {
+        'msg_id': row_id,
+        'chat_id': chat_id,
+        'chat': chat,
+        'sender': sender_name,
+        'is_from_me': bool(is_from_me),
+        'timestamp': ts,
+        'is_edited': is_edited,
+        'has_edits': is_edited,
+        'edit_count': edit_count,
+        'last_edited': last_edited,
+        'current_text': msg_text,
+        'edit_history': history
+    }
+
+    if getattr(args, 'json', False):
+        print(json.dumps(result, indent=2))
+    else:
+        if is_edited:
+            print(f"EDIT HISTORY FOR MESSAGE #{row_id} ({edit_count} edits, last edited: {last_edited}):")
+            print("=" * 85)
+            print(f"Chat: {chat} (ID: {chat_id}) | Sender: {sender_name} | Current: {msg_text}")
+            print("-" * 85)
+            for h in history:
+                label_display = "[Original]" if h['revision'] == 0 else f"[Edit {h['revision']}]"
+                print(f"{label_display:<12} {h['timestamp']}: {h['text']}")
+        else:
+            print(f"Message #{row_id} has no edit history (original message only).")
+            print("=" * 85)
+            print(f"Chat: {chat} | Sender: {sender_name} | Date: {ts}")
+            print(f"Text: {msg_text}")
     conn.close()
 
 def search_group_chats(args):
@@ -808,6 +1031,11 @@ def main():
     send_parser.add_argument("--message", "-m", help="Message text body")
     send_parser.add_argument("--attachment", "-a", help="POSIX path to attachment file")
     send_parser.set_defaults(func=send_message)
+
+    edits_parser = subparsers.add_parser("edits", help="View edit and rewrite history for a message")
+    edits_parser.add_argument("message_id", type=int, help="Message ROWID")
+    edits_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    edits_parser.set_defaults(func=get_edit_history)
     
     args = parser.parse_args()
     args.func(args)

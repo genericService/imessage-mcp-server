@@ -222,9 +222,10 @@ Returns:
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
 | `imessage_list_chats` | List recent conversations with AddressBook names and participant sets | `limit` (number, default: 30) |
-| `imessage_read_messages` | Read message history with inline attachment details | `chat` (string, required), `days` (number, default: 14) |
-| `imessage_get_recent_messages` | Preview last N messages to verify thread context before sending | `chat` (string, required), `limit` (number, default: 5) |
-| `imessage_search_messages` | Full-text search across all historical iMessages | `query` (string, required), `limit` (number, default: 30) |
+| `imessage_read_messages` | Read message history with inline attachment details, edit state indicators, and revision history | `chat` (string, required), `days` (number, default: 14) |
+| `imessage_get_recent_messages` | Preview last N messages to verify thread context, participants, and edit history before sending | `chat` (string, required), `limit` (number, default: 5) |
+| `imessage_search_messages` | Full-text search across all historical iMessages including edit state | `query` (string, required), `limit` (number, default: 30) |
+| `imessage_get_edit_history` | Retrieve full rewrite and edit history with revision timestamps for an iMessage by ROWID | `message_id` (number, required) |
 | `imessage_search_group_chats` | Exact participant set search across group chats | `participants` (array of strings, required) |
 | `imessage_search_contacts` | Search macOS Address Book by name, phone, or email | `query` (string, optional) |
 | `imessage_get_chat_members` | List members and resolved contact names in group chats | `chat` (string, required) |
