@@ -1050,18 +1050,33 @@ def edit_message(args):
 
     # Handle error from imsg
     err_detail = stderr_str or stdout_str or f"imsg exited with code {res.returncode}"
-    if 'SIP' in err_detail or 'bridge' in err_detail or 'not_started' in err_detail:
-        err_detail = (
-            "imsg edit requires the IMCore bridge into Messages.app, which requires System Integrity Protection (SIP) "
-            "to be disabled. Apple does not expose an edit command in its standard AppleScript dictionary. "
-            f"Details: {err_detail}"
-        )
+    is_sip_blocked = 'SIP' in err_detail or 'bridge' in err_detail or 'not_started' in err_detail
 
     if getattr(args, 'json', False):
-        print(json.dumps({'error': err_detail, 'success': False}, indent=2))
+        if is_sip_blocked:
+            print(json.dumps({
+                'success': False,
+                'bridge_available': False,
+                'msg_id': msg_id,
+                'message_guid': message_guid,
+                'chat': chat_ident,
+                'display_name': display_name or "",
+                'original_text': current_text or "",
+                'suggested_text': new_text,
+                'error': "Messages edit bridge is unavailable because System Integrity Protection (SIP) is enabled on the host Mac. Apple does not support message editing via AppleScript.",
+                'fallback_recommendation': "Instruct the user to edit the message manually on their device using suggested_text, or call imessage_send_message to send a follow-up correction."
+            }, indent=2))
+            return
+        else:
+            print(json.dumps({'error': err_detail, 'success': False}, indent=2))
+            sys.exit(1)
     else:
-        print(f"ERROR: Failed to edit message #{msg_id}: {err_detail}", file=sys.stderr)
-    sys.exit(1)
+        if is_sip_blocked:
+            print("NOTICE: Messages edit bridge is unavailable because System Integrity Protection (SIP) is enabled on this Mac. Apple does not support message editing via AppleScript.", file=sys.stderr)
+            print(f"Suggested text for manual edit: '{new_text}'", file=sys.stderr)
+        else:
+            print(f"ERROR: Failed to edit message #{msg_id}: {err_detail}", file=sys.stderr)
+        sys.exit(1)
 
 def search_group_chats(args):
     raw_participants = args.participants

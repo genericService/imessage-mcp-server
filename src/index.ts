@@ -311,7 +311,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_edit_message',
     description:
-      'Edit a previously sent outgoing iMessage by its numeric message ROWID. Apple limits edits to outgoing messages sent within the last 15 minutes (max 5 edits). Note: Editing requires the imsg IMCore bridge into Messages.app with SIP disabled, as Apple does not provide AppleScript dictionary support for message edits.',
+      'Attempt to edit a previously sent outgoing iMessage by its numeric message ROWID (15-minute Apple protocol window, max 5 edits). Note: In-place editing requires the imsg IMCore bridge with SIP disabled. When SIP is enabled on the host Mac, this tool returns bridge_available: false along with the suggested_text and fallback recommendations so the assistant can guide the user or send a follow-up correction.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -379,7 +379,7 @@ iMessage MCP Server Instructions:
 2. Search: Call 'imessage_search_messages' to search past message history by keyword, or 'imessage_search_contacts' to find contacts.
 3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' using a chat ID or contact identifier to review past messages. Messages indicate whether edits exist.
 4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
-5. Editing: Call 'imessage_edit_message' with message_id and new_text to edit an outgoing message sent within the last 15 minutes.
+5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
 6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
 7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
 8. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
