@@ -9,18 +9,11 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { SSEServerTransport } from "@modelcontextprotocol/server-legacy/sse";
+import { Server, Tool } from "@modelcontextprotocol/server";
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
-  Tool
-} from '@modelcontextprotocol/sdk/types.js';
 import { logAuditEvent } from './audit.js';
 import {
   getOAuthMetadata,
@@ -52,7 +45,7 @@ function shellQuote(arg: string): string {
   return `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
-async function runImessageCli(cliArgs: string[]): Promise<string> {
+export async function runImessageCli(cliArgs: string[]): Promise<string> {
   try {
     if (IMESSAGE_SSH_FDA) {
       const remoteCommand = [PYTHON_BIN, CLI_PATH, ...cliArgs]
@@ -106,6 +99,45 @@ const LEGACY_BEARER_TOKENS = new Set(
  * 2026-07-28 Model Context Protocol Specification Version
  */
 export const SPEC_VERSION = '2026-07-28';
+
+/**
+ * Supported Model Context Protocol specification versions (Dual-era modern and legacy support).
+ */
+export const SUPPORTED_SPEC_VERSIONS = [
+  '2026-07-28',
+  '2025-11-25',
+  '2025-06-18',
+  '2025-03-26',
+  '2024-11-05',
+  '2024-10-07'
+];
+
+/**
+ * Decodes RFC 9110 / MCP 2026-07-28 sentinel encoded header values (=?base64?...?=).
+ */
+export function decodeHeaderValue(val: string): string {
+  if (val.startsWith('=?base64?') && val.endsWith('?=')) {
+    const base64Str = val.slice(9, -2);
+    try {
+      return Buffer.from(base64Str, 'base64').toString('utf8');
+    } catch {
+      return val;
+    }
+  }
+  return val;
+}
+
+const SERVER_INSTRUCTIONS = `
+iMessage MCP Server Instructions:
+1. Discovery: Call 'imessage_list_chats' to discover available conversation IDs, display names, and handles.
+2. Search: Call 'imessage_search_messages' to search past message history by keyword, or 'imessage_search_contacts' to find contacts.
+3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' using a chat ID or contact identifier to review past messages. Messages indicate whether edits exist.
+4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
+5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
+6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
+7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
+8. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
+`.trim();
 
 function publicBaseUrl(): string {
   return `https://${PUBLIC_DOMAIN}`;
@@ -373,21 +405,39 @@ function createMcpServer(): Server {
           listChanged: false
         }
       },
-      instructions: `
-iMessage MCP Server Instructions:
-1. Discovery: Call 'imessage_list_chats' to discover available conversation IDs, display names, and handles.
-2. Search: Call 'imessage_search_messages' to search past message history by keyword, or 'imessage_search_contacts' to find contacts.
-3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' using a chat ID or contact identifier to review past messages. Messages indicate whether edits exist.
-4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
-5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
-6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
-7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
-8. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
-`.trim()
+      instructions: SERVER_INSTRUCTIONS,
+      supportedProtocolVersions: SUPPORTED_SPEC_VERSIONS
     }
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
+  server.setRequestHandler('server/discover', async () => {
+    return {
+      resultType: 'complete',
+      supportedVersions: SUPPORTED_SPEC_VERSIONS,
+      capabilities: {
+        tools: {
+          listChanged: true,
+          ttlMs: 300000,
+          cacheScope: 'client'
+        },
+        resources: {
+          subscribe: false,
+          listChanged: false
+        }
+      },
+      _meta: {
+        'io.modelcontextprotocol/serverInfo': {
+          name: 'imessage-mcp-server',
+          version: SERVER_VERSION
+        }
+      },
+      instructions: SERVER_INSTRUCTIONS,
+      ttlMs: 300000,
+      cacheScope: 'client'
+    } as any;
+  });
+
+  server.setRequestHandler('tools/list', async () => {
     return {
       tools: TOOLS,
       ttlMs: 300000,
@@ -395,7 +445,7 @@ iMessage MCP Server Instructions:
     } as any;
   });
 
-  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  server.setRequestHandler('resources/list', async () => {
     return {
       resources: [
         {
@@ -408,7 +458,7 @@ iMessage MCP Server Instructions:
     };
   });
 
-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  server.setRequestHandler('resources/read', async (request) => {
     const { uri } = request.params;
     if (uri === 'resource://readme' || uri === 'file:///README.md') {
       const readmePath = path.resolve(__dir, '../README.md');
@@ -426,7 +476,7 @@ iMessage MCP Server Instructions:
     throw new Error(`Resource not found: ${uri}`);
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+  server.setRequestHandler('tools/call', async (request, ctx) => {
     const { name, arguments: args } = request.params;
     const startTime = Date.now();
     let targetParam: string | undefined = undefined;
@@ -446,7 +496,7 @@ iMessage MCP Server Instructions:
     }
 
     try {
-      let result: { content: { type: string; text: string }[]; isError?: boolean };
+      let result: { content: { type: 'text'; text: string }[]; isError?: boolean };
       if (name === 'imessage_get_readme') {
         const readmePath = path.resolve(__dir, '../README.md');
         const content = await fs.promises.readFile(readmePath, 'utf8');
@@ -611,7 +661,7 @@ iMessage MCP Server Instructions:
 
       logAuditEvent({
         timestamp: new Date().toISOString(),
-        client_id: (extra as any)?.user?.sub || 'master-token',
+        client_id: (ctx as any)?.user?.sub || 'master-token',
         tool: name,
         target: targetParam,
         dry_run: dryRunParam,
@@ -622,7 +672,7 @@ iMessage MCP Server Instructions:
     } catch (error: any) {
       logAuditEvent({
         timestamp: new Date().toISOString(),
-        client_id: (extra as any)?.user?.sub || 'master-token',
+        client_id: (ctx as any)?.user?.sub || 'master-token',
         tool: name,
         target: targetParam,
         dry_run: dryRunParam,
@@ -787,7 +837,7 @@ app.post('/oauth/token', handleTokenPost);
 app.post('/oauth/register', handleRegisterPost);
 
 const sseSessions = new Map<string, { transport: SSEServerTransport; server: Server }>();
-const httpSessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server; lastAccess: number }>();
+const httpSessions = new Map<string, { transport: NodeStreamableHTTPServerTransport; server: Server; lastAccess: number }>();
 
 // Session cleanup interval for Streamable HTTP transport
 setInterval(() => {
@@ -1034,6 +1084,76 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
   // Handle ping & notification probes for grok/mcp doctor checks without requiring an active session
   if (parsedBody && typeof parsedBody === 'object') {
     const body = parsedBody as Record<string, unknown>;
+
+    // 1. Protocol Version Validation (-32022)
+    const headerProto = (req.headers['mcp-protocol-version'] || req.headers['Mcp-Protocol-Version']) as string | undefined;
+    const metaProto = (body.params as any)?._meta?.['io.modelcontextprotocol/protocolVersion']
+      || ((body.params as any)?.protocolVersion as string | undefined);
+    const requestedVersion = headerProto || metaProto;
+
+    if (requestedVersion && !SUPPORTED_SPEC_VERSIONS.includes(requestedVersion)) {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        id: body.id ?? null,
+        error: {
+          code: -32022,
+          message: `Unsupported protocol version: ${requestedVersion}`,
+          data: {
+            supported: SUPPORTED_SPEC_VERSIONS,
+            requested: requestedVersion
+          }
+        }
+      });
+      return;
+    }
+
+    // 2. Header Validation (-32020 HeaderMismatch)
+    if (headerProto && metaProto && headerProto !== metaProto) {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        id: body.id ?? null,
+        error: {
+          code: -32020,
+          message: `Header mismatch: MCP-Protocol-Version '${headerProto}' does not match body protocolVersion '${metaProto}'`
+        }
+      });
+      return;
+    }
+
+    const mcpMethodHeader = (req.headers['mcp-method'] || req.headers['Mcp-Method']) as string | undefined;
+    if (mcpMethodHeader && body.method && typeof body.method === 'string') {
+      if (mcpMethodHeader !== body.method) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          id: body.id ?? null,
+          error: {
+            code: -32020,
+            message: `Header mismatch: Mcp-Method header '${mcpMethodHeader}' does not match body method '${body.method}'`
+          }
+        });
+        return;
+      }
+    }
+
+    const mcpNameHeader = (req.headers['mcp-name'] || req.headers['Mcp-Name']) as string | undefined;
+    if (mcpNameHeader && body.params && typeof body.params === 'object') {
+      const bodyName = (body.params as any).name || (body.params as any).uri;
+      if (bodyName && typeof bodyName === 'string') {
+        const decodedName = decodeHeaderValue(mcpNameHeader);
+        if (decodedName !== bodyName) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            id: body.id ?? null,
+            error: {
+              code: -32020,
+              message: `Header mismatch: Mcp-Name header '${decodedName}' does not match body '${bodyName}'`
+            }
+          });
+          return;
+        }
+      }
+    }
+
     if (body.method === 'ping') {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.status(200).send(JSON.stringify({
@@ -1049,6 +1169,39 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
         jsonrpc: '2.0',
         result: {},
         id: body.id ?? null
+      }));
+      return;
+    }
+
+    if (body.method === 'server/discover') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.status(200).send(JSON.stringify({
+        jsonrpc: '2.0',
+        id: body.id ?? 1,
+        result: {
+          resultType: 'complete',
+          supportedVersions: SUPPORTED_SPEC_VERSIONS,
+          capabilities: {
+            tools: {
+              listChanged: true,
+              ttlMs: 300000,
+              cacheScope: 'client'
+            },
+            resources: {
+              subscribe: false,
+              listChanged: false
+            }
+          },
+          _meta: {
+            'io.modelcontextprotocol/serverInfo': {
+              name: 'imessage-mcp-server',
+              version: SERVER_VERSION
+            }
+          },
+          instructions: SERVER_INSTRUCTIONS,
+          ttlMs: 300000,
+          cacheScope: 'client'
+        }
       }));
       return;
     }
@@ -1081,6 +1234,7 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
   if (reqSessionId && httpSessions.has(reqSessionId)) {
     const session = httpSessions.get(reqSessionId)!;
     session.lastAccess = Date.now();
+    session.transport.setSupportedProtocolVersions(SUPPORTED_SPEC_VERSIONS);
     try {
       await session.transport.handleRequest(req, res, parsedBody);
     } catch (err: any) {
@@ -1092,22 +1246,36 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
     return;
   }
 
+  const isLegacyInitialize = parsedBody && typeof parsedBody === 'object' && (parsedBody as any).method === 'initialize';
+
   try {
-    let generatedSessionId: string | undefined;
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => {
-        generatedSessionId = crypto.randomUUID();
-        return generatedSessionId;
+    if (isLegacyInitialize) {
+      let generatedSessionId: string | undefined;
+      const transport = new NodeStreamableHTTPServerTransport({
+        sessionIdGenerator: () => {
+          generatedSessionId = crypto.randomUUID();
+          return generatedSessionId;
+        }
+      });
+      transport.setSupportedProtocolVersions(SUPPORTED_SPEC_VERSIONS);
+      const server = createMcpServer();
+      await server.connect(transport);
+
+      await transport.handleRequest(req, res, parsedBody);
+
+      if (generatedSessionId) {
+        httpSessions.set(generatedSessionId, { transport, server, lastAccess: Date.now() });
+        console.log(`[MCP] Registered Streamable HTTP session: ${generatedSessionId}`);
       }
-    });
-    const server = createMcpServer();
-    await server.connect(transport);
+    } else {
+      const transport = new NodeStreamableHTTPServerTransport({
+        sessionIdGenerator: undefined
+      });
+      transport.setSupportedProtocolVersions(SUPPORTED_SPEC_VERSIONS);
+      const server = createMcpServer();
+      await server.connect(transport);
 
-    await transport.handleRequest(req, res, parsedBody);
-
-    if (generatedSessionId) {
-      httpSessions.set(generatedSessionId, { transport, server, lastAccess: Date.now() });
-      console.log(`[MCP] Registered Streamable HTTP session: ${generatedSessionId}`);
+      await transport.handleRequest(req, res, parsedBody);
     }
   } catch (err: any) {
     console.error('[MCP Transport Error]:', err);

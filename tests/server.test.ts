@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import dotenv from 'dotenv';
@@ -6,9 +6,20 @@ import path from 'path';
 
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
+import { runImessageCli } from '../src/index.js';
+
 const execFileAsync = promisify(execFile);
 const PYTHON_BIN = '/usr/bin/python3';
 const CLI_PATH = path.resolve(__dirname, '../bin/imessage');
+
+async function runCli(args: string[]): Promise<{ stdout: string }> {
+  try {
+    const stdout = await runImessageCli(args);
+    return { stdout };
+  } catch (err: any) {
+    throw err;
+  }
+}
 
 describe('iMessage MCP Tool Schemas (SDD)', () => {
   it('should define required tool names and properties', () => {
@@ -41,7 +52,7 @@ describe('iMessage MCP Tool Schemas (SDD)', () => {
 
 describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   it('should return valid JSON when --json flag is passed to imessage list', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'list', '--limit', '3', '--json']);
+    const { stdout } = await runCli(['list', '--limit', '3', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
     if (data.length > 0) {
@@ -51,7 +62,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   });
 
   it('should return valid JSON when --json flag is passed to imessage search', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search', 'the', '--limit', '2', '--json']);
+    const { stdout } = await runCli(['search', 'the', '--limit', '2', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
     if (data.length > 0) {
@@ -63,13 +74,13 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   });
 
   it('should return valid JSON when --json flag is passed to imessage contacts', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'contacts', '', '--json']);
+    const { stdout } = await runCli(['contacts', '', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
   });
 
   it('should return valid JSON for recent messages CLI command with edit fields', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'recent', '1', '--limit', '2', '--json']);
+    const { stdout } = await runCli(['recent', '1', '--limit', '2', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
     if (data.length > 0) {
@@ -83,7 +94,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   });
 
   it('should support inspecting edit history for a specific message via CLI edits command', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edits', '198097', '--json']);
+    const { stdout } = await runCli(['edits', '198097', '--json']);
     const data = JSON.parse(stdout);
     expect(data).toHaveProperty('msg_id', 198097);
     expect(data).toHaveProperty('is_edited', true);
@@ -98,14 +109,14 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   });
 
   it('should format edit indicator in CLI text output for edited messages', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edits', '198097']);
+    const { stdout } = await runCli(['edits', '198097']);
     expect(stdout).toContain('EDIT HISTORY FOR MESSAGE #198097');
     expect(stdout).toContain('[Original]');
     expect(stdout).toContain('[Edit');
   });
 
   it('should return unedited message payload with is_edited false and original revision in edit_history', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edits', '1', '--json']);
+    const { stdout } = await runCli(['edits', '1', '--json']);
     const data = JSON.parse(stdout);
     expect(data).toHaveProperty('msg_id', 1);
     expect(data.is_edited).toBe(false);
@@ -117,9 +128,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   });
 
   it('should return valid JSON with edit fields for imessage read', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'read', '1', '--days', '14', '--json'], {
-      maxBuffer: 32 * 1024 * 1024
-    });
+    const { stdout } = await runCli(['read', '1', '--days', '14', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
     if (data.length > 0) {
@@ -131,25 +140,25 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   });
 
   it('should return valid JSON for search-group CLI command', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'search-group', 'Paul Atreides', '--json']);
+    const { stdout } = await runCli(['search-group', 'Paul Atreides', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
   });
 
   it('should support recipient parameter targeting group chats or phone numbers', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'send', '--help']);
+    const { stdout } = await runCli(['send', '--help']);
     expect(stdout).toContain('Recipient identifier');
   });
 
   it('should support CLI help for imessage edit command', async () => {
-    const { stdout } = await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edit', '--help']);
+    const { stdout } = await runCli(['edit', '--help']);
     expect(stdout).toContain('message_id');
     expect(stdout).toContain('--text');
   });
 
   it('should reject editing incoming messages with an error', async () => {
     try {
-      await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edit', '1', '--text', 'Trying to edit incoming message', '--json']);
+      await runCli(['edit', '1', '--text', 'Trying to edit incoming message', '--json']);
       expect.unreachable('Should have thrown an error for incoming message');
     } catch (err: any) {
       const output = err.stdout || err.stderr || err.message;
@@ -159,7 +168,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
 
   it('should reject editing messages older than 15 minutes', async () => {
     try {
-      await execFileAsync(PYTHON_BIN, [CLI_PATH, 'edit', '198100', '--text', 'Paul Atreides revised message', '--json']);
+      await runCli(['edit', '198100', '--text', 'Paul Atreides revised message', '--json']);
       expect.unreachable('Should have thrown an error for expired message');
     } catch (err: any) {
       const output = err.stdout || err.stderr || err.message;
@@ -427,9 +436,244 @@ describe('OAuth 2.0 Auth Server & JWT Verification', () => {
 });
 
 describe('MCP 2026-07-28 Spec Compliance', () => {
-  it('should declare protocol version 2026-07-28 and support stateless discovery', async () => {
-    const { SPEC_VERSION } = await import('../src/index.js');
+  let testServer: import('http').Server;
+  let testUrl: string;
+  const AUTH_TOKEN = process.env.BEARER_TOKEN || '1ba52a7166e61f6af6a35399a555f4e940af4653b223e1f1225b3ca64de6fb7e';
+
+  beforeAll(async () => {
+    const http = await import('http');
+    const { app } = await import('../src/index.js');
+    await new Promise<void>((resolve) => {
+      testServer = http.createServer(app);
+      testServer.listen(0, '127.0.0.1', () => {
+        const addr = testServer.address() as import('net').AddressInfo;
+        testUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+    });
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => {
+      testServer.close(() => resolve());
+    });
+  });
+
+  it('should declare protocol version 2026-07-28 and supported protocol versions', async () => {
+    const { SPEC_VERSION, SUPPORTED_SPEC_VERSIONS } = await import('../src/index.js');
     expect(SPEC_VERSION).toBe('2026-07-28');
+    expect(SUPPORTED_SPEC_VERSIONS).toContain('2026-07-28');
+    expect(SUPPORTED_SPEC_VERSIONS).toContain('2025-11-25');
+  });
+
+  it('should handle server/discover JSON-RPC method with supportedVersions, capabilities, and serverInfo', async () => {
+    const res = await fetch(`${testUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'MCP-Protocol-Version': '2026-07-28',
+        'Mcp-Method': 'server/discover'
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'disc-42',
+        method: 'server/discover',
+        params: {
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientInfo': {
+              name: 'spec-test-client',
+              version: '1.0.0'
+            },
+            'io.modelcontextprotocol/clientCapabilities': {}
+          }
+        }
+      })
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('mcp-protocol-version')).toBe('2026-07-28');
+    const data = await res.json();
+    expect(data.jsonrpc).toBe('2.0');
+    expect(data.id).toBe('disc-42');
+    expect(data.result).toHaveProperty('supportedVersions');
+    expect(data.result.supportedVersions).toContain('2026-07-28');
+    expect(data.result).toHaveProperty('capabilities');
+    expect(data.result.capabilities).toHaveProperty('tools');
+    expect(data.result).toHaveProperty('_meta');
+    expect(data.result._meta['io.modelcontextprotocol/serverInfo'].name).toBe('imessage-mcp-server');
+  });
+
+  it('should reject unsupported protocol version with -32022 UnsupportedProtocolVersionError', async () => {
+    const res = await fetch(`${testUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'MCP-Protocol-Version': '1999-01-01',
+        'Mcp-Method': 'server/discover'
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'unsupported-ver-1',
+        method: 'server/discover',
+        params: {
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '1999-01-01'
+          }
+        }
+      })
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error.code).toBe(-32022);
+    expect(data.error.message).toContain('Unsupported protocol version');
+    expect(data.error.data.requested).toBe('1999-01-01');
+    expect(Array.isArray(data.error.data.supported)).toBe(true);
+    expect(data.error.data.supported).toContain('2026-07-28');
+  });
+
+  it('should reject header mismatch with -32020 when Mcp-Method does not match body method', async () => {
+    const res = await fetch(`${testUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'MCP-Protocol-Version': '2026-07-28',
+        'Mcp-Method': 'tools/list'
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'mismatch-1',
+        method: 'server/discover',
+        params: {
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28'
+          }
+        }
+      })
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error.code).toBe(-32020);
+    expect(data.error.message).toContain('Header mismatch');
+  });
+
+  it('should reject header mismatch with -32020 when MCP-Protocol-Version does not match body protocolVersion', async () => {
+    const res = await fetch(`${testUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'MCP-Protocol-Version': '2026-07-28',
+        'Mcp-Method': 'server/discover'
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'mismatch-2',
+        method: 'server/discover',
+        params: {
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2025-11-25'
+          }
+        }
+      })
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error.code).toBe(-32020);
+    expect(data.error.message).toContain('Header mismatch');
+  });
+
+  it('should reject header mismatch with -32020 when Mcp-Name does not match body params.name', async () => {
+    const res = await fetch(`${testUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'MCP-Protocol-Version': '2026-07-28',
+        'Mcp-Method': 'tools/call',
+        'Mcp-Name': 'wrong_tool_name'
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'mismatch-3',
+        method: 'tools/call',
+        params: {
+          name: 'imessage_list_chats',
+          arguments: { limit: 1 },
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28'
+          }
+        }
+      })
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error.code).toBe(-32020);
+    expect(data.error.message).toContain('Header mismatch');
+  });
+
+  it('should accept Base64 sentinel encoded Mcp-Name header matching body params.name', async () => {
+    const toolName = 'imessage_get_readme';
+    const encodedHeader = `=?base64?${Buffer.from(toolName, 'utf8').toString('base64')}?=`;
+    const res = await fetch(`${testUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'MCP-Protocol-Version': '2026-07-28',
+        'Mcp-Method': 'tools/call',
+        'Mcp-Name': encodedHeader
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'b64-name-1',
+        method: 'tools/call',
+        params: {
+          name: toolName,
+          arguments: {},
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28'
+          }
+        }
+      })
+    });
+
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('iMessage MCP Server');
+  });
+
+  it('should execute tools/list statelessly without requiring an active session', async () => {
+    const res = await fetch(`${testUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'MCP-Protocol-Version': '2026-07-28',
+        'Mcp-Method': 'tools/list'
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'stateless-tools-1',
+        method: 'tools/list',
+        params: {
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28'
+          }
+        }
+      })
+    });
+
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('imessage_list_chats');
   });
 });
 
