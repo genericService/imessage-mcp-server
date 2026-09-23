@@ -11,6 +11,7 @@ import glob
 import json
 import base64
 import plistlib
+import struct
 
 DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
 
@@ -31,6 +32,215 @@ def format_size(bytes_num):
             return f"{bytes_num:.1f} {unit}"
         bytes_num /= 1024.0
     return f"{bytes_num:.1f} TB"
+
+AUDIO_EXTENSIONS = {'.caf', '.m4a', '.wav', '.mp3', '.aac', '.ogg', '.aiff', '.flac'}
+AUDIO_MIME_MAP = {
+    '.caf': 'audio/x-caf',
+    '.m4a': 'audio/mp4',
+    '.mp4': 'audio/mp4',
+    '.wav': 'audio/wav',
+    '.mp3': 'audio/mpeg',
+    '.aac': 'audio/aac',
+    '.ogg': 'audio/ogg',
+    '.aiff': 'audio/aiff',
+    '.flac': 'audio/flac',
+}
+
+def get_caf_duration(path):
+    """Parse CAF header for sample rate and valid frame count to compute exact duration."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            hdr = f.read(8)
+            if len(hdr) < 8 or hdr[:4] != b'caff':
+                return None
+            sr = None
+            while True:
+                chunk_hdr = f.read(12)
+                if len(chunk_hdr) < 12:
+                    break
+                ctype, csize = struct.unpack('>4sq', chunk_hdr)
+                if ctype == b'desc':
+                    desc_data = f.read(csize)
+                    if len(desc_data) >= 8:
+                        sr = struct.unpack('>d', desc_data[:8])[0]
+                elif ctype == b'pakt':
+                    pakt_data = f.read(min(csize, 24))
+                    if len(pakt_data) >= 16 and sr and sr > 0:
+                        pkts, valid_frames = struct.unpack('>qq', pakt_data[:16])
+                        return round(valid_frames / sr, 2)
+                    if csize > len(pakt_data):
+                        f.seek(csize - len(pakt_data), 1)
+                else:
+                    if csize > 0:
+                        f.seek(csize, 1)
+    except Exception:
+        pass
+    return None
+
+def get_audio_duration(path):
+    """Returns duration in seconds for an audio file, using fast CAF parser or afinfo."""
+    if not path or not os.path.exists(path):
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.caf':
+        dur = get_caf_duration(path)
+        if dur is not None:
+            return dur
+    try:
+        afinfo_bin = '/usr/bin/afinfo'
+        if os.path.exists(afinfo_bin):
+            res = subprocess.run([afinfo_bin, path], capture_output=True, text=True, timeout=5)
+            for line in res.stdout.splitlines():
+                if 'estimated duration:' in line:
+                    parts = line.split('estimated duration:')[1].split()
+                    if parts:
+                        return round(float(parts[0]), 2)
+    except Exception:
+        pass
+    return None
+
+def format_duration(seconds):
+    """Format duration in seconds to compact string like '15s' or '1m 32s'."""
+    if seconds is None:
+        return None
+    total_sec = int(round(seconds))
+    mins = total_sec // 60
+    secs = total_sec % 60
+    if mins > 0:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+def build_voice_note_label(duration_formatted, transcription):
+    """Build a clear label for voice notes instead of an empty message."""
+    if transcription and duration_formatted:
+        return f'[voice note, {duration_formatted}: "{transcription}"]'
+    elif transcription:
+        return f'[voice note: "{transcription}"]'
+    elif duration_formatted:
+        return f'[voice note, {duration_formatted}]'
+    return '[voice note]'
+
+def extract_attachment_user_info(user_info_blob):
+    """Extract transcription, uti, and metadata from attachment user_info blob."""
+    if not user_info_blob:
+        return {}
+    try:
+        return plistlib.loads(user_info_blob)
+    except Exception:
+        return {}
+
+def fetch_attachments_for_messages(cursor, msg_ids):
+    """
+    Fetch and enrich all attachments for a list of message IDs.
+    Returns a dict mapping msg_id to a list of attachment dicts.
+    """
+    if not msg_ids:
+        return {}
+    att_placeholders = ",".join(["?"] * len(msg_ids))
+    att_query = f"""
+    SELECT 
+        maj.message_id,
+        a.filename,
+        a.mime_type,
+        a.transfer_name,
+        a.total_bytes,
+        a.user_info,
+        a.uti
+    FROM message_attachment_join maj
+    JOIN attachment a ON maj.attachment_id = a.ROWID
+    WHERE maj.message_id IN ({att_placeholders})
+    """
+    cursor.execute(att_query, msg_ids)
+    attachments_map = {}
+    for msg_id, filename, mime_type, transfer_name, total_bytes, user_info, uti in cursor.fetchall():
+        if msg_id not in attachments_map:
+            attachments_map[msg_id] = []
+        
+        full_path = os.path.expanduser(filename) if filename else None
+        ext = os.path.splitext(full_path or transfer_name or "")[1].lower()
+        
+        p = extract_attachment_user_info(user_info)
+        transcription = p.get('audio-transcription') or None
+        
+        is_audio = (
+            ext in AUDIO_EXTENSIONS
+            or (uti and ('coreaudio' in uti.lower() or 'audio' in uti.lower()))
+            or (mime_type and mime_type.startswith('audio/'))
+            or transcription is not None
+        )
+        
+        resolved_mime = mime_type
+        if not resolved_mime or resolved_mime == 'application/octet-stream':
+            if ext in AUDIO_MIME_MAP:
+                resolved_mime = AUDIO_MIME_MAP[ext]
+            elif ext in ['.jpg', '.jpeg']:
+                resolved_mime = 'image/jpeg'
+            elif ext == '.png':
+                resolved_mime = 'image/png'
+            elif ext in ['.heic', '.heif']:
+                resolved_mime = 'image/heic'
+            elif ext == '.mov':
+                resolved_mime = 'video/quicktime'
+            elif ext == '.mp4':
+                resolved_mime = 'video/mp4'
+            elif is_audio:
+                resolved_mime = 'audio/x-caf'
+            else:
+                resolved_mime = 'application/octet-stream'
+
+        dur_sec = get_audio_duration(full_path) if is_audio and full_path else None
+        dur_fmt = format_duration(dur_sec) if dur_sec is not None else None
+
+        attachments_map[msg_id].append({
+            'filename': full_path,
+            'mime_type': resolved_mime,
+            'transfer_name': transfer_name or (os.path.basename(full_path) if full_path else 'attachment'),
+            'size': format_size(total_bytes),
+            'is_audio': bool(is_audio),
+            'duration_seconds': dur_sec,
+            'duration_formatted': dur_fmt,
+            'transcription': transcription
+        })
+    return attachments_map
+
+def synthesize_message_text(raw_text, attr_body, is_audio_message, att_list):
+    """
+    Synthesizes message text, populating voice note transcripts and labels
+    when text is empty or when audio attachments exist.
+    Returns: (text: str, is_audio: bool, transcription: str | None)
+    """
+    msg_text = raw_text or ""
+    if not msg_text or msg_text.strip() == "":
+        msg_text = parse_attributed_body(attr_body)
+    
+    audio_atts = [a for a in att_list if a.get('is_audio')]
+    is_audio = bool(is_audio_message or audio_atts)
+    
+    transcription = None
+    for a in audio_atts:
+        if a.get('transcription'):
+            transcription = a['transcription']
+            break
+            
+    dur_fmt = None
+    for a in audio_atts:
+        if a.get('duration_formatted'):
+            dur_fmt = a['duration_formatted']
+            break
+
+    if is_audio:
+        voice_label = build_voice_note_label(dur_fmt, transcription)
+        if not msg_text or msg_text.strip() == "" or msg_text == "<empty message>":
+            msg_text = voice_label
+        else:
+            msg_text = f"{msg_text.strip()} {voice_label}".strip()
+            
+    if not msg_text or msg_text.strip() == "":
+        msg_text = "<empty message>"
+
+    return msg_text, is_audio, transcription
 
 def normalize_handle(val):
     if not val: return ""
@@ -291,7 +501,8 @@ def read_messages(args):
         m.text,
         m.attributedBody,
         m.date_edited,
-        m.message_summary_info
+        m.message_summary_info,
+        m.is_audio_message
     FROM message m
     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     JOIN chat c ON cmj.chat_id = c.ROWID
@@ -303,51 +514,28 @@ def read_messages(args):
     rows = cursor.fetchall()
     
     msg_ids = [r[0] for r in rows]
-    attachments_map = {}
-    if msg_ids:
-        att_placeholders = ",".join(["?"] * len(msg_ids))
-        att_query = f"""
-        SELECT 
-            maj.message_id,
-            a.filename,
-            a.mime_type,
-            a.transfer_name,
-            a.total_bytes
-        FROM message_attachment_join maj
-        JOIN attachment a ON maj.attachment_id = a.ROWID
-        WHERE maj.message_id IN ({att_placeholders})
-        """
-        cursor.execute(att_query, msg_ids)
-        for msg_id, filename, mime_type, transfer_name, total_bytes in cursor.fetchall():
-            if msg_id not in attachments_map:
-                attachments_map[msg_id] = []
-            attachments_map[msg_id].append({
-                'filename': os.path.expanduser(filename) if filename else None,
-                'mime_type': mime_type or 'application/octet-stream',
-                'transfer_name': transfer_name or 'attachment',
-                'size': format_size(total_bytes)
-            })
+    attachments_map = fetch_attachments_for_messages(cursor, msg_ids)
 
     messages = []
-    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob in rows:
+    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob, is_audio_msg in rows:
         sec = date_ns / 1_000_000_000
         dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
         dt_local = dt_utc.astimezone()
         ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
         sender = "Me" if is_from_me else (handle or "Unknown")
         chat = display_name if display_name else chat_ident
-        msg_text = text or ""
-        if not msg_text or msg_text.strip() == "":
-            msg_text = parse_attributed_body(attr_body)
-        is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
         att_list = attachments_map.get(msg_id, [])
+        msg_text, is_audio, transcription = synthesize_message_text(text, attr_body, is_audio_msg, att_list)
+        is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
         messages.append({
             'msg_id': msg_id,
             'timestamp': ts,
             'chat': chat,
             'sender': sender,
             'is_from_me': bool(is_from_me),
-            'text': msg_text or "<empty message>",
+            'text': msg_text,
+            'is_audio_message': is_audio,
+            'transcription': transcription,
             'is_edited': is_edited,
             'has_edits': is_edited,
             'edit_count': edit_count,
@@ -366,10 +554,16 @@ def read_messages(args):
             if m['attachments']:
                 att_strs = []
                 for att in m['attachments']:
+                    dur_str = f", duration: {att['duration_formatted']}" if att.get('duration_formatted') else ""
                     path_str = f", path: {att['filename']}" if att['filename'] else ""
-                    att_strs.append(f"[Attachment: {att['transfer_name']} ({att['mime_type']}, {att['size']}{path_str})]")
+                    att_strs.append(f"[Attachment: {att['transfer_name']} ({att['mime_type']}, {att['size']}{dur_str}{path_str})]")
                 att_desc = " ".join(att_strs)
-                msg_text = f"{msg_text} {att_desc}".strip() if msg_text != "<empty message>" else att_desc
+                if not msg_text.startswith('[voice note') and msg_text != "<empty message>":
+                    msg_text = f"{msg_text} {att_desc}".strip()
+                elif msg_text.startswith('[voice note'):
+                    msg_text = f"{msg_text} {att_desc}".strip()
+                else:
+                    msg_text = att_desc
             edit_marker = f" [Edited ({m['edit_count']}x)]" if m['is_edited'] else ""
             print(f"[{m['timestamp']}]{edit_marker} [{m['chat']}] {m['sender']}: {msg_text}")
     conn.close()
@@ -381,7 +575,7 @@ def search_messages(args):
     limit = args.limit
     
     query = """
-    SELECT 
+    SELECT DISTINCT
         m.ROWID,
         c.ROWID as chat_id,
         c.display_name,
@@ -392,28 +586,35 @@ def search_messages(args):
         m.text,
         m.attributedBody,
         m.date_edited,
-        m.message_summary_info
+        m.message_summary_info,
+        m.is_audio_message
     FROM message m
     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     JOIN chat c ON cmj.chat_id = c.ROWID
     LEFT JOIN handle h ON m.handle_id = h.ROWID
-    WHERE m.text LIKE ? OR (m.text IS NULL AND m.attributedBody LIKE ?)
+    LEFT JOIN message_attachment_join maj ON m.ROWID = maj.message_id
+    LEFT JOIN attachment a ON maj.attachment_id = a.ROWID
+    WHERE m.text LIKE ? OR (m.text IS NULL AND m.attributedBody LIKE ?) OR a.user_info LIKE ?
     ORDER BY m.date DESC
     LIMIT ?
     """
-    cursor.execute(query, (f"%{query_str}%", f"%{query_str}%", limit))
+    cursor.execute(query, (f"%{query_str}%", f"%{query_str}%", f"%{query_str}%", limit))
     rows = cursor.fetchall()
     
+    msg_ids = [r[0] for r in rows]
+    attachments_map = fetch_attachments_for_messages(cursor, msg_ids)
+
     apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
     results = []
-    for msg_id, chat_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob in rows:
+    for msg_id, chat_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob, is_audio_msg in rows:
         sec = date_ns / 1_000_000_000
         dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
         dt_local = dt_utc.astimezone()
         ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
         sender = "Me" if is_from_me else (handle or "Unknown")
         chat = display_name if display_name else chat_ident
-        msg_text = text or parse_attributed_body(attr_body) or "<empty message>"
+        att_list = attachments_map.get(msg_id, [])
+        msg_text, is_audio, transcription = synthesize_message_text(text, attr_body, is_audio_msg, att_list)
         is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
         results.append({
             'msg_id': msg_id,
@@ -423,11 +624,14 @@ def search_messages(args):
             'sender': sender,
             'is_from_me': bool(is_from_me),
             'text': msg_text,
+            'is_audio_message': is_audio,
+            'transcription': transcription,
             'is_edited': is_edited,
             'has_edits': is_edited,
             'edit_count': edit_count,
             'last_edited': last_edited,
-            'edit_history': edit_history
+            'edit_history': edit_history,
+            'attachments': att_list
         })
 
     if getattr(args, 'json', False):
@@ -559,13 +763,35 @@ def get_attachment_payload(args):
     target_path = filepath
     mime = "application/octet-stream"
     ext = os.path.splitext(filepath)[1].lower()
+    parent_name = os.path.basename(os.path.dirname(filepath)) or "file"
+    file_base = os.path.splitext(os.path.basename(filepath))[0]
     
     if ext in ['.heic', '.heif']:
-        jpg_path = f"/tmp/imessage_conv_{os.path.basename(filepath)}.jpg"
+        jpg_path = f"/tmp/imessage_conv_{parent_name}_{file_base}.jpg"
         subprocess.run(['sips', '-s', 'format', 'jpeg', filepath, '--out', jpg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if os.path.exists(jpg_path):
             target_path = jpg_path
             mime = "image/jpeg"
+    elif ext == '.caf':
+        m4a_path = f"/tmp/imessage_conv_{parent_name}_{file_base}.m4a"
+        afconvert_bin = '/usr/bin/afconvert'
+        if os.path.exists(afconvert_bin):
+            subprocess.run([afconvert_bin, '-f', 'm4af', '-d', 'aac', filepath, m4a_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(m4a_path):
+                target_path = m4a_path
+                mime = "audio/mp4"
+            else:
+                mime = "audio/x-caf"
+        else:
+            mime = "audio/x-caf"
+    elif ext in ['.m4a', '.mp4']:
+        mime = "audio/mp4"
+    elif ext == '.wav':
+        mime = "audio/wav"
+    elif ext == '.mp3':
+        mime = "audio/mpeg"
+    elif ext == '.aac':
+        mime = "audio/aac"
     elif ext in ['.jpg', '.jpeg']:
         mime = "image/jpeg"
     elif ext == '.png':
@@ -577,6 +803,32 @@ def get_attachment_payload(args):
     elif ext == '.txt':
         mime = "text/plain"
 
+    is_audio = ext in AUDIO_EXTENSIONS or mime.startswith('audio/')
+    dur_sec = get_audio_duration(filepath) if is_audio else None
+    dur_fmt = format_duration(dur_sec) if dur_sec is not None else None
+
+    # Try looking up transcription and metadata in chat.db
+    transcription = None
+    language = None
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        c = conn.cursor()
+        basename = os.path.basename(filepath)
+        c.execute("""
+            SELECT user_info, attribution_info
+            FROM attachment
+            WHERE filename LIKE ? OR filename = ?
+            ORDER BY ROWID DESC LIMIT 1
+        """, (f"%{basename}", filepath))
+        row = c.fetchone()
+        if row and row[0]:
+            p = extract_attachment_user_info(row[0])
+            transcription = p.get('audio-transcription') or None
+            language = p.get('transcription-language') or p.get('language') or None
+        conn.close()
+    except Exception:
+        pass
+
     with open(target_path, 'rb') as f:
         data = f.read()
 
@@ -585,14 +837,25 @@ def get_attachment_payload(args):
         'converted_path': target_path if target_path != filepath else None,
         'mime_type': mime,
         'size_bytes': len(data),
-        'base64': base64.b64encode(data).decode('utf-8')
+        'base64': base64.b64encode(data).decode('utf-8'),
+        'is_audio': bool(is_audio),
+        'duration_seconds': dur_sec,
+        'duration_formatted': dur_fmt,
+        'transcription': transcription,
+        'language': language
     }
     
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
         print(f"File: {filepath}")
+        if payload['converted_path']:
+            print(f"Converted: {payload['converted_path']}")
         print(f"MIME: {mime} ({len(data)} bytes)")
+        if dur_fmt:
+            print(f"Duration: {dur_fmt} ({dur_sec}s)")
+        if transcription:
+            print(f"Transcription: {transcription}")
         print(f"Base64 string length: {len(payload['base64'])} characters")
 
 IMSG_UNCERTAIN_MARKERS = ('may_have_completed', 'still_in_flight')
@@ -760,7 +1023,8 @@ def get_recent_messages(args):
         m.text,
         m.attributedBody,
         m.date_edited,
-        m.message_summary_info
+        m.message_summary_info,
+        m.is_audio_message
     FROM message m
     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     JOIN chat c ON cmj.chat_id = c.ROWID
@@ -773,9 +1037,12 @@ def get_recent_messages(args):
     rows = cursor.fetchall()
     rows.reverse()
     
+    msg_ids = [r[0] for r in rows]
+    attachments_map = fetch_attachments_for_messages(cursor, msg_ids)
+
     cmap = get_contacts_map()
     messages = []
-    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob in rows:
+    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob, is_audio_msg in rows:
         sec = date_ns / 1_000_000_000
         dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
         dt_local = dt_utc.astimezone()
@@ -787,10 +1054,8 @@ def get_recent_messages(args):
             sender_name = cmap.get(norm, handle or "Unknown")
 
         chat = display_name if display_name else chat_ident
-        msg_text = text or ""
-        if not msg_text or msg_text.strip() == "":
-            msg_text = parse_attributed_body(attr_body)
-            
+        att_list = attachments_map.get(msg_id, [])
+        msg_text, is_audio, transcription = synthesize_message_text(text, attr_body, is_audio_msg, att_list)
         is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
 
         messages.append({
@@ -800,12 +1065,15 @@ def get_recent_messages(args):
             'sender': sender_name,
             'handle': handle or "",
             'is_from_me': bool(is_from_me),
-            'text': msg_text or "<empty message>",
+            'text': msg_text,
+            'is_audio_message': is_audio,
+            'transcription': transcription,
             'is_edited': is_edited,
             'has_edits': is_edited,
             'edit_count': edit_count,
             'last_edited': last_edited,
-            'edit_history': edit_history
+            'edit_history': edit_history,
+            'attachments': att_list
         })
 
     if getattr(args, 'json', False):
@@ -835,7 +1103,8 @@ def get_edit_history(args):
         h.id,
         m.text,
         m.attributedBody,
-        m.message_summary_info
+        m.message_summary_info,
+        m.is_audio_message
     FROM message m
     LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     LEFT JOIN chat c ON cmj.chat_id = c.ROWID
@@ -853,7 +1122,7 @@ def get_edit_history(args):
         conn.close()
         sys.exit(1)
 
-    row_id, chat_id, display_name, chat_ident, date_ns, date_edited_ns, is_from_me, handle, text, attr_body, summary_blob = row
+    row_id, chat_id, display_name, chat_ident, date_ns, date_edited_ns, is_from_me, handle, text, attr_body, summary_blob, is_audio_msg = row
 
     apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
     sec = (date_ns or 0) / 1_000_000_000
@@ -868,11 +1137,10 @@ def get_edit_history(args):
         sender_name = cmap.get(norm, handle or "Unknown")
 
     chat = display_name if display_name else (chat_ident or "Unknown")
-    msg_text = text or ""
-    if not msg_text or msg_text.strip() == "":
-        msg_text = parse_attributed_body(attr_body)
-    if not msg_text:
-        msg_text = "<empty message>"
+    
+    attachments_map = fetch_attachments_for_messages(cursor, [row_id])
+    att_list = attachments_map.get(row_id, [])
+    msg_text, is_audio, transcription = synthesize_message_text(text, attr_body, is_audio_msg, att_list)
 
     is_edited, edit_count, last_edited, history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
 
@@ -891,12 +1159,15 @@ def get_edit_history(args):
         'sender': sender_name,
         'is_from_me': bool(is_from_me),
         'timestamp': ts,
+        'is_audio_message': is_audio,
+        'transcription': transcription,
         'is_edited': is_edited,
         'has_edits': is_edited,
         'edit_count': edit_count,
         'last_edited': last_edited,
         'current_text': msg_text,
-        'edit_history': history
+        'edit_history': history,
+        'attachments': att_list
     }
 
     if getattr(args, 'json', False):

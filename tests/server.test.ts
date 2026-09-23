@@ -175,6 +175,47 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
       expect(output).toContain('15 minutes');
     }
   });
+
+  it('should return audio message transcription and duration for recent messages with voice notes', async () => {
+    const { stdout } = await runCli(['recent', '1800', '--limit', '200', '--json']);
+    const data = JSON.parse(stdout);
+    const audioMsg = data.find((m: any) => m.msg_id === 200462);
+    expect(audioMsg).toBeDefined();
+    expect(audioMsg.is_audio_message).toBe(true);
+    expect(audioMsg.transcription).toContain('German and Russian');
+    expect(audioMsg.text).toContain('[voice note');
+    expect(audioMsg.text).toContain('German and Russian');
+    expect(audioMsg.attachments).toBeDefined();
+    expect(audioMsg.attachments.length).toBeGreaterThan(0);
+    expect(audioMsg.attachments[0].is_audio).toBe(true);
+    expect(audioMsg.attachments[0].transcription).toContain('German and Russian');
+    expect(audioMsg.attachments[0].duration_seconds).toBeGreaterThan(10);
+    expect(audioMsg.attachments[0].duration_formatted).toBe('15s');
+    expect(audioMsg.attachments[0].mime_type).toBe('audio/x-caf');
+  });
+
+  it('should return converted m4a and transcription for attachment payload when given a caf file', async () => {
+    const cafPath = path.resolve(process.env.HOME || '/Users/matthias', 'Library/Messages/Attachments/cc/12/F3686DB9-8225-43CB-A142-89310D0BAACC/Audio Message.caf');
+    const { stdout } = await runCli(['attachment', cafPath, '--json']);
+    const data = JSON.parse(stdout);
+    expect(data.is_audio).toBe(true);
+    expect(data.mime_type).toBe('audio/mp4');
+    expect(data.converted_path).toBeDefined();
+    expect(data.converted_path).toContain('.m4a');
+    expect(data.transcription).toContain('German and Russian');
+    expect(data.duration_seconds).toBeGreaterThan(10);
+    expect(data.duration_formatted).toBe('15s');
+    expect(data.base64).toBeDefined();
+  });
+
+  it('should find voice note messages when searching by words in speech-to-text transcript', async () => {
+    const { stdout } = await runCli(['search', 'German and Russian', '--limit', '5', '--json']);
+    const data = JSON.parse(stdout);
+    expect(Array.isArray(data)).toBe(true);
+    const match = data.find((m: any) => m.msg_id === 200462);
+    expect(match).toBeDefined();
+    expect(match.text).toContain('German and Russian');
+  });
 });
 
 describe('Local Action Audit Logger (Security & Privacy)', () => {

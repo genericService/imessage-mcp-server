@@ -17,7 +17,8 @@ It connects your local Mac's iMessage database (`~/Library/Messages/chat.db`), m
 - **Message Rewrite & Edit History:** Surfaces edit status indicators (`is_edited`, `has_edits`, `edit_count`, `last_edited`) on pulled messages, decoding binary property lists (`message_summary_info`) in `chat.db` for full chronological revision histories.
 - **Message Editing:** Programmatically edit sent messages within Apple's 15-minute protocol window (up to 5 revisions) via `imessage_edit_message` and `imessage edit`, routing through the IMCore bridge.
 - **Contact Resolution:** Integrates with macOS Contacts database (`AddressBook-v22.abcddb`) to resolve names, phone numbers, and emails.
-- **Multimodal Attachment Reading:** Exposes attachment metadata (MIME type, size, path) and automatically converts `.heic` photos to `.jpg` for vision-capable LLMs.
+- **Voice Note Transcriptions & Audio Processing:** Surfaces Apple on-device speech-to-text transcriptions, audio durations (e.g. `[voice note, 15s: "transcript"]`), and full-text search across voice memo transcripts. Automatically converts proprietary CoreAudio `.caf` files to universal `.m4a` (AAC) via macOS `afconvert` for speech and multimodal AI models.
+- **Multimodal Attachment Reading:** Exposes attachment metadata (MIME type, size, path, duration) and automatically converts `.heic` photos to `.jpg` and `.caf` voice memos to `.m4a`.
 - **Reliable Attachment Sending:** Sends route through the [imsg](https://github.com/openclaw/imsg) CLI when installed, with a native AppleScript fallback that stages files inside Messages' own attachments directory to avoid "Not Delivered" sandboxing failures. No Accessibility/GUI scripting required.
 - **Group Chat Rosters:** Inspects group conversation member lists and handles.
 - **OAuth 2.0 Auth Server & Bearer Auth:** Embedded authorization server supporting RFC 8414 metadata, Authorization Code flow with PKCE, Client Credentials grant, and RFC 7591 dynamic client registration alongside customizable static Bearer tokens.
@@ -41,9 +42,10 @@ flowchart TD
 
     subgraph Storage["macOS System and Data Integration"]
         direction TB
-        ChatDB[("Messages Database: ~/Library/Messages/chat.db (Read-Only SQLite, Edit History bplist)")]
+        ChatDB[("Messages Database: ~/Library/Messages/chat.db (Read-Only SQLite, Edit History bplist, Voice Transcripts)")]
         ContactsDB[("Contacts Database: AddressBook-v22.abcddb (Read-Only SQLite)")]
         Automation["Messages.app Automation: imsg CLI (Sending and IMCore Edits) + AppleScript Fallback"]
+        Converters["macOS Media Converters: sips (HEIC to JPEG) + afconvert (CAF to M4A)"]
     end
 
     Client -->|"HTTP / SSE (Bearer or OAuth PKCE)"| Server
@@ -51,6 +53,7 @@ flowchart TD
     CLI -->|"Read-only SQLite query"| ChatDB
     CLI -->|"Read-only SQLite query"| ContactsDB
     CLI -->|"imsg / AppleScript execution"| Automation
+    CLI -->|"Media conversions"| Converters
 ```
 
 ```
@@ -73,6 +76,7 @@ flowchart TD
              │   Messages DB (Read-Only)    │                │   Contacts DB (Read-Only)    │                │   Messages.app Automation    │
              │  ~/Library/Messages/chat.db  │                │    AddressBook-v22.abcddb    │                │    imsg CLI + AppleScript    │
              │ • History & Edit bplists     │                │ • Contact & Name Resolution  │                │ • Sending & IMCore Edits     │
+             │ • Voice Memo Transcriptions  │                │                              │                │ • sips / afconvert tools     │
              └──────────────────────────────┘                └──────────────────────────────┘                └──────────────────────────────┘
 ```
 
@@ -254,14 +258,14 @@ Returns:
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
 | `imessage_list_chats` | List recent conversations with AddressBook names and participant sets | `limit` (number, default: 30) |
-| `imessage_read_messages` | Read message history with inline attachment details, edit state indicators, and revision history | `chat` (string, required), `days` (number, default: 14) |
-| `imessage_get_recent_messages` | Preview last N messages to verify thread context, participants, and edit history before sending | `chat` (string, required), `limit` (number, default: 5) |
-| `imessage_search_messages` | Full-text search across all historical iMessages including edit state | `query` (string, required), `limit` (number, default: 30) |
+| `imessage_read_messages` | Read message history with inline attachment details, voice note audio transcriptions, durations, edit state indicators, and revision history | `chat` (string, required), `days` (number, default: 14) |
+| `imessage_get_recent_messages` | Preview last N messages to verify thread context, participants, voice note transcriptions, and edit history before sending | `chat` (string, required), `limit` (number, default: 5) |
+| `imessage_search_messages` | Full-text search across historical iMessages and voice note speech-to-text transcriptions | `query` (string, required), `limit` (number, default: 30) |
 | `imessage_get_edit_history` | Retrieve full rewrite and edit history with revision timestamps for an iMessage by ROWID | `message_id` (number, required) |
 | `imessage_search_group_chats` | Exact participant set search across group chats | `participants` (array of strings, required) |
 | `imessage_search_contacts` | Search macOS Address Book by name, phone, or email | `query` (string, optional) |
 | `imessage_get_chat_members` | List members and resolved contact names in group chats | `chat` (string, required) |
-| `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (HEIC to JPEG) | `path` (string, required) |
+| `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (converts HEIC to JPEG and CAF voice notes to M4A with transcriptions) | `path` (string, required) |
 | `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports dry_run preview & confirm_token) | `recipient` (string, required), `message`, `attachment`, `dry_run`, `confirm_token` |
 | `imessage_edit_message` | Edit a previously sent message by ROWID (subject to 15-minute Apple protocol window and 5-edit limit) | `message_id` (number, required), `text` (string, required) |
 | `imessage_get_readme` | Retrieve full server README documentation & usage guide | *(none)* |

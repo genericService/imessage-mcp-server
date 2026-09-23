@@ -86,7 +86,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.1.0';
+const SERVER_VERSION = '1.2.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -130,11 +130,11 @@ export function decodeHeaderValue(val: string): string {
 const SERVER_INSTRUCTIONS = `
 iMessage MCP Server Instructions:
 1. Discovery: Call 'imessage_list_chats' to discover available conversation IDs, display names, and handles.
-2. Search: Call 'imessage_search_messages' to search past message history by keyword, or 'imessage_search_contacts' to find contacts.
-3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' using a chat ID or contact identifier to review past messages. Messages indicate whether edits exist.
+2. Search: Call 'imessage_search_messages' to search past message history by keyword or voice note speech-to-text transcriptions, or 'imessage_search_contacts' to find contacts.
+3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' using a chat ID or contact identifier to review past messages. Messages surface audio voice note transcriptions, durations, and edit history.
 4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
 5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
-6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments.
+6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments (converts HEIC photos to JPEG and CAF voice notes to playable/transcribable M4A audio with on-device speech-to-text transcripts).
 7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
 8. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
 `.trim();
@@ -180,7 +180,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_read_messages',
     description:
-      'Read recent message history from a specific iMessage chat. Accepts a numeric chat ROWID, contact display name, or phone number/email address. Returned messages indicate edit state (is_edited, has_edits, edit_count, last_edited) and include revision history.',
+      'Read recent message history from a specific iMessage chat. Accepts a numeric chat ROWID, contact display name, or phone number/email address. Returned messages indicate voice note audio transcriptions, duration, edit state (is_edited, has_edits, edit_count, last_edited), and include revision history.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -199,7 +199,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_search_messages',
     description:
-      'Full-text search across all historical iMessage conversations. Returns matching messages, dates, chat IDs, senders, edit state (is_edited, edit_count), and revision history.',
+      'Full-text search across all historical iMessage conversations, including message text and voice note audio speech-to-text transcriptions. Returns matching messages, dates, chat IDs, senders, edit state (is_edited, edit_count), and revision history.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -247,7 +247,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_get_attachment_payload',
     description:
-      'Fetch metadata and base64 payload for an attachment file (converts HEIC photos to JPEG automatically for vision LLM analysis).',
+      'Fetch metadata and base64 payload for an attachment file (converts HEIC photos to JPEG and CAF audio voice notes to M4A for multimodal LLMs, returning duration and on-device speech-to-text transcriptions).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -293,7 +293,7 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_get_recent_messages',
     description:
-      'Preview the last N recent messages from a chat to quickly verify thread context, participants, conversation topic, and message edit history before sending a reply.',
+      'Preview the last N recent messages from a chat to quickly verify thread context, participants, conversation topic, voice note transcriptions, and message edit history before sending a reply.',
     inputSchema: {
       type: 'object',
       properties: {
