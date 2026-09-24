@@ -26,6 +26,9 @@ export function getClientRegistry(): Map<string, string> {
   if (process.env.CLIENT_UBUNTU_SECRET) {
     registry.set('ubuntu-remote', process.env.CLIENT_UBUNTU_SECRET);
   }
+  if (process.env.CLIENT_MUSE_SECRET) {
+    registry.set('muse', process.env.CLIENT_MUSE_SECRET);
+  }
   for (const [clientId, client] of dynamicClients.entries()) {
     if (client.clientSecret) {
       registry.set(clientId, client.clientSecret);

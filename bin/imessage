@@ -814,12 +814,13 @@ def get_attachment_payload(args):
         conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
         c = conn.cursor()
         basename = os.path.basename(filepath)
+        normpath = filepath.replace(os.path.expanduser('~'), '~')
         c.execute("""
             SELECT user_info, attribution_info
             FROM attachment
-            WHERE filename LIKE ? OR filename = ?
-            ORDER BY ROWID DESC LIMIT 1
-        """, (f"%{basename}", filepath))
+            WHERE filename = ? OR filename = ? OR filename LIKE ?
+            ORDER BY (CASE WHEN filename = ? OR filename = ? THEN 0 ELSE 1 END), ROWID DESC LIMIT 1
+        """, (filepath, normpath, f"%{basename}", filepath, normpath))
         row = c.fetchone()
         if row and row[0]:
             p = extract_attachment_user_info(row[0])
