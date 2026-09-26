@@ -423,6 +423,29 @@ Configure rules using either `WATCH_RULES` (inline JSON string) or `WATCH_CONFIG
 - `events` (array of strings, optional): Events to emit. Supported values: `message_in`, `message_out`, `reaction`, `read_receipt`, `delivered`. Defaults to `["message_in", "reaction"]`. Outgoing messages (`message_out`) only fire when explicitly included in `events`.
 - `debounce_ms` (number, optional, default: 3000): Debounce window grouping rapid event bursts for a chat into a single aggregated notification with an updated `count` and `newest_msg_id`.
 - `secret` (string, optional): Shared secret. When present, each webhook request includes an `X-Signature-SHA256: sha256=<hex>` HMAC signature header.
+- `headers` (object, optional): Custom HTTP headers sent on every webhook POST, as a map of header name to string value (for example an `Authorization` key expected by the receiving endpoint). Values must be strings without control characters; a rule whose `headers` is not an object of strings is rejected with a warning naming the offending header. `Content-Type`, `Content-Length`, `Host`, and `X-Signature-SHA256` are reserved and cannot be overridden. Header values are never logged. Works together with `secret`: the HMAC signature header is still added.
+
+Example rule with an `Authorization` header and an HMAC secret:
+
+```json
+[
+  {
+    "webhook_url": "https://bot.example.com/webhook",
+    "chats": [7],
+    "events": ["message_in", "reaction"],
+    "secret": "your-shared-hmac-secret",
+    "headers": {"Authorization": "Bearer <key>"}
+  }
+]
+```
+
+Each POST then carries `Content-Type: application/json`, `User-Agent: imessage-mcp-server/<version>`, `Authorization: Bearer <key>`, and `X-Signature-SHA256: sha256=<hex>` (HMAC-SHA256 of the raw JSON body).
+
+Rules are read once at server startup from `WATCH_RULES` or `WATCH_CONFIG_FILE`; restart the server after changing them.
+
+### Event Classification
+
+`message_in` and `message_out` are only emitted for real messages. System rows (`item_type != 0`), group events (`group_action_type != 0`), and empty rows with no text, no `attributedBody` text, and no attachments (the rows that render as `<empty message>` from sender `Unknown`) are skipped. They still advance the cursor. Tapbacks are always classified as `reaction`.
 
 ### State Persistence & Resilience
 
