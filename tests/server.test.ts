@@ -3,6 +3,14 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import dotenv from 'dotenv';
 import path from 'path';
+import os from 'os';
+import { existsSync } from 'fs';
+
+const hasRealChatDb = existsSync(path.join(os.homedir(), 'Library/Messages/chat.db'));
+const dbIt = hasRealChatDb ? it : it.skip;
+if (!hasRealChatDb) {
+  process.env.IMESSAGE_SSH_FDA = 'false';
+}
 
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
@@ -51,7 +59,7 @@ describe('iMessage MCP Tool Schemas (SDD)', () => {
 });
 
 describe('CLI JSON Output Contracts (SDD & TDD)', () => {
-  it('should return valid JSON when --json flag is passed to imessage list', async () => {
+  dbIt('should return valid JSON when --json flag is passed to imessage list', async () => {
     const { stdout } = await runCli(['list', '--limit', '3', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
@@ -61,7 +69,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     }
   }, 15000);
 
-  it('should return valid JSON when --json flag is passed to imessage search', async () => {
+  dbIt('should return valid JSON when --json flag is passed to imessage search', async () => {
     const { stdout } = await runCli(['search', 'the', '--limit', '2', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
@@ -79,7 +87,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     expect(Array.isArray(data)).toBe(true);
   });
 
-  it('should return valid JSON for recent messages CLI command with edit fields', async () => {
+  dbIt('should return valid JSON for recent messages CLI command with edit fields', async () => {
     const { stdout } = await runCli(['recent', '1', '--limit', '2', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
@@ -93,7 +101,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     }
   });
 
-  it('should support inspecting edit history for a specific message via CLI edits command', async () => {
+  dbIt('should support inspecting edit history for a specific message via CLI edits command', async () => {
     const { stdout } = await runCli(['edits', '198097', '--json']);
     const data = JSON.parse(stdout);
     expect(data).toHaveProperty('msg_id', 198097);
@@ -108,14 +116,14 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     expect(data.edit_history[0]).toHaveProperty('text');
   });
 
-  it('should format edit indicator in CLI text output for edited messages', async () => {
+  dbIt('should format edit indicator in CLI text output for edited messages', async () => {
     const { stdout } = await runCli(['edits', '198097']);
     expect(stdout).toContain('EDIT HISTORY FOR MESSAGE #198097');
     expect(stdout).toContain('[Original]');
     expect(stdout).toContain('[Edit');
   });
 
-  it('should return unedited message payload with is_edited false and original revision in edit_history', async () => {
+  dbIt('should return unedited message payload with is_edited false and original revision in edit_history', async () => {
     const { stdout } = await runCli(['edits', '1', '--json']);
     const data = JSON.parse(stdout);
     expect(data).toHaveProperty('msg_id', 1);
@@ -127,7 +135,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     expect(data.edit_history[0].label).toBe('original');
   });
 
-  it('should return valid JSON with edit fields for imessage read', async () => {
+  dbIt('should return valid JSON with edit fields for imessage read', async () => {
     const { stdout } = await runCli(['read', '1', '--days', '14', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
@@ -139,7 +147,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     }
   });
 
-  it('should return valid JSON for search-group CLI command', async () => {
+  dbIt('should return valid JSON for search-group CLI command', async () => {
     const { stdout } = await runCli(['search-group', 'Paul Atreides', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
@@ -156,7 +164,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     expect(stdout).toContain('--text');
   });
 
-  it('should reject editing incoming messages with an error', async () => {
+  dbIt('should reject editing incoming messages with an error', async () => {
     try {
       await runCli(['edit', '1', '--text', 'Trying to edit incoming message', '--json']);
       expect.unreachable('Should have thrown an error for incoming message');
@@ -166,7 +174,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     }
   });
 
-  it('should reject editing messages older than 15 minutes', async () => {
+  dbIt('should reject editing messages older than 15 minutes', async () => {
     try {
       await runCli(['edit', '198100', '--text', 'Paul Atreides revised message', '--json']);
       expect.unreachable('Should have thrown an error for expired message');
@@ -176,7 +184,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     }
   });
 
-  it('should return audio message transcription and duration for recent messages with voice notes', async () => {
+  dbIt('should return audio message transcription and duration for recent messages with voice notes', async () => {
     const { stdout } = await runCli(['recent', '1800', '--limit', '50', '--json']);
     const data = JSON.parse(stdout);
     const audioMsg = data.find((m: any) => m.is_audio_message);
@@ -193,7 +201,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     expect(audioMsg.attachments[0].mime_type).toBe('audio/x-caf');
   });
 
-  it('should return converted m4a and transcription for attachment payload when given a caf file', async () => {
+  dbIt('should return converted m4a and transcription for attachment payload when given a caf file', async () => {
     const cafPath = path.resolve(process.env.HOME || '/Users/matthias', 'Library/Messages/Attachments/cc/12/F3686DB9-8225-43CB-A142-89310D0BAACC/Audio Message.caf');
     const { stdout } = await runCli(['attachment', cafPath, '--json']);
     const data = JSON.parse(stdout);
@@ -207,7 +215,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     expect(data.base64).toBeDefined();
   });
 
-  it('should find voice note messages when searching by words in speech-to-text transcript', async () => {
+  dbIt('should find voice note messages when searching by words in speech-to-text transcript', async () => {
     const { stdout } = await runCli(['search', 'German and Russian', '--limit', '5', '--json']);
     const data = JSON.parse(stdout);
     expect(Array.isArray(data)).toBe(true);
