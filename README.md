@@ -258,8 +258,8 @@ Returns:
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
 | `imessage_list_chats` | List recent conversations with AddressBook names and participant sets | `limit` (number, default: 30) |
-| `imessage_read_messages` | Read message history with inline attachment details, voice note audio transcriptions, durations, edit state indicators, and revision history | `chat` (string, required), `days` (number, default: 14) |
-| `imessage_get_recent_messages` | Preview last N messages to verify thread context, participants, voice note transcriptions, and edit history before sending | `chat` (string, required), `limit` (number, default: 5) |
+| `imessage_read_messages` | Read message history with inline attachment details, voice note audio transcriptions, durations, edit state indicators, and revision history | `chat` (string, required), `days` (number, default: 14), `since_message_id` (number, optional incremental polling threshold) |
+| `imessage_get_recent_messages` | Preview last N messages to verify thread context, participants, voice note transcriptions, and edit history before sending | `chat` (string, required), `limit` (number, default: 5), `since_message_id` (number, optional incremental polling threshold) |
 | `imessage_search_messages` | Full-text search across historical iMessages and voice note speech-to-text transcriptions | `query` (string, required), `limit` (number, default: 30) |
 | `imessage_get_edit_history` | Retrieve full rewrite and edit history with revision timestamps for an iMessage by ROWID | `message_id` (number, required) |
 | `imessage_search_group_chats` | Exact participant set search across group chats | `participants` (array of strings, required) |
@@ -279,8 +279,8 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | Command | Description | Example |
 | :--- | :--- | :--- |
 | `list` | List recent conversations with participant handles | `bin/imessage list --limit 10 --json` |
-| `read` | Read chat history for a contact or group chat | `bin/imessage read "+15550199808" --days 7` |
-| `recent` | Preview last N messages in a conversation thread | `bin/imessage recent "+15550199808" --limit 5 --json` |
+| `read` | Read chat history for a contact or group chat | `bin/imessage read "+15550199808" --days 7 --since-id 202440` |
+| `recent` | Preview last N messages in a conversation thread | `bin/imessage recent "+15550199808" --limit 5 --since-id 202440 --json` |
 | `search` | Search message history by keyword or phrase | `bin/imessage search "Arrakis" --limit 20` |
 | `edits` | Inspect complete rewrite and revision history for a message | `bin/imessage edits 198097 --json` |
 | `edit` | Edit a previously sent outgoing message | `bin/imessage edit 198097 --text "Paul Atreides revised" --json` |

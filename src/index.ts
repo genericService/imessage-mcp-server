@@ -86,7 +86,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.2.1';
+const SERVER_VERSION = '1.3.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -162,7 +162,7 @@ function maskToken(token: string): string {
 /**
  * Detailed MCP tool definitions for iMessage integration.
  */
-const TOOLS: Tool[] = [
+export const TOOLS: Tool[] = [
   {
     name: 'imessage_list_chats',
     description:
@@ -191,6 +191,10 @@ const TOOLS: Tool[] = [
         days: {
           type: 'number',
           description: 'Number of past days of message history to retrieve (default: 14).'
+        },
+        since_message_id: {
+          type: 'number',
+          description: 'Optional message ROWID threshold. Only returns messages with database ROWID greater than this ID. Ideal for incremental polling to only fetch new messages since the last check.'
         }
       },
       required: ['chat']
@@ -304,6 +308,10 @@ const TOOLS: Tool[] = [
         limit: {
           type: 'number',
           description: 'Number of recent messages to preview (default: 5, max: 50).'
+        },
+        since_message_id: {
+          type: 'number',
+          description: 'Optional message ROWID threshold. Only returns messages with database ROWID greater than this ID. Ideal for incremental polling to only fetch new messages since the last check.'
         }
       },
       required: ['chat']
@@ -515,7 +523,12 @@ function createMcpServer(): Server {
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
-        const stdout = await runImessageCli(['read', chat, '--days', String(days), '--json']);
+        const cliArgs = ['read', chat, '--days', String(days)];
+        if (typeof args?.since_message_id === 'number' && args.since_message_id > 0) {
+          cliArgs.push('--since-id', String(Math.floor(args.since_message_id)));
+        }
+        cliArgs.push('--json');
+        const stdout = await runImessageCli(cliArgs);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -541,7 +554,12 @@ function createMcpServer(): Server {
         if (!chat) {
           throw new Error('Missing required parameter "chat"');
         }
-        const stdout = await runImessageCli(['recent', chat, '--limit', String(limit), '--json']);
+        const cliArgs = ['recent', chat, '--limit', String(limit)];
+        if (typeof args?.since_message_id === 'number' && args.since_message_id > 0) {
+          cliArgs.push('--since-id', String(Math.floor(args.since_message_id)));
+        }
+        cliArgs.push('--json');
+        const stdout = await runImessageCli(cliArgs);
         result = {
           content: [{ type: 'text', text: stdout }]
         };

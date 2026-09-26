@@ -490,6 +490,16 @@ def read_messages(args):
     threshold_dt = now - datetime.timedelta(days=args.days)
     threshold_ns = int((threshold_dt - apple_epoch).total_seconds() * 1_000_000_000)
     
+    where_clauses = [f"c.ROWID IN ({placeholders})", "m.date >= ?"]
+    params = [*chat_ids, threshold_ns]
+
+    since_id = getattr(args, 'since_id', None)
+    if since_id is not None:
+        where_clauses.append("m.ROWID > ?")
+        params.append(since_id)
+
+    order_clause = "ORDER BY m.ROWID ASC" if since_id is not None else "ORDER BY m.date ASC"
+
     query = f"""
     SELECT 
         m.ROWID,
@@ -507,10 +517,10 @@ def read_messages(args):
     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     JOIN chat c ON cmj.chat_id = c.ROWID
     LEFT JOIN handle h ON m.handle_id = h.ROWID
-    WHERE c.ROWID IN ({placeholders}) AND m.date >= ?
-    ORDER BY m.date ASC
+    WHERE {" AND ".join(where_clauses)}
+    {order_clause}
     """
-    cursor.execute(query, (*chat_ids, threshold_ns))
+    cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
     
     msg_ids = [r[0] for r in rows]
@@ -1013,6 +1023,19 @@ def get_recent_messages(args):
     placeholders = ",".join(["?"] * len(chat_ids))
     apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
     
+    where_clauses = [f"c.ROWID IN ({placeholders})"]
+    params = [*chat_ids]
+
+    since_id = getattr(args, 'since_id', None)
+    if since_id is not None:
+        where_clauses.append("m.ROWID > ?")
+        params.append(since_id)
+        order_clause = "ORDER BY m.ROWID ASC"
+    else:
+        order_clause = "ORDER BY m.date DESC"
+
+    params.append(limit)
+
     query = f"""
     SELECT 
         m.ROWID,
@@ -1030,13 +1053,14 @@ def get_recent_messages(args):
     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     JOIN chat c ON cmj.chat_id = c.ROWID
     LEFT JOIN handle h ON m.handle_id = h.ROWID
-    WHERE c.ROWID IN ({placeholders})
-    ORDER BY m.date DESC
+    WHERE {" AND ".join(where_clauses)}
+    {order_clause}
     LIMIT ?
     """
-    cursor.execute(query, (*chat_ids, limit))
+    cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
-    rows.reverse()
+    if since_id is None:
+        rows.reverse()
     
     msg_ids = [r[0] for r in rows]
     attachments_map = fetch_attachments_for_messages(cursor, msg_ids)
@@ -1424,12 +1448,14 @@ def main():
     read_parser = subparsers.add_parser("read", help="Read recent messages from a chat")
     read_parser.add_argument("chat", help="Chat ID, display name, or contact identifier")
     read_parser.add_argument("--days", type=int, default=14, help="Days of history to fetch (default 14)")
+    read_parser.add_argument("--since-id", "--since-message-id", "--after-id", dest="since_id", type=int, default=None, help="Only return messages with a database ROWID greater than this ID")
     read_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     read_parser.set_defaults(func=read_messages)
 
     recent_parser = subparsers.add_parser("recent", help="Get recent messages preview")
     recent_parser.add_argument("chat", help="Chat ID, display name, or contact identifier")
     recent_parser.add_argument("--limit", type=int, default=5, help="Number of recent messages to preview (default 5)")
+    recent_parser.add_argument("--since-id", "--since-message-id", "--after-id", dest="since_id", type=int, default=None, help="Only return messages with a database ROWID greater than this ID")
     recent_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     recent_parser.set_defaults(func=get_recent_messages)
 

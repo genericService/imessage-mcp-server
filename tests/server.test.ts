@@ -41,6 +41,18 @@ describe('iMessage MCP Tool Schemas (SDD)', () => {
     expect(requiredTools).toHaveLength(12);
   });
 
+  it('should expose since_message_id in read and recent tool schemas', async () => {
+    const { TOOLS } = await import('../src/index.js');
+    const readTool = TOOLS.find((t: any) => t.name === 'imessage_read_messages');
+    const recentTool = TOOLS.find((t: any) => t.name === 'imessage_get_recent_messages');
+
+    expect(readTool?.inputSchema?.properties?.since_message_id).toBeDefined();
+    expect(readTool?.inputSchema?.properties?.since_message_id?.type).toBe('number');
+
+    expect(recentTool?.inputSchema?.properties?.since_message_id).toBeDefined();
+    expect(recentTool?.inputSchema?.properties?.since_message_id?.type).toBe('number');
+  });
+
   it('should have a readable README.md documentation file', async () => {
     const fs = await import('fs');
     const readmePath = path.resolve(__dirname, '../README.md');
@@ -139,6 +151,42 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
     }
   });
 
+  it('should filter messages by since-id in recent CLI command', async () => {
+    const { stdout: baselineOut } = await runCli(['recent', '1800', '--limit', '10', '--json']);
+    const baseline = JSON.parse(baselineOut);
+    expect(baseline.length).toBeGreaterThan(1);
+
+    const midIndex = Math.floor(baseline.length / 2);
+    const thresholdId = baseline[midIndex].msg_id;
+
+    const { stdout: filteredOut } = await runCli(['recent', '1800', '--since-id', String(thresholdId), '--limit', '10', '--json']);
+    const filtered = JSON.parse(filteredOut);
+
+    expect(filtered.length).toBeGreaterThan(0);
+    expect(filtered.length).toBeLessThan(baseline.length);
+    for (const msg of filtered) {
+      expect(msg.msg_id).toBeGreaterThan(thresholdId);
+    }
+  });
+
+  it('should filter messages by since-id in read CLI command', async () => {
+    const { stdout: baselineOut } = await runCli(['read', '1800', '--days', '30', '--json']);
+    const baseline = JSON.parse(baselineOut);
+    expect(baseline.length).toBeGreaterThan(1);
+
+    const midIndex = Math.floor(baseline.length / 2);
+    const thresholdId = baseline[midIndex].msg_id;
+
+    const { stdout: filteredOut } = await runCli(['read', '1800', '--days', '30', '--since-id', String(thresholdId), '--json']);
+    const filtered = JSON.parse(filteredOut);
+
+    expect(filtered.length).toBeGreaterThan(0);
+    expect(filtered.length).toBeLessThan(baseline.length);
+    for (const msg of filtered) {
+      expect(msg.msg_id).toBeGreaterThan(thresholdId);
+    }
+  });
+
   it('should return valid JSON for search-group CLI command', async () => {
     const { stdout } = await runCli(['search-group', 'Paul Atreides', '--json']);
     const data = JSON.parse(stdout);
@@ -177,7 +225,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   });
 
   it('should return audio message transcription and duration for recent messages with voice notes', async () => {
-    const { stdout } = await runCli(['recent', '1800', '--limit', '50', '--json']);
+    const { stdout } = await runCli(['recent', '1800', '--since-id', '200987', '--limit', '5', '--json']);
     const data = JSON.parse(stdout);
     const audioMsg = data.find((m: any) => m.is_audio_message);
     expect(audioMsg).toBeDefined();
@@ -883,6 +931,69 @@ describe('Express HTTP Endpoints & Transport Integration', () => {
     });
     expect(res.status).toBe(200);
     expect(res.headers.get('mcp-session-id')).toBeTruthy();
+  });
+
+  integration('should handle imessage_get_recent_messages with since_message_id via tools/call', async () => {
+    const initRes = await fetch(`${LOCAL_URL}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': AUTH_HEADER,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream'
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        params: {
+          protocolVersion: '2026-07-28',
+          capabilities: {},
+          clientInfo: { name: 'test-since-id-runner', version: '1.0.0' }
+        },
+        id: 100
+      })
+    });
+    expect(initRes.status).toBe(200);
+    const sessionId = initRes.headers.get('mcp-session-id') || '';
+
+    const callRes = await fetch(`${LOCAL_URL}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': AUTH_HEADER,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Mcp-Session-Id': sessionId
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        params: {
+          name: 'imessage_get_recent_messages',
+          arguments: {
+            chat: '1800',
+            limit: 5,
+            since_message_id: 202440
+          }
+        },
+        id: 101
+      })
+    });
+    expect(callRes.status).toBe(200);
+    const rawText = await callRes.text();
+    let data: any;
+    if (rawText.startsWith('event:')) {
+      const dataLine = rawText.split('\n').find((l: string) => l.startsWith('data:'));
+      data = JSON.parse(dataLine ? dataLine.replace(/^data:\s*/, '') : rawText);
+    } else {
+      data = JSON.parse(rawText);
+    }
+    expect(data.result).toBeDefined();
+    expect(data.result.content).toBeDefined();
+    expect(data.result.content[0].text).toBeDefined();
+    const messages = JSON.parse(data.result.content[0].text);
+    expect(Array.isArray(messages)).toBe(true);
+    for (const m of messages) {
+      expect(m.msg_id).toBeGreaterThan(202440);
+    }
   });
 });
 
