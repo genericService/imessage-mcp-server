@@ -185,7 +185,7 @@ describe('CLI JSON Output Contracts (SDD & TDD)', () => {
   });
 
   dbIt('should return audio message transcription and duration for recent messages with voice notes', async () => {
-    const { stdout } = await runCli(['recent', '1800', '--limit', '50', '--json']);
+    const { stdout } = await runCli(['recent', '1800', '--since-message-id', '200987', '--limit', '5', '--json']);
     const data = JSON.parse(stdout);
     const audioMsg = data.find((m: any) => m.is_audio_message);
     expect(audioMsg).toBeDefined();

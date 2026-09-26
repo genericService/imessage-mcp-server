@@ -92,7 +92,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.3.0';
+const SERVER_VERSION = '1.3.1';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -216,7 +216,18 @@ function clampInt(value: number | undefined, fallback: number, min: number, max:
 }
 
 function appendPresentationArgs(cli: string[], args: Record<string, unknown> | undefined): void {
-  const since = readIntArg(args, ['since_msg_id', 'sinceMsgId', 'after_msg_id', 'afterMsgId', 'since_id', 'since']);
+  const since = readIntArg(args, [
+    'since_msg_id',
+    'since_message_id',
+    'sinceMsgId',
+    'sinceMessageId',
+    'after_msg_id',
+    'after_id',
+    'afterMsgId',
+    'afterId',
+    'since_id',
+    'since'
+  ]);
   if (since !== undefined) {
     if (since < 0) {
       throw new Error('Invalid parameter "since_msg_id" (non-negative integer message ROWID expected)');
@@ -279,10 +290,15 @@ const readWindowProperties = {
   since_msg_id: {
     type: 'number',
     description:
-      'Polling cursor. When set, return only rows in this chat whose message ROWID is strictly greater than this id (a single indexed range read). Pair with with_meta and advance the cursor using next_since_msg_id, which includes filtered tapback ids. Aliases: sinceMsgId, after_msg_id, since_id, since.'
+      'Polling cursor. When set, return only rows in this chat whose message ROWID is strictly greater than this id (a single indexed range read). Pair with with_meta and advance the cursor using next_since_msg_id, which includes filtered tapback ids. Aliases: since_message_id, sinceMsgId, sinceMessageId, after_msg_id, after_id, afterMsgId, afterId, since_id, since.'
   },
+  since_message_id: { type: 'number', description: 'Alias of since_msg_id.' },
   sinceMsgId: { type: 'number', description: 'Alias of since_msg_id.' },
+  sinceMessageId: { type: 'number', description: 'Alias of since_msg_id.' },
   after_msg_id: { type: 'number', description: 'Alias of since_msg_id.' },
+  after_id: { type: 'number', description: 'Alias of since_msg_id.' },
+  afterMsgId: { type: 'number', description: 'Alias of since_msg_id.' },
+  afterId: { type: 'number', description: 'Alias of since_msg_id.' },
   since_id: { type: 'number', description: 'Alias of since_msg_id.' },
   since: {
     type: 'number',

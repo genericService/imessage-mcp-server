@@ -318,7 +318,7 @@ If you wish to log AI agent action executions for security auditing, set `ENABLE
 
 ## Reading messages
 
-`chat` and `chat_id` are the same parameter. Pass the numeric chat ROWID from `imessage_list_chats` (`rowid`, also copied to `chat_id`). A display name, phone number, or email still matches when you do not have the ROWID yet.
+`chat` and `chat_id` are the same parameter. Pass the numeric chat ROWID from `imessage_list_chats` (`rowid`, also copied to `chat_id`). A display name, phone number, or email still matches when you do not have the ROWID yet. `since_message_id` and `after_id` are accepted aliases for `since_msg_id`.
 
 Polling a busy thread:
 

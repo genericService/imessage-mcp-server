@@ -79,6 +79,16 @@ describe('incremental polling (since_msg_id)', () => {
     expect(search.length).toBeGreaterThan(0);
     expect(search.every((m: any) => m.msg_id > 100)).toBe(true);
   });
+
+  it('supports --since-message-id, --after-id, and --since-id aliases identically', async () => {
+    const canonical = await cliJson(['recent', '7', '--since-msg-id', '105', '--limit', '20', '--json']);
+    const aliasMessageId = await cliJson(['recent', '7', '--since-message-id', '105', '--limit', '20', '--json']);
+    const aliasAfterId = await cliJson(['recent', '7', '--after-id', '105', '--limit', '20', '--json']);
+    const aliasSinceId = await cliJson(['recent', '7', '--since-id', '105', '--limit', '20', '--json']);
+    expect(aliasMessageId).toEqual(canonical);
+    expect(aliasAfterId).toEqual(canonical);
+    expect(aliasSinceId).toEqual(canonical);
+  });
 });
 
 describe('link previews', () => {
@@ -249,7 +259,7 @@ describe('edit history does not regress', () => {
 });
 
 describe('parameter aliases', () => {
-  it('documents chat as the list ROWID and accepts chat_id', async () => {
+  it('documents chat as the list ROWID and accepts chat_id and since_message_id aliases', async () => {
     process.env.IMESSAGE_DB_PATH = FIXTURE_DB;
     process.env.IMESSAGE_SSH_FDA = 'false';
     process.env.NODE_ENV = 'test';
@@ -262,13 +272,19 @@ describe('parameter aliases', () => {
     expect(schema.properties.chat.description).toContain('imessage_list_chats');
     expect(schema.properties.chat_id.description).toContain('Alias of chat');
     expect(schema.properties.since_msg_id).toBeTruthy();
+    expect(schema.properties.since_message_id.description).toContain('Alias of since_msg_id');
+    expect(schema.properties.after_id.description).toContain('Alias of since_msg_id');
+    expect(schema.properties.afterId.description).toContain('Alias of since_msg_id');
+    expect(schema.properties.sinceMessageId.description).toContain('Alias of since_msg_id');
     expect(readChatArg({ chat_id: '7' })).toBe('7');
     expect(readChatArg({ chatId: 7 })).toBe('7');
     expect(readChatArg({ thread_id: 'Chani' })).toBe('Chani');
     expect(readIntArg({ since: '105' }, ['since_msg_id', 'since'])).toBe(105);
+    expect(readIntArg({ since_message_id: '105' }, ['since_msg_id', 'since_message_id'])).toBe(105);
+    expect(readIntArg({ after_id: 105 }, ['since_msg_id', 'after_id'])).toBe(105);
   });
 
-  it('serves recent messages when the tool is called with chat_id', async () => {
+  it('serves recent messages when the tool is called with chat_id and since_message_id', async () => {
     process.env.IMESSAGE_DB_PATH = FIXTURE_DB;
     process.env.IMESSAGE_SSH_FDA = 'false';
     process.env.NODE_ENV = 'test';
@@ -293,7 +309,7 @@ describe('parameter aliases', () => {
           method: 'tools/call',
           params: {
             name: 'imessage_get_recent_messages',
-            arguments: { chat_id: '7', since_msg_id: 107, limit: 10, with_meta: true },
+            arguments: { chat_id: '7', since_message_id: 107, limit: 10, with_meta: true },
           },
         }),
       });

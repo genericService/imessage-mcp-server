@@ -1078,6 +1078,11 @@ def add_read_presentation_args(parser, *, with_limit=False, with_days=False, def
         parser.add_argument("--limit", type=int, default=default_limit, help=f"Maximum rows to return (default {default_limit})")
     parser.add_argument(
         "--since-msg-id",
+        "--since-message-id",
+        "--since-id",
+        "--after-id",
+        "--after-msg-id",
+        dest="since_msg_id",
         type=int,
         default=None,
         help="Only rows in this chat with ROWID strictly greater than this id (polling cursor)",
