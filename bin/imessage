@@ -2240,6 +2240,39 @@ def search_group_chats(args):
             print(f"[{c['rowid']}] {c['name']} ({c['identifier']})")
     conn.close()
 
+def classify_change_row(assoc_type, is_from_me, text, attributed_body, item_type,
+                        group_action_type, has_attachments):
+    """Classify a new message row for the watcher.
+
+    Returns "reaction", "message_out", "message_in", or None when the row is a
+    system/group event or an empty row (no text, no attributedBody text, and no
+    attachments) that must not be reported as a message.
+    """
+    try:
+        if assoc_type and int(assoc_type) > 0:
+            return "reaction"
+    except (TypeError, ValueError):
+        pass
+    try:
+        if item_type is not None and int(item_type) != 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    try:
+        if group_action_type is not None and int(group_action_type) != 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    def has_visible_text(val):
+        return bool(val) and bool(str(val).strip().strip("\x00\x01\ufffc").strip())
+
+    has_text = has_visible_text(text) or has_visible_text(parse_attributed_body(attributed_body))
+    if not has_text and not has_attachments:
+        return None
+    return "message_out" if is_from_me else "message_in"
+
+
 def get_changes(args):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -2285,25 +2318,56 @@ def get_changes(args):
     new_messages = []
 
     if since_id is not None and since_id > 0:
+        def opt_col(column, alias):
+            return f"m.{column} AS {alias}" if column in available else f"NULL AS {alias}"
+
         cursor.execute(f"""
             SELECT m.ROWID AS msg_id, m.guid AS guid, cmj.chat_id AS chat_id,
                    c.chat_identifier AS chat_identifier, c.display_name AS display_name,
                    m.is_from_me AS is_from_me,
-                   m.associated_message_type AS associated_message_type,
-                   m.associated_message_guid AS associated_message_guid,
-                   m.date AS date_ns
+                   {opt_col("associated_message_type", "associated_message_type")},
+                   {opt_col("associated_message_guid", "associated_message_guid")},
+                   m.date AS date_ns,
+                   m.text AS text,
+                   {opt_col("attributedBody", "attributed_body")},
+                   {opt_col("item_type", "item_type")},
+                   {opt_col("group_action_type", "group_action_type")},
+                   {opt_col("cache_has_attachments", "cache_has_attachments")}
             {MESSAGE_FROM_LOOSE}
             WHERE m.ROWID > ?
             ORDER BY m.ROWID ASC
         """, (since_id,))
-        for r in cursor.fetchall():
-            m_id, guid, chat_id, chat_ident, display_name, is_from_me, assoc_type, assoc_guid, date_ns = r
-            if assoc_type and int(assoc_type) > 0:
-                event = "reaction"
-            elif is_from_me:
-                event = "message_out"
-            else:
-                event = "message_in"
+        rows = cursor.fetchall()
+
+        # Message ids that have at least one joined attachment row.
+        with_attachments = set()
+        row_ids = [r[0] for r in rows]
+        if row_ids:
+            try:
+                placeholders = ",".join(["?"] * len(row_ids))
+                cursor.execute(
+                    f"SELECT DISTINCT message_id FROM message_attachment_join WHERE message_id IN ({placeholders})",
+                    row_ids,
+                )
+                with_attachments = {int(x[0]) for x in cursor.fetchall()}
+            except Exception:
+                pass
+
+        for r in rows:
+            (m_id, guid, chat_id, chat_ident, display_name, is_from_me, assoc_type, assoc_guid, date_ns,
+             text, attr_body, item_type, group_action_type, cache_has_attachments) = r
+            event = classify_change_row(
+                assoc_type=assoc_type,
+                is_from_me=is_from_me,
+                text=text,
+                attributed_body=attr_body,
+                item_type=item_type,
+                group_action_type=group_action_type,
+                has_attachments=bool(cache_has_attachments) or int(m_id) in with_attachments,
+            )
+            if event is None:
+                # System, group-event, or empty rows ('<empty message>') never wake a webhook.
+                continue
 
             _human, iso = format_apple_ns(date_ns)
             identifiers = build_identifiers(chat_id, chat_ident, display_name)

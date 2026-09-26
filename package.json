@@ -1,6 +1,6 @@
 {
   "name": "imessage-mcp-server",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "iMessage MCP Server over HTTP/HTTPS (SSE Transport)",
   "main": "dist/index.js",
   "type": "module",

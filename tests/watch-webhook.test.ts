@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
@@ -11,10 +11,12 @@ import {
   ruleMatchesEvent,
   deliverWebhook,
   parseWatcherConfig,
+  validateRuleHeaders,
 } from '../src/watcher.js';
 
 const PYTHON = '/usr/bin/python3';
 const FIXTURE_BUILDER = path.resolve(__dirname, 'fixtures/build_chat_db.py');
+const SYSTEM_ROWS_SCRIPT = path.resolve(__dirname, 'fixtures/insert_system_rows.py');
 
 interface CapturedWebhook {
   path: string;
@@ -49,6 +51,11 @@ function startWebhookServer(): Promise<number> {
           rawBody,
           payload,
         });
+        if ((req.url || '').startsWith('/fail')) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'error' }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok' }));
       });
@@ -510,5 +517,213 @@ describe('iMessage Watcher & Webhook Notification System', () => {
 
     delete process.env.WATCH_RULES;
     delete process.env.WATCH_ENABLED;
+  });
+
+  it('sends custom rule headers on every POST together with the HMAC signature and JSON content type', async () => {
+    const secret = 'arrakis-secret-key-42';
+    const authValue = 'Bearer grok-routine-key-abc123';
+    const config: WatcherConfig = {
+      enabled: true,
+      poll_interval_ms: 10000,
+      state_file: testStatePath,
+      rules: [
+        {
+          webhook_url: `http://127.0.0.1:${webhookPort}/webhook`,
+          chats: [7],
+          debounce_ms: 100,
+          secret,
+          headers: { Authorization: authValue, 'X-Routine-Id': 'routine-7' },
+        },
+      ],
+    };
+
+    const watcher = new WatcherService(config);
+    await watcher.start();
+
+    insertDbMessage(testDbPath, { rowid: 370, chat_id: 7, handle_id: 1, is_from_me: 0, text: 'Header test 1' });
+    await watcher.checkChanges();
+    await waitForWebhooks(1, 1500);
+
+    insertDbMessage(testDbPath, { rowid: 371, chat_id: 7, handle_id: 1, is_from_me: 0, text: 'Header test 2' });
+    await watcher.checkChanges();
+    const webhooks = await waitForWebhooks(2, 1500);
+    await watcher.stop();
+
+    expect(webhooks.length).toBe(2);
+    for (const post of webhooks) {
+      expect(post.method).toBe('POST');
+      expect(post.headers['authorization']).toBe(authValue);
+      expect(post.headers['x-routine-id']).toBe('routine-7');
+      expect(post.headers['content-type']).toBe('application/json');
+      expect(post.headers['x-signature-sha256']).toBe(`sha256=${computeHmacSignature(post.rawBody, secret)}`);
+    }
+  });
+
+  it('sends custom headers without a secret and omits the signature header', async () => {
+    const ok = await deliverWebhook(
+      `http://127.0.0.1:${webhookPort}/webhook`,
+      { event: 'message_in', chat_id: 7, newest_msg_id: 1, count: 1, since_msg_id_hint: 0, occurred_at_iso: new Date().toISOString() },
+      undefined,
+      0,
+      { Authorization: 'Bearer no-secret-key' }
+    );
+    expect(ok).toBe(true);
+    expect(receivedWebhooks.length).toBe(1);
+    expect(receivedWebhooks[0].headers['authorization']).toBe('Bearer no-secret-key');
+    expect(receivedWebhooks[0].headers['content-type']).toBe('application/json');
+    expect(receivedWebhooks[0].headers['x-signature-sha256']).toBeUndefined();
+  });
+
+  it('never logs custom header values on delivery failures or config errors', async () => {
+    const secretValue = 'Bearer super-secret-routine-key-XYZ';
+    const logged: string[] = [];
+    const capture = (...args: unknown[]) => {
+      logged.push(args.map((a) => String(a)).join(' '));
+    };
+    const spies = [
+      vi.spyOn(console, 'log').mockImplementation(capture),
+      vi.spyOn(console, 'info').mockImplementation(capture),
+      vi.spyOn(console, 'warn').mockImplementation(capture),
+      vi.spyOn(console, 'error').mockImplementation(capture),
+      vi.spyOn(console, 'debug').mockImplementation(capture),
+    ];
+
+    try {
+      const payload = { event: 'message_in' as const, chat_id: 7, newest_msg_id: 1, count: 1, since_msg_id_hint: 0, occurred_at_iso: new Date().toISOString() };
+
+      // Non-2xx response path
+      const failed = await deliverWebhook(`http://127.0.0.1:${webhookPort}/fail`, payload, 'shh', 0, { Authorization: secretValue });
+      expect(failed).toBe(false);
+      expect(receivedWebhooks[0].headers['authorization']).toBe(secretValue);
+
+      // Network error path (closed port)
+      const closed = await deliverWebhook('http://127.0.0.1:1/webhook', payload, undefined, 0, { Authorization: secretValue });
+      expect(closed).toBe(false);
+
+      // Invalid header value error path (fetch rejects it; the error text must be redacted)
+      const invalid = await deliverWebhook(`http://127.0.0.1:${webhookPort}/webhook`, payload, undefined, 0, { Authorization: `${secretValue}\u0000` });
+      expect(invalid).toBe(false);
+
+      // Config validation error path
+      process.env.WATCH_ENABLED = 'true';
+      process.env.WATCH_RULES = JSON.stringify([
+        { webhook_url: 'http://example.com/bad', chats: [7], headers: { Authorization: `${secretValue}\r\nX-Evil: 1` } },
+      ]);
+      const parsed = parseWatcherConfig();
+      expect(parsed!.rules.length).toBe(0);
+    } finally {
+      delete process.env.WATCH_RULES;
+      delete process.env.WATCH_ENABLED;
+      spies.forEach((s) => s.mockRestore());
+    }
+
+    expect(logged.length).toBeGreaterThan(0);
+    for (const line of logged) {
+      expect(line).not.toContain('super-secret-routine-key-XYZ');
+    }
+  });
+
+  it('validates headers as an object of strings and rejects invalid rules with a clear error', () => {
+    expect(validateRuleHeaders(undefined)).toEqual({ ok: true, headers: undefined });
+    expect(validateRuleHeaders({ Authorization: 'Bearer k' })).toEqual({ ok: true, headers: { Authorization: 'Bearer k' } });
+
+    expect(validateRuleHeaders('Bearer k').ok).toBe(false);
+    expect(validateRuleHeaders(['Authorization', 'Bearer k']).ok).toBe(false);
+    const numVal = validateRuleHeaders({ 'X-Count': 5 });
+    expect(numVal.ok).toBe(false);
+    if (!numVal.ok) expect(numVal.error).toContain('headers["X-Count"] must be a string');
+    expect(validateRuleHeaders({ Authorization: { token: 'k' } }).ok).toBe(false);
+    expect(validateRuleHeaders({ 'Bad Header': 'v' }).ok).toBe(false);
+    expect(validateRuleHeaders({ 'content-type': 'text/plain' }).ok).toBe(false);
+    expect(validateRuleHeaders({ 'X-Signature-SHA256': 'sha256=forged' }).ok).toBe(false);
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    process.env.WATCH_ENABLED = 'true';
+    process.env.WATCH_RULES = JSON.stringify([
+      { webhook_url: 'http://example.com/string-headers', chats: [7], headers: 'Authorization: Bearer k' },
+      { webhook_url: 'http://example.com/number-value', chats: [7], headers: { Authorization: 123 } },
+      { webhook_url: 'http://example.com/array-headers', chats: [7], headers: [['Authorization', 'k']] },
+      { webhook_url: 'http://example.com/valid', chats: [7], headers: { Authorization: 'Bearer valid-key' } },
+      { webhook_url: 'http://example.com/no-headers', chats: [7] },
+    ]);
+    try {
+      const parsed = parseWatcherConfig();
+      expect(parsed!.rules.map((r) => r.webhook_url)).toEqual(['http://example.com/valid', 'http://example.com/no-headers']);
+      expect(parsed!.rules[0].headers).toEqual({ Authorization: 'Bearer valid-key' });
+      expect(parsed!.rules[1].headers).toBeUndefined();
+      const warnings = warnSpy.mock.calls.map((c) => c.join(' '));
+      expect(warnings.some((w) => w.includes('string-headers') && w.includes('invalid headers'))).toBe(true);
+      expect(warnings.some((w) => w.includes('number-value') && w.includes('must be a string'))).toBe(true);
+      expect(warnings.some((w) => w.includes('array-headers') && w.includes('invalid headers'))).toBe(true);
+      expect(warnings.join('\n')).not.toContain('valid-key');
+    } finally {
+      delete process.env.WATCH_RULES;
+      delete process.env.WATCH_ENABLED;
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('does not classify system, group-event, or empty rows as message_in; tapbacks stay reactions', async () => {
+    const config: WatcherConfig = {
+      enabled: true,
+      poll_interval_ms: 10000,
+      state_file: testStatePath,
+      rules: [
+        {
+          webhook_url: `http://127.0.0.1:${webhookPort}/webhook`,
+          chats: [7],
+          events: ['message_in', 'reaction'],
+          debounce_ms: 150,
+        },
+      ],
+    };
+
+    // Add group_action_type column (present on real chat.db) before the watcher baseline.
+    execFileSync(PYTHON, [SYSTEM_ROWS_SCRIPT, testDbPath, 'schema']);
+
+    const watcher = new WatcherService(config);
+    await watcher.start();
+
+    execFileSync(PYTHON, [SYSTEM_ROWS_SCRIPT, testDbPath, 'rows']);
+
+    const cli = JSON.parse(
+      execFileSync(PYTHON, [path.resolve(__dirname, '../bin/imessage'), 'check-changes', '--since-id', '379', '--json'], {
+        env: { ...process.env, IMESSAGE_DB_PATH: testDbPath },
+      }).toString()
+    );
+    const classified = Object.fromEntries(cli.new_messages.map((m: any) => [String(m.msg_id), m.event]));
+    expect(classified).toEqual({
+      '386': 'message_in',
+      '387': 'message_in',
+      '388': 'message_in',
+      '389': 'message_in',
+      '390': 'reaction',
+    });
+    expect(cli.max_msg_id).toBe(390);
+
+    await watcher.checkChanges();
+    const webhooks = await waitForWebhooks(2, 2000);
+    await watcher.stop();
+
+    const messageIn = webhooks.filter((w) => w.payload.event === 'message_in');
+    const reactions = webhooks.filter((w) => w.payload.event === 'reaction');
+    expect(messageIn.length).toBe(1);
+    expect(messageIn[0].payload.count).toBe(4);
+    expect(messageIn[0].payload.newest_msg_id).toBe(389);
+    expect(messageIn[0].payload.since_msg_id_hint).toBe(385);
+    expect(reactions.length).toBe(1);
+    expect(reactions[0].payload.newest_msg_id).toBe(390);
+
+    // Payload stays metadata-only
+    for (const w of webhooks) {
+      expect(Object.keys(w.payload).sort()).toEqual([
+        'chat_id', 'count', 'event', 'newest_msg_id', 'occurred_at_iso', 'since_msg_id_hint',
+      ]);
+      expect(w.rawBody).not.toContain('Real incoming text');
+      expect(w.rawBody).not.toContain('Hello');
+    }
+
+    // Cursor still advances past skipped system rows
+    expect(watcher.getState().last_seen_msg_id).toBe(390);
   });
 });

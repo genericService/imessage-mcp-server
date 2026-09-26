@@ -12,6 +12,8 @@ export interface WatchRule {
   events?: WatchEventType[];
   debounce_ms?: number;
   secret?: string;
+  /** Optional custom HTTP headers sent on every webhook POST (e.g. Authorization). Values are never logged. */
+  headers?: Record<string, string>;
 }
 
 export interface WatcherConfig {
@@ -126,6 +128,69 @@ export function ruleMatchesEvent(
   return false;
 }
 
+export const WATCHER_USER_AGENT = 'imessage-mcp-server/1.4.1';
+
+/**
+ * Header names the watcher controls itself. Custom rule headers may not override them,
+ * so Content-Type stays application/json and the HMAC signature cannot be spoofed.
+ */
+const RESERVED_HEADER_NAMES = new Set(['content-type', 'content-length', 'host', 'x-signature-sha256']);
+const HEADER_NAME_PATTERN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+// Header values: no control characters except horizontal tab (rejects CR/LF injection).
+const HEADER_VALUE_INVALID = /[\u0000-\u0008\u000A-\u001F\u007F]/;
+
+export type HeaderValidationResult =
+  | { ok: true; headers: Record<string, string> | undefined }
+  | { ok: false; error: string };
+
+/**
+ * Validates an optional rule `headers` field. Must be a plain object mapping header names to
+ * string values. Error messages name the offending header but never include its value.
+ */
+export function validateRuleHeaders(raw: unknown): HeaderValidationResult {
+  if (raw === undefined || raw === null) {
+    return { ok: true, headers: undefined };
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: 'headers must be an object mapping header names to string values' };
+  }
+  const out: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!HEADER_NAME_PATTERN.test(name)) {
+      return { ok: false, error: `headers contains an invalid header name "${name}"` };
+    }
+    if (typeof value !== 'string') {
+      return { ok: false, error: `headers["${name}"] must be a string (got ${Array.isArray(value) ? 'array' : typeof value})` };
+    }
+    if (HEADER_VALUE_INVALID.test(value)) {
+      return { ok: false, error: `headers["${name}"] contains control characters (CR/LF are not allowed)` };
+    }
+    const lower = name.toLowerCase();
+    if (RESERVED_HEADER_NAMES.has(lower)) {
+      return { ok: false, error: `headers["${name}"] is reserved and set by the watcher itself` };
+    }
+    if (seen.has(lower)) {
+      return { ok: false, error: `headers contains duplicate header name "${name}" (header names are case-insensitive)` };
+    }
+    seen.add(lower);
+    out[name] = value;
+  }
+  return { ok: true, headers: Object.keys(out).length > 0 ? out : undefined };
+}
+
+function redactHeaderValues(message: string, customHeaders?: Record<string, string>): string {
+  let result = message;
+  if (customHeaders) {
+    for (const value of Object.values(customHeaders)) {
+      if (value) {
+        result = result.split(value).join('[redacted]');
+      }
+    }
+  }
+  return result;
+}
+
 export function computeHmacSignature(payload: string, secret: string): string {
   return crypto.createHmac('sha256', secret).update(payload).digest('hex');
 }
@@ -134,12 +199,15 @@ export async function deliverWebhook(
   url: string,
   payload: WebhookPayload,
   secret?: string,
-  maxRetries = 3
+  maxRetries = 3,
+  customHeaders?: Record<string, string>
 ): Promise<boolean> {
   const body = JSON.stringify(payload);
+  // Custom headers first; watcher-controlled headers are applied after so they always win.
   const headers: Record<string, string> = {
+    'User-Agent': WATCHER_USER_AGENT,
+    ...(customHeaders || {}),
     'Content-Type': 'application/json',
-    'User-Agent': 'imessage-mcp-server/1.4.0',
   };
 
   if (secret) {
@@ -162,7 +230,8 @@ export async function deliverWebhook(
 
       console.warn(`[Watcher] Webhook returned status ${response.status} for ${url} (attempt ${attempt + 1}/${maxRetries + 1})`);
     } catch (err: any) {
-      console.warn(`[Watcher] Webhook delivery failed for ${url} (attempt ${attempt + 1}/${maxRetries + 1}): ${err?.message || err}`);
+      const reason = redactHeaderValues(String(err?.message || err), customHeaders);
+      console.warn(`[Watcher] Webhook delivery failed for ${url} (attempt ${attempt + 1}/${maxRetries + 1}): ${reason}`);
     }
 
     if (attempt < maxRetries) {
@@ -205,12 +274,17 @@ export function parseWatcherConfig(): WatcherConfig | null {
 
   const validRules: WatchRule[] = [];
   for (const r of rulesList) {
-    if (!r.webhook_url || typeof r.webhook_url !== 'string') {
+    if (!r || typeof r !== 'object' || !r.webhook_url || typeof r.webhook_url !== 'string') {
       console.warn('[Watcher] Skipping rule with missing webhook_url');
       continue;
     }
     if (!Array.isArray(r.chats) || r.chats.length === 0) {
       console.warn(`[Watcher] Skipping rule for ${r.webhook_url}: chats array is required (no default-all)`);
+      continue;
+    }
+    const headerCheck = validateRuleHeaders(r.headers);
+    if (!headerCheck.ok) {
+      console.warn(`[Watcher] Skipping rule for ${r.webhook_url}: invalid headers: ${headerCheck.error}`);
       continue;
     }
     validRules.push({
@@ -219,6 +293,7 @@ export function parseWatcherConfig(): WatcherConfig | null {
       events: Array.isArray(r.events) ? r.events : undefined,
       debounce_ms: typeof r.debounce_ms === 'number' ? r.debounce_ms : 3000,
       secret: typeof r.secret === 'string' ? r.secret : undefined,
+      headers: headerCheck.headers,
     });
   }
 
@@ -519,7 +594,7 @@ export class WatcherService {
       occurred_at_iso: item.occurred_at_iso,
     };
 
-    await deliverWebhook(item.rule.webhook_url, payload, item.rule.secret);
+    await deliverWebhook(item.rule.webhook_url, payload, item.rule.secret, 3, item.rule.headers);
   }
 }
 
