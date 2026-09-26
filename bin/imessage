@@ -32,6 +32,23 @@ def get_db_connection():
         print(f"ERROR: Could not open database in read-only mode: {e}", file=sys.stderr)
         sys.exit(1)
 
+def get_call_history_db_path():
+    """CallHistory.storedata path. CALL_HISTORY_DB_PATH overrides the macOS default (used by tests)."""
+    override = os.environ.get("CALL_HISTORY_DB_PATH")
+    if override:
+        return os.path.expanduser(override)
+    return os.path.expanduser("~/Library/Application Support/CallHistoryDB/CallHistory.storedata")
+
+def get_call_history_connection():
+    db_path = get_call_history_db_path()
+    if not os.path.exists(db_path):
+        return None, f"Call history database not found at {db_path}. Ensure Full Disk Access is granted or iPhone call syncing is enabled."
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        return conn, None
+    except Exception as e:
+        return None, f"Could not open call history database in read-only mode ({e}). Check Full Disk Access permissions."
+
 def format_size(bytes_num):
     if not bytes_num: return "0 B"
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -841,6 +858,7 @@ def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
         "link_preview": link_preview,
         "balloon_bundle_id": row.get("balloon_bundle_id"),
         "reactions": [],
+        "_date_apple_s": float((row.get("date_ns") or 0) / 1_000_000_000),
     }
 
 
@@ -942,6 +960,8 @@ def annotate_batch(items, scanned_rows, since_input):
 
 
 def emit_read_result(args, items, filtered, next_since, has_more, text_header, text_lines):
+    for item in items:
+        item.pop("_date_apple_s", None)
     if getattr(args, "json", False):
         if getattr(args, "with_meta", False):
             print(json.dumps({
@@ -960,6 +980,16 @@ def emit_read_result(args, items, filtered, next_since, has_more, text_header, t
 
 
 def format_item_line(item, prefix_chat=False):
+    if item.get("kind") == "call":
+        dir_label = "Incoming" if item.get("direction") == "incoming" else "Outgoing"
+        dur_str = f" ({item.get('duration_seconds')}s)" if (item.get("duration_seconds") or 0) > 0 else ""
+        status_label = "Missed" if item.get("missed") else f"Answered{dur_str}"
+        contact_str = f" ({item.get('contact_name')})" if item.get("contact_name") else ""
+        chat_prefix = f"[{item.get('chat')}] " if prefix_chat and item.get("chat") else ""
+        return (
+            f"[{item['timestamp']}] {chat_prefix}[Call: {item.get('call_type')}] "
+            f"{dir_label} {status_label} - {item.get('handle')}{contact_str}"
+        )
     if item.get("kind") == "reaction":
         reaction = item.get("reaction") or {}
         emoji = f" {reaction['emoji']}" if reaction.get("emoji") else ""
@@ -1099,11 +1129,336 @@ def add_read_presentation_args(parser, *, with_limit=False, with_days=False, def
         help="Keep filtered rows (tapbacks) inline as structured records so ids are visible",
     )
     parser.add_argument(
+        "--include-calls",
+        action="store_true",
+        default=False,
+        help="Merge phone and FaceTime calls with chat participants into the timeline in chronological order",
+    )
+    parser.add_argument(
         "--with-meta",
         action="store_true",
         help="Wrap JSON as {messages, filtered, next_since_msg_id, has_more}",
     )
     parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+def call_record_columns(cursor):
+    try:
+        cursor.execute("PRAGMA table_info(ZCALLRECORD)")
+        return {row[1].upper() for row in cursor.fetchall()}
+    except Exception:
+        return set()
+
+def map_call_type(call_type, service_provider=None):
+    if call_type == 1:
+        return "phone"
+    elif call_type == 8:
+        return "facetime_video"
+    elif call_type == 16:
+        return "facetime_audio"
+    elif call_type == 0:
+        if service_provider == "com.apple.Telephony":
+            return "phone"
+        return "unknown"
+    elif call_type is None:
+        if service_provider == "com.apple.Telephony":
+            return "phone"
+        elif service_provider == "com.apple.FaceTime":
+            return "facetime_video"
+        return "unknown"
+    else:
+        return call_type
+
+def parse_date_boundary(val):
+    if val is None:
+        return None
+    val_str = str(val).strip()
+    if not val_str:
+        return None
+    try:
+        num = float(val_str)
+        if num > 1_000_000_000:
+            return num - 978307200.0
+        return num
+    except ValueError:
+        pass
+    try:
+        dt = datetime.datetime.fromisoformat(val_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return (dt - APPLE_EPOCH).total_seconds()
+    except Exception:
+        pass
+    return None
+
+def fetch_call_records(conn, handles=None, since=None, until=None, call_type_filter=None, limit=30, cmap=None):
+    cursor = conn.cursor()
+    available = call_record_columns(cursor)
+    if not available:
+        return []
+
+    pk_col = "Z_PK" if "Z_PK" in available else "ROWID"
+    uid_col = "ZUNIQUE_ID" if "ZUNIQUE_ID" in available else "NULL"
+    addr_col = "ZADDRESS" if "ZADDRESS" in available else "NULL"
+    date_col = "ZDATE" if "ZDATE" in available else "NULL"
+    dur_col = "ZDURATION" if "ZDURATION" in available else "0.0"
+    orig_col = "ZORIGINATED" if "ZORIGINATED" in available else "0"
+    ans_col = "ZANSWERED" if "ZANSWERED" in available else "0"
+    type_col = "ZCALLTYPE" if "ZCALLTYPE" in available else "NULL"
+    prov_col = "ZSERVICE_PROVIDER" if "ZSERVICE_PROVIDER" in available else "NULL"
+    name_col = "ZNAME" if "ZNAME" in available else "NULL"
+
+    sql_select = f"""
+        SELECT 
+            {pk_col} AS pk,
+            {uid_col} AS unique_id,
+            {addr_col} AS address,
+            {date_col} AS date_s,
+            {dur_col} AS duration,
+            {orig_col} AS originated,
+            {ans_col} AS answered,
+            {type_col} AS call_type,
+            {prov_col} AS service_provider,
+            {name_col} AS name
+        FROM ZCALLRECORD
+    """
+
+    where_clauses = []
+    params = []
+    since_s = parse_date_boundary(since)
+    if since_s is not None and "ZDATE" in available:
+        where_clauses.append("ZDATE > ?")
+        params.append(since_s)
+
+    until_s = parse_date_boundary(until)
+    if until_s is not None and "ZDATE" in available:
+        where_clauses.append("ZDATE < ?")
+        params.append(until_s)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    order_sql = "ORDER BY ZDATE DESC" if "ZDATE" in available else ""
+    query = f"{sql_select} {where_sql} {order_sql}"
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+
+    norm_target_handles = None
+    if handles:
+        norm_target_handles = {normalize_handle(h) for h in handles if normalize_handle(h)}
+
+    if cmap is None:
+        cmap = get_contacts_map()
+
+    calls = []
+    for r in rows:
+        pk, uid, raw_addr, date_s, duration, orig, ans, ctype, prov, cname = r
+        if raw_addr and isinstance(raw_addr, bytes):
+            raw_addr = raw_addr.decode('utf-8', errors='ignore')
+        raw_addr = str(raw_addr) if raw_addr is not None else ""
+        norm_addr = normalize_handle(raw_addr)
+
+        if norm_target_handles is not None:
+            matched = False
+            if norm_addr in norm_target_handles:
+                matched = True
+            elif raw_addr and raw_addr.lower() in norm_target_handles:
+                matched = True
+            elif raw_addr:
+                for th in norm_target_handles:
+                    if th and (th in norm_addr or norm_addr in th):
+                        matched = True
+                        break
+            if not matched:
+                continue
+
+        mapped_type = map_call_type(ctype, prov)
+        if call_type_filter:
+            ctf = str(call_type_filter).lower().strip()
+            if ctf == "facetime":
+                if mapped_type not in ("facetime_video", "facetime_audio"):
+                    continue
+            elif str(mapped_type).lower() != ctf:
+                continue
+
+        is_orig = bool(orig == 1)
+        direction = "outgoing" if is_orig else "incoming"
+        is_ans = bool(ans == 1)
+        is_missed = bool(not is_orig and not is_ans)
+
+        dur_sec = round(float(duration or 0.0), 2)
+        human_ts, iso_ts = format_apple_seconds(date_s)
+
+        contact_name = cmap.get(norm_addr)
+        if not contact_name and cname:
+            contact_name = str(cname)
+
+        calls.append({
+            "id": uid or (str(pk) if pk is not None else ""),
+            "handle": raw_addr,
+            "contact_name": contact_name,
+            "direction": direction,
+            "answered": is_ans,
+            "missed": is_missed,
+            "duration_seconds": dur_sec,
+            "call_type": mapped_type,
+            "timestamp": human_ts,
+            "timestamp_iso": iso_ts,
+            "_date_apple_s": float(date_s or 0.0),
+        })
+
+        if limit and len(calls) >= limit:
+            break
+
+    return calls
+
+def get_calls_for_chat_ids(imsg_cursor, chat_ids, since_date_s=None, until_date_s=None, cmap=None):
+    call_conn, err = get_call_history_connection()
+    if not call_conn:
+        return []
+    handles = set()
+    try:
+        placeholders = ",".join("?" * len(chat_ids))
+        imsg_cursor.execute(f"""
+            SELECT h.id FROM chat_handle_join chj
+            JOIN handle h ON chj.handle_id = h.ROWID
+            WHERE chj.chat_id IN ({placeholders})
+        """, chat_ids)
+        for r in imsg_cursor.fetchall():
+            if r[0]:
+                handles.add(r[0])
+        imsg_cursor.execute(f"""
+            SELECT chat_identifier FROM chat WHERE ROWID IN ({placeholders})
+        """, chat_ids)
+        for r in imsg_cursor.fetchall():
+            if r[0] and not r[0].startswith("chat"):
+                handles.add(r[0])
+    except Exception:
+        pass
+
+    if not handles:
+        call_conn.close()
+        return []
+
+    calls = fetch_call_records(
+        call_conn,
+        handles=list(handles),
+        since=since_date_s,
+        until=until_date_s,
+        limit=100,
+        cmap=cmap
+    )
+    call_conn.close()
+    return calls
+
+def merge_calls_into_timeline(items, calls):
+    if not calls:
+        return items
+    call_items = []
+    for call in calls:
+        call_item = {
+            "kind": "call",
+            "id": call["id"],
+            "handle": call["handle"],
+            "contact_name": call.get("contact_name"),
+            "sender": call.get("contact_name") or call.get("handle") if call.get("direction") == "incoming" else "Me",
+            "direction": call["direction"],
+            "answered": call["answered"],
+            "missed": call["missed"],
+            "duration_seconds": call["duration_seconds"],
+            "call_type": call["call_type"],
+            "timestamp": call["timestamp"],
+            "timestamp_iso": call["timestamp_iso"],
+            "text": None,
+            "_date_apple_s": call.get("_date_apple_s", 0.0),
+        }
+        call_items.append(call_item)
+
+    combined = items + call_items
+    combined.sort(key=lambda x: x.get("_date_apple_s", 0.0))
+    return combined
+
+def get_call_history(args):
+    call_conn, err = get_call_history_connection()
+    if err:
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "available": False,
+                "error": err,
+                "calls": []
+            }, indent=2))
+        else:
+            print(f"ERROR: {err}", file=sys.stderr)
+        return
+
+    handles = set()
+    cmap = get_contacts_map()
+
+    chat_arg = getattr(args, "chat", None)
+    if chat_arg:
+        try:
+            imsg_conn = get_db_connection()
+            c_imsg = imsg_conn.cursor()
+            chat_ids = resolve_chat_ids(c_imsg, chat_arg)
+            if chat_ids:
+                placeholders = ",".join("?" * len(chat_ids))
+                c_imsg.execute(f"""
+                    SELECT h.id FROM chat_handle_join chj
+                    JOIN handle h ON chj.handle_id = h.ROWID
+                    WHERE chj.chat_id IN ({placeholders})
+                """, chat_ids)
+                for r in c_imsg.fetchall():
+                    if r[0]:
+                        handles.add(r[0])
+                c_imsg.execute(f"""
+                    SELECT chat_identifier FROM chat WHERE ROWID IN ({placeholders})
+                """, chat_ids)
+                for r in c_imsg.fetchall():
+                    if r[0] and not r[0].startswith("chat"):
+                        handles.add(r[0])
+            imsg_conn.close()
+        except Exception:
+            pass
+
+    handle_arg = getattr(args, "handle", None)
+    if handle_arg:
+        handles.add(handle_arg)
+        norm_arg = normalize_handle(handle_arg)
+        if norm_arg:
+            handles.add(norm_arg)
+        arg_lower = handle_arg.strip().lower()
+        for norm_h, cname in cmap.items():
+            if cname and cname.strip().lower() == arg_lower:
+                handles.add(norm_h)
+
+    limit = getattr(args, "limit", 30) or 30
+    calls = fetch_call_records(
+        call_conn,
+        handles=list(handles) if (chat_arg or handle_arg) else None,
+        since=getattr(args, "since", None),
+        until=getattr(args, "until", None),
+        call_type_filter=getattr(args, "call_type", None),
+        limit=limit,
+        cmap=cmap
+    )
+    call_conn.close()
+
+    clean_calls = []
+    for c in calls:
+        rec = {k: v for k, v in c.items() if not k.startswith("_")}
+        clean_calls.append(rec)
+
+    if getattr(args, "json", False):
+        print(json.dumps(clean_calls, indent=2))
+        return
+
+    header = f"CALL HISTORY ({len(clean_calls)} calls found):"
+    print(header)
+    print("=" * 85)
+    for c in clean_calls:
+        dir_label = "Incoming" if c["direction"] == "incoming" else "Outgoing"
+        dur_label = f" ({c['duration_seconds']}s)" if c['duration_seconds'] > 0 else ""
+        status_label = "Missed" if c["missed"] else f"Answered{dur_label}"
+        name_str = f" ({c['contact_name']})" if c['contact_name'] else ""
+        print(f"[{c['timestamp']}] [{c['call_type']}] {dir_label} {status_label} - {c['handle']}{name_str}")
 
 def read_messages(args):
     conn = get_db_connection()
@@ -1131,6 +1486,10 @@ def read_messages(args):
     mode = presentation_options(args)
     items = present_rows(cursor, rows, None, False, mode)
     filtered, next_since = annotate_batch(items, rows, since)
+    if getattr(args, "include_calls", False):
+        cmap = get_contacts_map()
+        calls = get_calls_for_chat_ids(cursor, chat_ids, since_date_s=threshold_ns / 1_000_000_000, cmap=cmap)
+        items = merge_calls_into_timeline(items, calls)
     header = f"READING MESSAGES FROM THE LAST {args.days} DAYS FOR '{target}' ({len(items)} shown):"
     lines = [format_item_line(item, prefix_chat=True) for item in items]
     emit_read_result(args, items, filtered, next_since, False, header, lines)
@@ -1556,6 +1915,19 @@ def get_recent_messages(args):
     cmap = get_contacts_map()
     items = present_rows(cursor, rows, cmap, True, mode)
     filtered, next_since = annotate_batch(items, rows, since)
+    if getattr(args, "include_calls", False):
+        min_date_s = None
+        if since is not None:
+            cursor.execute("SELECT date FROM message WHERE ROWID = ?", (since,))
+            r = cursor.fetchone()
+            if r and r[0]:
+                min_date_s = int(r[0]) / 1_000_000_000
+        elif rows:
+            min_ns = min(r.get("date_ns") or r.get("date") or 0 for r in rows if (r.get("date_ns") or r.get("date")))
+            if min_ns:
+                min_date_s = min_ns / 1_000_000_000
+        calls = get_calls_for_chat_ids(cursor, chat_ids, since_date_s=min_date_s, cmap=cmap)
+        items = merge_calls_into_timeline(items, calls)
     header = f"LAST {len(items)} RECENT MESSAGES FOR '{target}':"
     lines = [format_item_line(item) for item in items]
     emit_read_result(args, items, filtered, next_since, has_more, header, lines)
@@ -1914,6 +2286,16 @@ def main():
     edit_parser.add_argument("--text", "-t", required=True, help="New replacement message text")
     edit_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     edit_parser.set_defaults(func=edit_message)
+
+    calls_parser = subparsers.add_parser("calls", help="Get call and FaceTime history")
+    calls_parser.add_argument("--handle", "--contact", "--recipient", "--phone", "--email", dest="handle", default=None, help="Filter by phone number, email address, or contact name")
+    calls_parser.add_argument("--chat", default=None, help="Numeric chat ROWID (resolve participants to handles)")
+    calls_parser.add_argument("--since", default=None, help="Filter calls after this timestamp (Apple epoch seconds, Unix timestamp, or ISO 8601)")
+    calls_parser.add_argument("--until", default=None, help="Filter calls before this timestamp")
+    calls_parser.add_argument("--call-type", "--type", dest="call_type", default=None, help="Filter by call type (phone, facetime_video, facetime_audio, unknown)")
+    calls_parser.add_argument("--limit", type=int, default=30, help="Maximum number of calls to return (default: 30)")
+    calls_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    calls_parser.set_defaults(func=get_call_history)
     
     args = parser.parse_args()
     args.func(args)

@@ -263,8 +263,9 @@ Returns:
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
 | `imessage_list_chats` | List recent conversations with AddressBook names and participant sets | `limit` (number, default: 30) |
-| `imessage_read_messages` | Read message history with attachments, link previews, tapbacks, voice notes, edit history, and ISO timestamps | `chat` or alias `chat_id` (numeric ROWID from `imessage_list_chats`, or a name/phone/email), `days` (default: 14), `since_msg_id`, `reactions`, `with_meta` |
-| `imessage_get_recent_messages` | Preview the last N messages, or poll rows newer than `since_msg_id` | `chat` or `chat_id`, `limit` (default: 5, max: 50), `since_msg_id`, `reactions` (`attach` or `separate`), `include_filtered`, `with_meta` |
+| `imessage_read_messages` | Read message history with attachments, link previews, tapbacks, voice notes, edit history, and ISO timestamps | `chat` or alias `chat_id` (numeric ROWID from `imessage_list_chats`, or a name/phone/email), `days` (default: 14), `since_msg_id`, `reactions`, `include_calls`, `with_meta` |
+| `imessage_get_recent_messages` | Preview the last N messages, or poll rows newer than `since_msg_id` | `chat` or `chat_id`, `limit` (default: 5, max: 50), `since_msg_id`, `reactions` (`attach` or `separate`), `include_filtered`, `include_calls`, `with_meta` |
+| `imessage_get_call_history` | Retrieve phone and FaceTime call history with direction, duration, and status | `handle` (or `contact`), `chat` (or `chat_id`), `since`, `until`, `call_type`, `limit` (default: 30) |
 | `imessage_search_messages` | Full-text search across historical iMessages and voice note transcriptions, optionally only after a message id | `query` (aliases `q`, `search`), `limit` (default: 30), `since_msg_id` |
 | `imessage_get_edit_history` | Retrieve full rewrite and edit history with revision timestamps for an iMessage by ROWID | `message_id` (number, required) |
 | `imessage_search_group_chats` | Exact participant set search across group chats | `participants` (array of strings, required) |
@@ -284,8 +285,9 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | Command | Description | Example |
 | :--- | :--- | :--- |
 | `list` | List recent conversations with participant handles | `bin/imessage list --limit 10 --json` |
-| `read` | Read chat history for a contact or group chat | `bin/imessage read 46 --days 7 --since-msg-id 1200 --json` |
-| `recent` | Preview last N messages, or rows after a message id | `bin/imessage recent 46 --limit 5 --since-msg-id 1200 --with-meta --json` |
+| `read` | Read chat history for a contact or group chat | `bin/imessage read 46 --days 7 --since-msg-id 1200 --include-calls --json` |
+| `recent` | Preview last N messages, or rows after a message id | `bin/imessage recent 46 --limit 5 --since-msg-id 1200 --include-calls --with-meta --json` |
+| `calls` | Retrieve phone and FaceTime call history | `bin/imessage calls --limit 20 --json` |
 | `search` | Search message history by keyword or phrase | `bin/imessage search "Arrakis" --limit 20 --since-msg-id 1200` |
 | `edits` | Inspect complete rewrite and revision history for a message | `bin/imessage edits 198097 --json` |
 | `edit` | Edit a previously sent outgoing message | `bin/imessage edit 198097 --text "Paul Atreides revised" --json` |
@@ -348,15 +350,25 @@ Outgoing messages (`is_from_me`) use `sender: "Me"` and `handle: ""`. `participa
 
 Tapback `type` is `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`, or `emoji` (custom emoji in `emoji`). `action` is `added` or `removed`. Each reaction includes `target_msg_id` and `target_guid`. A reaction whose target is outside the current window is returned as its own structured record so a poll does not drop it.
 
+## Call and FaceTime history
+
+Call records are read from macOS Core Data SQLite storage at `~/Library/Application Support/CallHistoryDB/CallHistory.storedata` using read-only URIs (`mode=ro`).
+
+- **Tool `imessage_get_call_history`:** Retrieves call records. Filter by `handle` (phone number, email, or contact name), `chat` (resolves chat participants to their handles), `since`/`until` (ISO 8601 strings, Unix timestamps, or Apple epoch seconds), `call_type` (`phone`, `facetime_video`, `facetime_audio`, or `unknown`), and `limit`.
+- **Timeline merging via `include_calls`:** Setting `include_calls: true` on `imessage_read_messages` or `imessage_get_recent_messages` merges phone and FaceTime calls with that chat's participants into the message list in chronological order. Calls appear as entries with `kind: "call"`, `text: null`, and the call metadata.
+- **Cursor safety:** Call entries do not have message ROWIDs and do not affect `next_since_msg_id` or `filtered.reaction` counts. Incremental polling via `since_msg_id` advances strictly on message rows.
+- **Resilience:** If `CallHistory.storedata` is missing or unreadable due to missing Full Disk Access permissions, the tool returns a non-fatal status object explaining the issue rather than throwing an exception.
+
 ### Check on a real Mac after deploy
 
-The fixture database covers the shapes this server parses. A live `chat.db` can still differ:
+The fixture database covers the shapes this server parses. A live `chat.db` and `CallHistory.storedata` can still differ:
 
 - `payload_data` for a current Spotify (or other) share may be an `NSKeyedArchiver` of `LPLinkMetadata`, a plain binary plist, or a newer specialization class. Confirm `link_preview.url`, `title`, `subtitle` or `artist`, and `site_name` on one real share, and that the `.pluginPayloadAttachment` is still listed under `attachments`.
-- Tapback rows should use `associated_message_type` 2000–2006 (added) and 3000–3006 (removed), with `associated_message_guid` like `p:0/<message guid>`. Custom emoji reactions need the `associated_message_emoji` column (Ventura and later). If a reaction still shows up as text, note the integer type and guid prefix.
+- Tapback rows should use `associated_message_type` 2000 to 2006 (added) and 3000 to 3006 (removed), with `associated_message_guid` like `p:0/<message guid>`. Custom emoji reactions need the `associated_message_emoji` column (Ventura and later). If a reaction still shows up as text, note the integer type and guid prefix.
 - On a 1:1 thread, an `is_from_me` row's `handle_id` points at the other person. Confirm `sender` is `Me`, `handle` is empty, and `participant` is that other handle. Group chats often leave `handle_id` empty on outgoing rows.
 - `timestamp_iso` should use the Mac's local offset, including daylight-saving changes.
 - Edit history for a real edited message should still list every revision. This build does not change how `message_summary_info` is decoded.
+- `CallHistory.storedata`: Confirm Full Disk Access allows reading `CallHistory.storedata`. Check that incoming/outgoing phone calls and FaceTime video/audio calls appear with accurate `duration_seconds` and resolved contact names. Check if cellular iPhone calls appear (requires "Calls on Other Devices" enabled in FaceTime/Phone settings on your iPhone and Mac).
 
 ## Known Limitations & Considerations
 
