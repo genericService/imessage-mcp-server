@@ -546,6 +546,10 @@ def message_select_list(available):
         field("associated_message_emoji", "associated_message_emoji"),
         field("balloon_bundle_id", "balloon_bundle_id"),
         field("payload_data", "payload_data"),
+        field("is_delivered", "is_delivered"),
+        field("date_delivered", "date_delivered_ns"),
+        field("is_read", "is_read"),
+        field("date_read", "date_read_ns"),
     ]
     return ",\n        ".join(parts)
 
@@ -816,6 +820,10 @@ def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
     link_preview = extract_link_preview(
         row.get("payload_data"), msg_text, row.get("balloon_bundle_id"), att_list
     )
+    deliv_human, deliv_iso = format_apple_ns(row.get("date_delivered_ns"))
+    read_human, read_iso = format_apple_ns(row.get("date_read_ns"))
+    is_delivered = bool(row.get("is_delivered") or (row.get("date_delivered_ns") and row.get("date_delivered_ns") > 0))
+    is_read = bool(row.get("is_read") or (row.get("date_read_ns") and row.get("date_read_ns") > 0))
     return {
         "kind": "message",
         "msg_id": row["msg_id"],
@@ -829,6 +837,12 @@ def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
         "participant": participant,
         "is_from_me": is_from_me,
         "text": msg_text,
+        "is_delivered": is_delivered,
+        "delivered_at": deliv_human or None,
+        "delivered_at_iso": deliv_iso,
+        "is_read": is_read,
+        "read_at": read_human or None,
+        "read_at_iso": read_iso,
         "is_audio_message": is_audio,
         "transcription": transcription,
         "is_edited": is_edited,
@@ -1854,6 +1868,162 @@ def search_group_chats(args):
             print(f"[{c['rowid']}] {c['name']} ({c['identifier']})")
     conn.close()
 
+def get_changes(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    available = message_column_names(cursor)
+
+    cursor.execute("SELECT MAX(ROWID) FROM message")
+    row = cursor.fetchone()
+    max_msg_id = int(row[0]) if row and row[0] is not None else 0
+
+    chat_handles_map = {}
+    try:
+        cursor.execute("""
+            SELECT chj.chat_id, h.id
+            FROM chat_handle_join chj
+            JOIN handle h ON chj.handle_id = h.ROWID
+        """)
+        for cid, hid in cursor.fetchall():
+            if hid:
+                chat_handles_map.setdefault(cid, []).append(hid)
+    except Exception:
+        pass
+
+    def build_identifiers(cid, c_ident, disp_name):
+        res = []
+        if cid is not None:
+            res.append(str(cid))
+        if c_ident:
+            res.append(str(c_ident))
+            norm = normalize_handle(c_ident)
+            if norm:
+                res.append(norm)
+        if disp_name:
+            res.append(str(disp_name))
+        for h in chat_handles_map.get(cid, []):
+            if h:
+                res.append(str(h))
+                norm_h = normalize_handle(h)
+                if norm_h:
+                    res.append(norm_h)
+        return list(dict.fromkeys(filter(None, res)))
+
+    since_id = args.since_id
+    new_messages = []
+
+    if since_id is not None and since_id > 0:
+        cursor.execute(f"""
+            SELECT m.ROWID AS msg_id, m.guid AS guid, cmj.chat_id AS chat_id,
+                   c.chat_identifier AS chat_identifier, c.display_name AS display_name,
+                   m.is_from_me AS is_from_me,
+                   m.associated_message_type AS associated_message_type,
+                   m.associated_message_guid AS associated_message_guid,
+                   m.date AS date_ns
+            {MESSAGE_FROM_LOOSE}
+            WHERE m.ROWID > ?
+            ORDER BY m.ROWID ASC
+        """, (since_id,))
+        for r in cursor.fetchall():
+            m_id, guid, chat_id, chat_ident, display_name, is_from_me, assoc_type, assoc_guid, date_ns = r
+            if assoc_type and int(assoc_type) > 0:
+                event = "reaction"
+            elif is_from_me:
+                event = "message_out"
+            else:
+                event = "message_in"
+
+            _human, iso = format_apple_ns(date_ns)
+            identifiers = build_identifiers(chat_id, chat_ident, display_name)
+            new_messages.append({
+                "msg_id": m_id,
+                "guid": guid,
+                "chat_id": chat_id,
+                "chat_identifiers": identifiers,
+                "event": event,
+                "is_from_me": bool(is_from_me),
+                "occurred_at_iso": iso or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            })
+
+    receipt_events = []
+    current_receipt_state = {}
+
+    has_receipt_cols = any(col in available for col in ("is_delivered", "date_delivered", "is_read", "date_read"))
+    if has_receipt_cols:
+        deliv_col = "m.is_delivered" if "is_delivered" in available else "0"
+        deliv_date_col = "m.date_delivered" if "date_delivered" in available else "0"
+        read_col = "m.is_read" if "is_read" in available else "0"
+        read_date_col = "m.date_read" if "date_read" in available else "0"
+
+        cursor.execute(f"""
+            SELECT m.ROWID AS msg_id, cmj.chat_id AS chat_id,
+                   c.chat_identifier AS chat_identifier, c.display_name AS display_name,
+                   {deliv_col} AS is_delivered,
+                   {deliv_date_col} AS date_delivered_ns,
+                   {read_col} AS is_read,
+                   {read_date_col} AS date_read_ns,
+                   m.date AS date_ns
+            {MESSAGE_FROM_LOOSE}
+            WHERE m.is_from_me = 1
+            ORDER BY m.ROWID DESC
+            LIMIT ?
+        """, (args.lookback,))
+
+        prev_receipt_state = {}
+        if args.receipt_state:
+            try:
+                prev_receipt_state = json.loads(args.receipt_state)
+            except Exception:
+                pass
+
+        for r in cursor.fetchall():
+            m_id, chat_id, chat_ident, display_name, is_deliv, date_deliv_ns, is_rd, date_rd_ns, date_ns = r
+            curr_delivered = bool(is_deliv or (date_deliv_ns and date_deliv_ns > 0))
+            curr_read = bool(is_rd or (date_rd_ns and date_rd_ns > 0))
+            current_receipt_state[str(m_id)] = {
+                "delivered": curr_delivered,
+                "read": curr_read,
+            }
+
+            if prev_receipt_state and str(m_id) in prev_receipt_state:
+                prev = prev_receipt_state[str(m_id)]
+                identifiers = build_identifiers(chat_id, chat_ident, display_name)
+
+                if not prev.get("delivered") and curr_delivered:
+                    _h, deliv_iso = format_apple_ns(date_deliv_ns) if date_deliv_ns else format_apple_ns(date_ns)
+                    receipt_events.append({
+                        "event": "delivered",
+                        "chat_id": chat_id,
+                        "chat_identifiers": identifiers,
+                        "msg_id": m_id,
+                        "occurred_at_iso": deliv_iso or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    })
+                if not prev.get("read") and curr_read:
+                    _h, read_iso = format_apple_ns(date_rd_ns) if date_rd_ns else format_apple_ns(date_ns)
+                    receipt_events.append({
+                        "event": "read_receipt",
+                        "chat_id": chat_id,
+                        "chat_identifiers": identifiers,
+                        "msg_id": m_id,
+                        "occurred_at_iso": read_iso or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    })
+
+    conn.close()
+
+    result = {
+        "max_msg_id": max_msg_id,
+        "new_messages": new_messages,
+        "receipt_events": receipt_events,
+        "receipt_state": current_receipt_state,
+    }
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Max Message ID: {max_msg_id}")
+        print(f"New Messages: {len(new_messages)}")
+        print(f"Receipt Events: {len(receipt_events)}")
+
 def main():
     parser = argparse.ArgumentParser(description="iMessage CLI tool for macOS")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1914,6 +2084,20 @@ def main():
     edit_parser.add_argument("--text", "-t", required=True, help="New replacement message text")
     edit_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     edit_parser.set_defaults(func=edit_message)
+
+    changes_parser = subparsers.add_parser("changes", help="Check for new messages and receipt events")
+    changes_parser.add_argument("--since-id", type=int, default=None, help="Message ROWID cursor to check after")
+    changes_parser.add_argument("--lookback", type=int, default=50, help="Number of recent outgoing messages to check for receipt status")
+    changes_parser.add_argument("--receipt-state", type=str, default=None, help="JSON string of prior outgoing receipt states")
+    changes_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    changes_parser.set_defaults(func=get_changes)
+
+    check_changes_parser = subparsers.add_parser("check-changes", help="Alias of changes")
+    check_changes_parser.add_argument("--since-id", type=int, default=None, help="Message ROWID cursor to check after")
+    check_changes_parser.add_argument("--lookback", type=int, default=50, help="Number of recent outgoing messages to check for receipt status")
+    check_changes_parser.add_argument("--receipt-state", type=str, default=None, help="JSON string of prior outgoing receipt states")
+    check_changes_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    check_changes_parser.set_defaults(func=get_changes)
     
     args = parser.parse_args()
     args.func(args)
