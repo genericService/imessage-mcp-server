@@ -11,16 +11,23 @@ import glob
 import json
 import base64
 import plistlib
+import re
 import struct
 
-DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
+def get_db_path():
+    """chat.db path. IMESSAGE_DB_PATH overrides the macOS default (used by tests)."""
+    override = os.environ.get("IMESSAGE_DB_PATH")
+    if override:
+        return os.path.expanduser(override)
+    return os.path.expanduser("~/Library/Messages/chat.db")
 
 def get_db_connection():
-    if not os.path.exists(DB_PATH):
-        print(f"ERROR: iMessage database not found at {DB_PATH}", file=sys.stderr)
+    db_path = get_db_path()
+    if not os.path.exists(db_path):
+        print(f"ERROR: iMessage database not found at {db_path}", file=sys.stderr)
         sys.exit(1)
     try:
-        return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except Exception as e:
         print(f"ERROR: Could not open database in read-only mode: {e}", file=sys.stderr)
         sys.exit(1)
@@ -201,7 +208,8 @@ def fetch_attachments_for_messages(cursor, msg_ids):
             'is_audio': bool(is_audio),
             'duration_seconds': dur_sec,
             'duration_formatted': dur_fmt,
-            'transcription': transcription
+            'transcription': transcription,
+            'uti': uti,
         })
     return attachments_map
 
@@ -322,6 +330,7 @@ def list_chats(args):
 
         chats.append({
             'rowid': rowid,
+            'chat_id': rowid,
             'display_name': display_name,
             'name': name,
             'identifier': identifier,
@@ -373,18 +382,31 @@ def parse_attributed_body(blob):
     except: pass
     return ""
 
+APPLE_EPOCH = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+
+def format_apple_seconds(seconds):
+    """Human timestamp (unchanged) plus ISO 8601 with the host's local UTC offset."""
+    if seconds is None:
+        return "", None
+    dt_local = (APPLE_EPOCH + datetime.timedelta(seconds=float(seconds))).astimezone()
+    human = dt_local.strftime("%Y-%m-%d %I:%M %p")
+    iso = dt_local.replace(microsecond=0).isoformat()
+    return human, iso
+
+def format_apple_ns(date_ns):
+    if not date_ns:
+        return "", None
+    return format_apple_seconds(int(date_ns) / 1_000_000_000)
+
 def parse_edit_history(blob, date_edited_ns=0, message_date_ns=0):
     """
     Parses message_summary_info and date_edited to extract rewrite history.
     Returns: (is_edited: bool, edit_count: int, last_edited: str | None, edit_history: list)
+    History entries keep `timestamp` and add `timestamp_iso`.
     """
-    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
-
     if not blob:
         if date_edited_ns and date_edited_ns > 0:
-            sec = date_edited_ns / 1_000_000_000
-            dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
-            last_ts = dt.strftime("%Y-%m-%d %I:%M %p")
+            last_ts, _last_iso = format_apple_ns(date_edited_ns)
             return True, 1, last_ts, []
         return False, 0, None, []
 
@@ -392,18 +414,14 @@ def parse_edit_history(blob, date_edited_ns=0, message_date_ns=0):
         data = plistlib.loads(blob)
     except Exception:
         if date_edited_ns and date_edited_ns > 0:
-            sec = date_edited_ns / 1_000_000_000
-            dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
-            last_ts = dt.strftime("%Y-%m-%d %I:%M %p")
+            last_ts, _last_iso = format_apple_ns(date_edited_ns)
             return True, 1, last_ts, []
         return False, 0, None, []
 
     ec = data.get('ec')
     if not ec or not isinstance(ec, dict):
         if date_edited_ns and date_edited_ns > 0:
-            sec = date_edited_ns / 1_000_000_000
-            dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
-            last_ts = dt.strftime("%Y-%m-%d %I:%M %p")
+            last_ts, _last_iso = format_apple_ns(date_edited_ns)
             return True, 1, last_ts, []
         return False, 0, None, []
 
@@ -414,9 +432,7 @@ def parse_edit_history(blob, date_edited_ns=0, message_date_ns=0):
     max_revisions = max((len(ec[k]) for k in sorted_parts if isinstance(ec[k], list)), default=0)
     if max_revisions <= 1:
         if date_edited_ns and date_edited_ns > 0:
-            sec = date_edited_ns / 1_000_000_000
-            dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
-            last_ts = dt.strftime("%Y-%m-%d %I:%M %p")
+            last_ts, _last_iso = format_apple_ns(date_edited_ns)
             return True, 1, last_ts, []
         return False, 0, None, []
 
@@ -436,212 +452,721 @@ def parse_edit_history(blob, date_edited_ns=0, message_date_ns=0):
                 part_texts.append(t_str)
 
         ts_str = ''
+        ts_iso = None
         if rev_date:
-            dt = (apple_epoch + datetime.timedelta(seconds=rev_date)).astimezone()
-            ts_str = dt.strftime("%Y-%m-%d %I:%M %p")
+            ts_str, ts_iso = format_apple_seconds(rev_date)
         elif rev_idx == 0 and message_date_ns:
-            dt = (apple_epoch + datetime.timedelta(seconds=message_date_ns / 1_000_000_000)).astimezone()
-            ts_str = dt.strftime("%Y-%m-%d %I:%M %p")
+            ts_str, ts_iso = format_apple_ns(message_date_ns)
 
         label = "original" if rev_idx == 0 else f"edit_{rev_idx}"
         history.append({
             'revision': rev_idx,
             'label': label,
             'timestamp': ts_str,
+            'timestamp_iso': ts_iso,
             'text': " ".join(part_texts)
         })
 
     edit_count = max_revisions - 1
     last_edited = history[-1]['timestamp'] if history and history[-1]['timestamp'] else None
     if not last_edited and date_edited_ns and date_edited_ns > 0:
-        sec = date_edited_ns / 1_000_000_000
-        dt = (apple_epoch + datetime.timedelta(seconds=sec)).astimezone()
-        last_edited = dt.strftime("%Y-%m-%d %I:%M %p")
+        last_edited, _last_iso = format_apple_ns(date_edited_ns)
 
     return True, edit_count, last_edited, history
+
+_REACTION_NAMES = {
+    0: "love",
+    1: "like",
+    2: "dislike",
+    3: "laugh",
+    4: "emphasize",
+    5: "question",
+    6: "emoji",
+}
+
+_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+
+def classify_associated_type(assoc_type):
+    """Tapback rows use 2000-2006 (added) and 3000-3006 (removed)."""
+    if assoc_type is None:
+        return None
+    try:
+        code = int(assoc_type)
+    except (TypeError, ValueError):
+        return None
+    if 2000 <= code <= 2006:
+        return code, _REACTION_NAMES[code - 2000], "added"
+    if 3000 <= code <= 3006:
+        return code, _REACTION_NAMES[code - 3000], "removed"
+    return None
+
+
+def target_guid_from_associated(raw):
+    """associated_message_guid looks like 'p:0/<guid>' or 'bp:<guid>'."""
+    if not raw or not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if "/" in value:
+        value = value.rsplit("/", 1)[-1]
+    if value.startswith("bp:"):
+        value = value[3:]
+    return value or None
+
+
+def message_column_names(cursor):
+    cursor.execute("PRAGMA table_info(message)")
+    return {row[1] for row in cursor.fetchall()}
+
+
+def message_select_list(available):
+    def field(column, alias):
+        if column in available:
+            return f"m.{column} AS {alias}"
+        return f"NULL AS {alias}"
+
+    parts = [
+        "m.ROWID AS msg_id",
+        field("guid", "guid"),
+        "c.ROWID AS chat_id",
+        "c.display_name AS display_name",
+        "c.chat_identifier AS chat_identifier",
+        "m.date AS date_ns",
+        "m.is_from_me AS is_from_me",
+        "h.id AS handle",
+        "m.text AS text",
+        field("attributedBody", "attributed_body"),
+        field("date_edited", "date_edited_ns"),
+        field("message_summary_info", "summary_blob"),
+        field("is_audio_message", "is_audio_message"),
+        field("associated_message_type", "associated_message_type"),
+        field("associated_message_guid", "associated_message_guid"),
+        field("associated_message_emoji", "associated_message_emoji"),
+        field("balloon_bundle_id", "balloon_bundle_id"),
+        field("payload_data", "payload_data"),
+    ]
+    return ",\n        ".join(parts)
+
+
+MESSAGE_FROM = """
+FROM message m
+JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+JOIN chat c ON cmj.chat_id = c.ROWID
+LEFT JOIN handle h ON m.handle_id = h.ROWID
+"""
+
+
+MESSAGE_FROM_LOOSE = """
+FROM message m
+LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+LEFT JOIN handle h ON m.handle_id = h.ROWID
+"""
+
+
+def fetch_message_dicts(cursor, select_sql, tail_sql, params, from_sql=None):
+    cursor.execute(f"SELECT {select_sql} {from_sql or MESSAGE_FROM} WHERE {tail_sql}", params)
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def resolve_chat_ids(cursor, target):
+    if target is None:
+        return []
+    target = str(target).strip()
+    if not target:
+        return []
+    if target.isdigit():
+        return [int(target)]
+    cursor.execute(
+        "SELECT ROWID FROM chat WHERE display_name LIKE ? OR chat_identifier LIKE ?",
+        (f"%{target}%", f"%{target}%"),
+    )
+    return [r[0] for r in cursor.fetchall()]
+
+
+def chat_placeholders(chat_ids):
+    return ",".join(["?"] * len(chat_ids))
+
+
+def sender_identity(is_from_me, handle, cmap, prefer_contact_name):
+    """
+    Outgoing chat.db rows store the other participant on handle_id.
+    `handle` is the sender's own address and is empty for the account owner.
+    `participant` preserves the other party's handle from that column.
+    """
+    counterpart = handle or ""
+    if is_from_me:
+        return "Me", "", counterpart
+    if prefer_contact_name and cmap is not None:
+        sender = cmap.get(normalize_handle(handle), handle or "Unknown")
+    else:
+        sender = handle or "Unknown"
+    return sender, counterpart, counterpart
+
+
+def last_edited_iso(history, date_edited_ns):
+    if history:
+        iso = history[-1].get("timestamp_iso")
+        if iso:
+            return iso
+    if date_edited_ns:
+        _human, iso = format_apple_ns(date_edited_ns)
+        return iso
+    return None
+
+
+def _resolve_archive_value(objects, value, seen):
+    if isinstance(value, plistlib.UID):
+        idx = int(value)
+        if idx in seen or idx < 0 or idx >= len(objects):
+            return None
+        seen = set(seen)
+        seen.add(idx)
+        return _resolve_archive_value(objects, objects[idx], seen)
+    if isinstance(value, dict):
+        if "NS.relative" in value or "NS.base" in value:
+            rel = _resolve_archive_value(objects, value.get("NS.relative"), set(seen))
+            base = _resolve_archive_value(objects, value.get("NS.base"), set(seen))
+            if isinstance(rel, str) and rel:
+                if isinstance(base, str) and base and not rel.startswith("http"):
+                    return base.rstrip("/") + "/" + rel.lstrip("/")
+                return rel
+            return rel if isinstance(rel, str) else None
+        out = {}
+        for key, item in value.items():
+            if key.startswith("$"):
+                continue
+            out[key] = _resolve_archive_value(objects, item, set(seen))
+        return out
+    if isinstance(value, list):
+        return [_resolve_archive_value(objects, item, set(seen)) for item in value]
+    if value == "$null":
+        return None
+    return value
+
+
+def decode_payload_object(blob):
+    if not blob:
+        return None
+    try:
+        obj = plistlib.loads(blob)
+    except Exception:
+        return None
+    if isinstance(obj, dict) and obj.get("$archiver") == "NSKeyedArchiver":
+        objects = obj.get("$objects") or []
+        root = (obj.get("$top") or {}).get("root")
+        return _resolve_archive_value(objects, root, set())
+    return obj
+
+
+def _first_str(*values):
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _find_link_dict(node):
+    if isinstance(node, dict):
+        if any(key in node for key in ("URL", "url", "title", "siteName", "summary", "originalURL")):
+            return node
+        for child in node.values():
+            found = _find_link_dict(child)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for child in node:
+            found = _find_link_dict(child)
+            if found:
+                return found
+    return None
+
+
+def _artist_from_node(node):
+    if not isinstance(node, dict):
+        return None
+    direct = _first_str(node.get("artist"), node.get("artistName"), node.get("albumArtist"))
+    if direct:
+        return direct
+    for child in node.values():
+        if isinstance(child, dict):
+            found = _artist_from_node(child)
+            if found:
+                return found
+    return None
+
+
+def attachment_is_plugin_payload(att):
+    blob = " ".join([
+        str(att.get("transfer_name") or ""),
+        str(att.get("filename") or ""),
+        str(att.get("uti") or ""),
+    ]).lower()
+    return "pluginpayload" in blob
+
+
+def extract_link_preview(payload_blob, message_text, balloon_bundle_id, attachments):
+    """
+    Pull URL, title, subtitle, artist, and site name out of payload_data.
+    Accepts a plain binary plist or an NSKeyedArchiver LPLinkMetadata archive.
+    The raw pluginPayloadAttachment stays on `attachments` for callers that need bytes.
+    """
+    decoded = decode_payload_object(payload_blob)
+    meta = _find_link_dict(decoded) if decoded is not None else None
+    url = title = subtitle = site_name = artist = None
+    if isinstance(meta, dict):
+        url = _first_str(meta.get("URL"), meta.get("url"), meta.get("originalURL"))
+        title = _first_str(meta.get("title"))
+        subtitle = _first_str(meta.get("summary"), meta.get("subtitle"))
+        site_name = _first_str(meta.get("siteName"), meta.get("site_name"))
+        artist = _artist_from_node(meta.get("specialization")) or _artist_from_node(meta)
+        if artist and title and artist == title:
+            artist = _artist_from_node(meta.get("specialization"))
+    balloon = balloon_bundle_id or ""
+    is_linkish = (
+        "URLBalloon" in balloon
+        or "RichLink" in balloon
+        or "spotify" in balloon.lower()
+        or any(attachment_is_plugin_payload(att) for att in attachments)
+    )
+    if not url and is_linkish and message_text:
+        match = _URL_RE.search(message_text)
+        if match:
+            url = match.group(0)
+    if artist is None and subtitle and site_name and "spotify" in site_name.lower():
+        artist = subtitle
+    if meta is None and not is_linkish:
+        return None
+    if not any([url, title, subtitle, site_name, artist]):
+        return None
+    return {
+        "url": url,
+        "title": title,
+        "subtitle": subtitle,
+        "artist": artist,
+        "site_name": site_name,
+    }
+
+
+def lookup_message_guids(cursor, guids):
+    cleaned = [g for g in dict.fromkeys(guids) if g]
+    if not cleaned:
+        return {}
+    placeholders = ",".join(["?"] * len(cleaned))
+    try:
+        cursor.execute(
+            f"SELECT ROWID, guid FROM message WHERE guid IN ({placeholders})",
+            cleaned,
+        )
+    except sqlite3.OperationalError:
+        return {}
+    return {guid: rowid for rowid, guid in cursor.fetchall() if guid}
+
+
+def build_reaction_record(row, cmap, prefer_contact_name, guid_to_id):
+    _code, reaction_type, action = classify_associated_type(row.get("associated_message_type"))
+    target_guid = target_guid_from_associated(row.get("associated_message_guid"))
+    emoji = row.get("associated_message_emoji") or None
+    if reaction_type != "emoji":
+        emoji = None
+    elif isinstance(emoji, str):
+        emoji = emoji or None
+    sender, handle, participant = sender_identity(
+        bool(row.get("is_from_me")), row.get("handle"), cmap, prefer_contact_name
+    )
+    human, iso = format_apple_ns(row.get("date_ns"))
+    return {
+        "msg_id": row["msg_id"],
+        "guid": row.get("guid"),
+        "type": reaction_type,
+        "action": action,
+        "emoji": emoji,
+        "sender": sender,
+        "handle": handle,
+        "participant": participant,
+        "is_from_me": bool(row.get("is_from_me")),
+        "target_msg_id": guid_to_id.get(target_guid) if target_guid else None,
+        "target_guid": target_guid,
+        "associated_message_guid": row.get("associated_message_guid"),
+        "associated_message_type": int(row.get("associated_message_type") or 0),
+        "timestamp": human,
+        "timestamp_iso": iso,
+    }
+
+
+def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
+    is_from_me = bool(row.get("is_from_me"))
+    sender, handle, participant = sender_identity(
+        is_from_me, row.get("handle"), cmap, prefer_contact_name
+    )
+    human, iso = format_apple_ns(row.get("date_ns"))
+    display_name = row.get("display_name") or ""
+    chat_ident = row.get("chat_identifier") or ""
+    chat = display_name if display_name else chat_ident
+    att_list = attachments_map.get(row["msg_id"], [])
+    msg_text, is_audio, transcription = synthesize_message_text(
+        row.get("text"), row.get("attributed_body"), row.get("is_audio_message"), att_list
+    )
+    is_edited, edit_count, last_edited, edit_history = parse_edit_history(
+        row.get("summary_blob"), row.get("date_edited_ns") or 0, row.get("date_ns") or 0
+    )
+    link_preview = extract_link_preview(
+        row.get("payload_data"), msg_text, row.get("balloon_bundle_id"), att_list
+    )
+    return {
+        "kind": "message",
+        "msg_id": row["msg_id"],
+        "guid": row.get("guid"),
+        "timestamp": human,
+        "timestamp_iso": iso,
+        "chat": chat,
+        "chat_id": row.get("chat_id"),
+        "sender": sender,
+        "handle": handle,
+        "participant": participant,
+        "is_from_me": is_from_me,
+        "text": msg_text,
+        "is_audio_message": is_audio,
+        "transcription": transcription,
+        "is_edited": is_edited,
+        "has_edits": is_edited,
+        "edit_count": edit_count,
+        "last_edited": last_edited,
+        "last_edited_iso": last_edited_iso(edit_history, row.get("date_edited_ns") or 0) if is_edited else None,
+        "edit_history": edit_history,
+        "attachments": att_list,
+        "link_preview": link_preview,
+        "balloon_bundle_id": row.get("balloon_bundle_id"),
+        "reactions": [],
+    }
+
+
+def reaction_list_item(row, reaction, cmap, prefer_contact_name):
+    """Structured tapback. text is null so the Loved/Liked quote is not repeated as a message."""
+    item = base_message_fields(row, cmap, prefer_contact_name, {})
+    item["kind"] = "reaction"
+    item["text"] = None
+    item["link_preview"] = None
+    item["reactions"] = []
+    item["reaction"] = reaction
+    return item
+
+
+def present_rows(cursor, rows, cmap, prefer_contact_name, reactions_mode):
+    if not rows:
+        return []
+    msg_ids = [row["msg_id"] for row in rows]
+    attachments_map = fetch_attachments_for_messages(cursor, msg_ids)
+    target_guids = []
+    for row in rows:
+        if classify_associated_type(row.get("associated_message_type")):
+            guid = target_guid_from_associated(row.get("associated_message_guid"))
+            if guid:
+                target_guids.append(guid)
+    guid_to_id = lookup_message_guids(cursor, target_guids)
+    for row in rows:
+        if row.get("guid"):
+            guid_to_id.setdefault(row["guid"], row["msg_id"])
+
+    by_id = {}
+    by_guid = {}
+    for row in rows:
+        if classify_associated_type(row.get("associated_message_type")):
+            continue
+        item = base_message_fields(row, cmap, prefer_contact_name, attachments_map)
+        by_id[item["msg_id"]] = item
+        if item.get("guid"):
+            by_guid[item["guid"]] = item
+
+    if reactions_mode == "separate":
+        items = []
+        for row in rows:
+            if classify_associated_type(row.get("associated_message_type")):
+                reaction = build_reaction_record(row, cmap, prefer_contact_name, guid_to_id)
+                items.append(reaction_list_item(row, reaction, cmap, prefer_contact_name))
+            else:
+                items.append(by_id[row["msg_id"]])
+        return items
+
+    attached_ids = set()
+    built_reactions = {}
+    for row in rows:
+        if not classify_associated_type(row.get("associated_message_type")):
+            continue
+        reaction = build_reaction_record(row, cmap, prefer_contact_name, guid_to_id)
+        built_reactions[row["msg_id"]] = reaction
+        target = by_guid.get(reaction.get("target_guid")) if reaction.get("target_guid") else None
+        if target is None and reaction.get("target_msg_id") in by_id:
+            target = by_id[reaction["target_msg_id"]]
+        if target is not None:
+            target["reactions"].append(reaction)
+            attached_ids.add(row["msg_id"])
+
+    items = []
+    for row in rows:
+        if classify_associated_type(row.get("associated_message_type")):
+            if row["msg_id"] in attached_ids:
+                continue
+            reaction = built_reactions[row["msg_id"]]
+            items.append(reaction_list_item(row, reaction, cmap, prefer_contact_name))
+        else:
+            items.append(by_id[row["msg_id"]])
+    return items
+
+
+def annotate_batch(items, scanned_rows, since_input):
+    emitted = {item["msg_id"] for item in items}
+    ordered_rows = sorted(scanned_rows, key=lambda row: row["msg_id"])
+    max_id = ordered_rows[-1]["msg_id"] if ordered_rows else since_input
+    ordered_items = sorted(items, key=lambda item: item["msg_id"])
+    idx = 0
+    for item in ordered_items:
+        skipped = 0
+        while idx < len(ordered_rows) and ordered_rows[idx]["msg_id"] < item["msg_id"]:
+            row = ordered_rows[idx]
+            if row["msg_id"] not in emitted and classify_associated_type(row.get("associated_message_type")):
+                skipped += 1
+            idx += 1
+        item["skipped_before"] = {"reaction": skipped}
+        item["next_since_msg_id"] = max_id
+        if idx < len(ordered_rows) and ordered_rows[idx]["msg_id"] == item["msg_id"]:
+            idx += 1
+    filtered = 0
+    for row in ordered_rows:
+        if row["msg_id"] not in emitted and classify_associated_type(row.get("associated_message_type")):
+            filtered += 1
+    return {"reaction": filtered}, max_id
+
+
+def emit_read_result(args, items, filtered, next_since, has_more, text_header, text_lines):
+    if getattr(args, "json", False):
+        if getattr(args, "with_meta", False):
+            print(json.dumps({
+                "messages": items,
+                "filtered": filtered,
+                "next_since_msg_id": next_since,
+                "has_more": bool(has_more),
+            }, indent=2))
+        else:
+            print(json.dumps(items, indent=2))
+        return
+    print(text_header)
+    print("=" * 85)
+    for line in text_lines:
+        print(line)
+
+
+def format_item_line(item, prefix_chat=False):
+    if item.get("kind") == "reaction":
+        reaction = item.get("reaction") or {}
+        emoji = f" {reaction['emoji']}" if reaction.get("emoji") else ""
+        target = reaction.get("target_msg_id")
+        target_bit = f" -> #{target}" if target else ""
+        return (
+            f"[{item['timestamp']}] {item['sender']} reaction "
+            f"{reaction.get('type')}{emoji} {reaction.get('action')}{target_bit}"
+        )
+    edit_marker = f" [Edited ({item['edit_count']}x)]" if item.get("is_edited") else ""
+    msg_text = item.get("text") or ""
+    if item.get("attachments"):
+        att_strs = []
+        for att in item["attachments"]:
+            dur_str = f", duration: {att['duration_formatted']}" if att.get("duration_formatted") else ""
+            path_str = f", path: {att['filename']}" if att.get("filename") else ""
+            att_strs.append(
+                f"[Attachment: {att['transfer_name']} ({att['mime_type']}, {att['size']}{dur_str}{path_str})]"
+            )
+        att_desc = " ".join(att_strs)
+        if msg_text and not msg_text.startswith("[voice note") and msg_text != "<empty message>":
+            msg_text = f"{msg_text} {att_desc}".strip()
+        elif msg_text.startswith("[voice note"):
+            msg_text = f"{msg_text} {att_desc}".strip()
+        else:
+            msg_text = att_desc or msg_text
+    preview = item.get("link_preview")
+    if preview:
+        bits = [preview.get("title"), preview.get("artist") or preview.get("subtitle"), preview.get("site_name")]
+        summary = " | ".join([b for b in bits if b])
+        if summary:
+            msg_text = f"{msg_text} [link: {summary}]".strip()
+    if item.get("reactions"):
+        bits = []
+        for reaction in item["reactions"]:
+            emoji = f" {reaction['emoji']}" if reaction.get("emoji") else ""
+            bits.append(f"{reaction['type']}{emoji} {reaction['action']} by {reaction['sender']}")
+        msg_text = f"{msg_text} [reactions: {'; '.join(bits)}]"
+    chat_bit = f" [{item['chat']}]" if prefix_chat else ""
+    return f"[{item['timestamp']}]{edit_marker}{chat_bit} {item['sender']}: {msg_text}"
+
+
+def reaction_predicate(available):
+    if "associated_message_type" not in available:
+        return "0"
+    return (
+        "(COALESCE(m.associated_message_type, 0) BETWEEN 2000 AND 2006 "
+        "OR COALESCE(m.associated_message_type, 0) BETWEEN 3000 AND 3006)"
+    )
+
+
+def finish_no_chat(conn, args, target):
+    if getattr(args, "json", False):
+        if getattr(args, "with_meta", False):
+            since = getattr(args, "since_msg_id", None)
+            print(json.dumps({
+                "messages": [],
+                "filtered": {"reaction": 0},
+                "next_since_msg_id": since,
+                "has_more": False,
+            }, indent=2))
+        else:
+            print(json.dumps([]))
+        conn.close()
+        return
+    print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
+    conn.close()
+    sys.exit(1)
+
+
+def presentation_options(args):
+    if getattr(args, "include_filtered", False):
+        return "separate"
+    mode = getattr(args, "reactions", None) or "attach"
+    if mode not in ("attach", "separate"):
+        return "attach"
+    return mode
+
+
+def fetch_reactions_for_messages(cursor, select_sql, chat_ids, message_rows, available):
+    if "associated_message_type" not in available:
+        return []
+    guids = [row.get("guid") for row in message_rows if row.get("guid")]
+    if not guids:
+        return []
+    placeholders = chat_placeholders(chat_ids)
+    guid_clauses = []
+    params = list(chat_ids)
+    for guid in guids:
+        guid_clauses.append(
+            "(m.associated_message_guid = ? OR m.associated_message_guid = ? OR m.associated_message_guid LIKE ?)"
+        )
+        params.extend([guid, f"bp:{guid}", f"p:%/{guid}"])
+    where = (
+        f"c.ROWID IN ({placeholders}) AND {reaction_predicate(available)} "
+        f"AND ({' OR '.join(guid_clauses)})"
+    )
+    return fetch_message_dicts(cursor, select_sql, where, params)
+
+
+def dedupe_rows(rows):
+    seen = set()
+    ordered = []
+    for row in sorted(rows, key=lambda item: item["msg_id"]):
+        if row["msg_id"] in seen:
+            continue
+        seen.add(row["msg_id"])
+        ordered.append(row)
+    return ordered
+
+
+def add_read_presentation_args(parser, *, with_limit=False, with_days=False, default_limit=5):
+    if with_days:
+        parser.add_argument("--days", type=int, default=14, help="Days of history to fetch (default 14)")
+    if with_limit:
+        parser.add_argument("--limit", type=int, default=default_limit, help=f"Maximum rows to return (default {default_limit})")
+    parser.add_argument(
+        "--since-msg-id",
+        type=int,
+        default=None,
+        help="Only rows in this chat with ROWID strictly greater than this id (polling cursor)",
+    )
+    parser.add_argument(
+        "--reactions",
+        choices=["attach", "separate"],
+        default="attach",
+        help="Attach tapbacks to the message they target, or list them as structured records",
+    )
+    parser.add_argument(
+        "--include-filtered",
+        action="store_true",
+        help="Keep filtered rows (tapbacks) inline as structured records so ids are visible",
+    )
+    parser.add_argument(
+        "--with-meta",
+        action="store_true",
+        help="Wrap JSON as {messages, filtered, next_since_msg_id, has_more}",
+    )
+    parser.add_argument("--json", action="store_true", help="Output results in JSON format")
 
 def read_messages(args):
     conn = get_db_connection()
     cursor = conn.cursor()
     target = args.chat
-    
-    chat_ids = []
-    if target.isdigit():
-        chat_ids = [int(target)]
-    else:
-        cursor.execute(
-            "SELECT ROWID FROM chat WHERE display_name LIKE ? OR chat_identifier LIKE ?", 
-            (f"%{target}%", f"%{target}%")
-        )
-        chat_ids = [r[0] for r in cursor.fetchall()]
-        
+    chat_ids = resolve_chat_ids(cursor, target)
     if not chat_ids:
-        if getattr(args, 'json', False):
-            print(json.dumps([]))
-            conn.close()
-            return
-        print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
-        conn.close()
-        sys.exit(1)
-        
-    placeholders = ",".join(["?"] * len(chat_ids))
-    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+        finish_no_chat(conn, args, target)
+        return
+
+    available = message_column_names(cursor)
+    select_sql = message_select_list(available)
+    placeholders = chat_placeholders(chat_ids)
     now = datetime.datetime.now(datetime.timezone.utc)
     threshold_dt = now - datetime.timedelta(days=args.days)
-    threshold_ns = int((threshold_dt - apple_epoch).total_seconds() * 1_000_000_000)
-    
-    query = f"""
-    SELECT 
-        m.ROWID,
-        c.display_name,
-        c.chat_identifier,
-        m.date,
-        m.is_from_me,
-        h.id,
-        m.text,
-        m.attributedBody,
-        m.date_edited,
-        m.message_summary_info,
-        m.is_audio_message
-    FROM message m
-    JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-    JOIN chat c ON cmj.chat_id = c.ROWID
-    LEFT JOIN handle h ON m.handle_id = h.ROWID
-    WHERE c.ROWID IN ({placeholders}) AND m.date >= ?
-    ORDER BY m.date ASC
-    """
-    cursor.execute(query, (*chat_ids, threshold_ns))
-    rows = cursor.fetchall()
-    
-    msg_ids = [r[0] for r in rows]
-    attachments_map = fetch_attachments_for_messages(cursor, msg_ids)
-
-    messages = []
-    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob, is_audio_msg in rows:
-        sec = date_ns / 1_000_000_000
-        dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
-        dt_local = dt_utc.astimezone()
-        ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
-        sender = "Me" if is_from_me else (handle or "Unknown")
-        chat = display_name if display_name else chat_ident
-        att_list = attachments_map.get(msg_id, [])
-        msg_text, is_audio, transcription = synthesize_message_text(text, attr_body, is_audio_msg, att_list)
-        is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
-        messages.append({
-            'msg_id': msg_id,
-            'timestamp': ts,
-            'chat': chat,
-            'sender': sender,
-            'is_from_me': bool(is_from_me),
-            'text': msg_text,
-            'is_audio_message': is_audio,
-            'transcription': transcription,
-            'is_edited': is_edited,
-            'has_edits': is_edited,
-            'edit_count': edit_count,
-            'last_edited': last_edited,
-            'edit_history': edit_history,
-            'attachments': att_list
-        })
-
-    if getattr(args, 'json', False):
-        print(json.dumps(messages, indent=2))
-    else:
-        print(f"READING MESSAGES FROM THE LAST {args.days} DAYS FOR '{target}' ({len(rows)} messages found):")
-        print("=" * 85)
-        for m in messages:
-            msg_text = m['text']
-            if m['attachments']:
-                att_strs = []
-                for att in m['attachments']:
-                    dur_str = f", duration: {att['duration_formatted']}" if att.get('duration_formatted') else ""
-                    path_str = f", path: {att['filename']}" if att['filename'] else ""
-                    att_strs.append(f"[Attachment: {att['transfer_name']} ({att['mime_type']}, {att['size']}{dur_str}{path_str})]")
-                att_desc = " ".join(att_strs)
-                if not msg_text.startswith('[voice note') and msg_text != "<empty message>":
-                    msg_text = f"{msg_text} {att_desc}".strip()
-                elif msg_text.startswith('[voice note'):
-                    msg_text = f"{msg_text} {att_desc}".strip()
-                else:
-                    msg_text = att_desc
-            edit_marker = f" [Edited ({m['edit_count']}x)]" if m['is_edited'] else ""
-            print(f"[{m['timestamp']}]{edit_marker} [{m['chat']}] {m['sender']}: {msg_text}")
+    threshold_ns = int((threshold_dt - APPLE_EPOCH).total_seconds() * 1_000_000_000)
+    where = f"c.ROWID IN ({placeholders}) AND m.date >= ?"
+    params = [*chat_ids, threshold_ns]
+    since = getattr(args, "since_msg_id", None)
+    if since is not None:
+        where += " AND m.ROWID > ?"
+        params.append(since)
+    where += " ORDER BY m.ROWID ASC"
+    rows = fetch_message_dicts(cursor, select_sql, where, params)
+    mode = presentation_options(args)
+    items = present_rows(cursor, rows, None, False, mode)
+    filtered, next_since = annotate_batch(items, rows, since)
+    header = f"READING MESSAGES FROM THE LAST {args.days} DAYS FOR '{target}' ({len(items)} shown):"
+    lines = [format_item_line(item, prefix_chat=True) for item in items]
+    emit_read_result(args, items, filtered, next_since, False, header, lines)
     conn.close()
 
 def search_messages(args):
     conn = get_db_connection()
     cursor = conn.cursor()
     query_str = args.query
-    limit = args.limit
-    
-    query = """
-    SELECT DISTINCT
-        m.ROWID,
-        c.ROWID as chat_id,
-        c.display_name,
-        c.chat_identifier,
-        m.date,
-        m.is_from_me,
-        h.id,
-        m.text,
-        m.attributedBody,
-        m.date_edited,
-        m.message_summary_info,
-        m.is_audio_message
-    FROM message m
-    JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-    JOIN chat c ON cmj.chat_id = c.ROWID
-    LEFT JOIN handle h ON m.handle_id = h.ROWID
-    LEFT JOIN message_attachment_join maj ON m.ROWID = maj.message_id
-    LEFT JOIN attachment a ON maj.attachment_id = a.ROWID
-    WHERE m.text LIKE ? OR (m.text IS NULL AND m.attributedBody LIKE ?) OR a.user_info LIKE ?
-    ORDER BY m.date DESC
-    LIMIT ?
-    """
-    cursor.execute(query, (f"%{query_str}%", f"%{query_str}%", f"%{query_str}%", limit))
-    rows = cursor.fetchall()
-    
-    msg_ids = [r[0] for r in rows]
-    attachments_map = fetch_attachments_for_messages(cursor, msg_ids)
-
-    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
-    results = []
-    for msg_id, chat_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob, is_audio_msg in rows:
-        sec = date_ns / 1_000_000_000
-        dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
-        dt_local = dt_utc.astimezone()
-        ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
-        sender = "Me" if is_from_me else (handle or "Unknown")
-        chat = display_name if display_name else chat_ident
-        att_list = attachments_map.get(msg_id, [])
-        msg_text, is_audio, transcription = synthesize_message_text(text, attr_body, is_audio_msg, att_list)
-        is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
-        results.append({
-            'msg_id': msg_id,
-            'chat_id': chat_id,
-            'chat': chat,
-            'timestamp': ts,
-            'sender': sender,
-            'is_from_me': bool(is_from_me),
-            'text': msg_text,
-            'is_audio_message': is_audio,
-            'transcription': transcription,
-            'is_edited': is_edited,
-            'has_edits': is_edited,
-            'edit_count': edit_count,
-            'last_edited': last_edited,
-            'edit_history': edit_history,
-            'attachments': att_list
-        })
-
-    if getattr(args, 'json', False):
-        print(json.dumps(results, indent=2))
-    else:
-        print(f"SEARCH RESULTS FOR '{query_str}' ({len(results)} matching messages found):")
-        print("=" * 85)
-        for r in results:
-            edit_marker = f" [Edited ({r['edit_count']}x)]" if r['is_edited'] else ""
-            print(f"[{r['timestamp']}]{edit_marker} [Chat {r['chat_id']}: {r['chat']}] {r['sender']}: {r['text']}")
+    limit = args.limit or 30
+    available = message_column_names(cursor)
+    select_sql = message_select_list(available)
+    where = """(
+        m.text LIKE ?
+        OR (m.text IS NULL AND m.attributedBody LIKE ?)
+        OR EXISTS (
+            SELECT 1 FROM message_attachment_join maj
+            JOIN attachment a ON maj.attachment_id = a.ROWID
+            WHERE maj.message_id = m.ROWID AND a.user_info LIKE ?
+        )
+    )"""
+    params = [f"%{query_str}%", f"%{query_str}%", f"%{query_str}%"]
+    since = getattr(args, "since_msg_id", None)
+    if since is not None:
+        where += " AND m.ROWID > ?"
+        params.append(since)
+    where += " ORDER BY m.date DESC LIMIT ?"
+    params.append(int(limit) + 1)
+    rows = fetch_message_dicts(cursor, select_sql, where, params)
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+    mode = presentation_options(args)
+    items = present_rows(cursor, rows, None, False, mode)
+    filtered, next_since = annotate_batch(items, rows, since)
+    header = f"SEARCH RESULTS FOR '{query_str}' ({len(items)} matching messages found):"
+    lines = []
+    for item in items:
+        line = format_item_line(item)
+        lines.append(f"{line} [Chat {item.get('chat_id')}: {item.get('chat')}]")
+    emit_read_result(args, items, filtered, next_since, has_more, header, lines)
     conn.close()
 
 def search_contacts(args):
@@ -811,7 +1336,7 @@ def get_attachment_payload(args):
     transcription = None
     language = None
     try:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{get_db_path()}?mode=ro", uri=True)
         c = conn.cursor()
         basename = os.path.basename(filepath)
         normpath = filepath.replace(os.path.expanduser('~'), '~')
@@ -866,7 +1391,7 @@ ATTACHMENT_STAGING_DIR = os.path.expanduser("~/Library/Messages/Attachments/imes
 def _resolve_chat(recipient):
     """Resolve recipient to (chat_rowid, chat_identifier) via chat.db; falls back to (None, recipient)."""
     try:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{get_db_path()}?mode=ro", uri=True)
         c = conn.cursor()
         if recipient.isdigit():
             c.execute("SELECT ROWID, chat_identifier FROM chat WHERE ROWID = ?", (int(recipient),))
@@ -989,133 +1514,55 @@ def get_recent_messages(args):
     conn = get_db_connection()
     cursor = conn.cursor()
     target = args.chat
-    limit = getattr(args, 'limit', 5) or 5
-    
-    chat_ids = []
-    if target.isdigit():
-        chat_ids = [int(target)]
-    else:
-        cursor.execute(
-            "SELECT ROWID FROM chat WHERE display_name LIKE ? OR chat_identifier LIKE ?", 
-            (f"%{target}%", f"%{target}%")
-        )
-        chat_ids = [r[0] for r in cursor.fetchall()]
-        
+    limit = getattr(args, "limit", 5) or 5
+    chat_ids = resolve_chat_ids(cursor, target)
     if not chat_ids:
-        if getattr(args, 'json', False):
-            print(json.dumps([]))
-            conn.close()
-            return
-        print(f"ERROR: No chat found matching '{target}'", file=sys.stderr)
-        conn.close()
-        sys.exit(1)
-        
-    placeholders = ",".join(["?"] * len(chat_ids))
-    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
-    
-    query = f"""
-    SELECT 
-        m.ROWID,
-        c.display_name,
-        c.chat_identifier,
-        m.date,
-        m.is_from_me,
-        h.id,
-        m.text,
-        m.attributedBody,
-        m.date_edited,
-        m.message_summary_info,
-        m.is_audio_message
-    FROM message m
-    JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-    JOIN chat c ON cmj.chat_id = c.ROWID
-    LEFT JOIN handle h ON m.handle_id = h.ROWID
-    WHERE c.ROWID IN ({placeholders})
-    ORDER BY m.date DESC
-    LIMIT ?
-    """
-    cursor.execute(query, (*chat_ids, limit))
-    rows = cursor.fetchall()
-    rows.reverse()
-    
-    msg_ids = [r[0] for r in rows]
-    attachments_map = fetch_attachments_for_messages(cursor, msg_ids)
+        finish_no_chat(conn, args, target)
+        return
 
-    cmap = get_contacts_map()
-    messages = []
-    for msg_id, display_name, chat_ident, date_ns, is_from_me, handle, text, attr_body, date_edited_ns, summary_blob, is_audio_msg in rows:
-        sec = date_ns / 1_000_000_000
-        dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
-        dt_local = dt_utc.astimezone()
-        ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
-        
-        sender_name = "Me"
-        if not is_from_me:
-            norm = normalize_handle(handle)
-            sender_name = cmap.get(norm, handle or "Unknown")
-
-        chat = display_name if display_name else chat_ident
-        att_list = attachments_map.get(msg_id, [])
-        msg_text, is_audio, transcription = synthesize_message_text(text, attr_body, is_audio_msg, att_list)
-        is_edited, edit_count, last_edited, edit_history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
-
-        messages.append({
-            'msg_id': msg_id,
-            'timestamp': ts,
-            'chat': chat,
-            'sender': sender_name,
-            'handle': handle or "",
-            'is_from_me': bool(is_from_me),
-            'text': msg_text,
-            'is_audio_message': is_audio,
-            'transcription': transcription,
-            'is_edited': is_edited,
-            'has_edits': is_edited,
-            'edit_count': edit_count,
-            'last_edited': last_edited,
-            'edit_history': edit_history,
-            'attachments': att_list
-        })
-
-    if getattr(args, 'json', False):
-        print(json.dumps(messages, indent=2))
+    available = message_column_names(cursor)
+    select_sql = message_select_list(available)
+    placeholders = chat_placeholders(chat_ids)
+    since = getattr(args, "since_msg_id", None)
+    mode = presentation_options(args)
+    has_more = False
+    if since is not None:
+        # One range read: chat_message_join.chat_id plus message.ROWID > cursor.
+        # Limit counts raw rows (including tapbacks) so the cursor cannot skip them.
+        where = f"c.ROWID IN ({placeholders}) AND m.ROWID > ? ORDER BY m.ROWID ASC LIMIT ?"
+        params = [*chat_ids, since, int(limit) + 1]
+        rows = fetch_message_dicts(cursor, select_sql, where, params)
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
     else:
-        print(f"LAST {len(messages)} RECENT MESSAGES FOR '{target}':")
-        print("=" * 85)
-        for m in messages:
-            edit_marker = f" [Edited ({m['edit_count']}x)]" if m['is_edited'] else ""
-            print(f"[{m['timestamp']}]{edit_marker} {m['sender']}: {m['text']}")
+        predicate = reaction_predicate(available)
+        # Newest N visible messages. has_more stays false here: this is not a forward page.
+        # since_msg_id is what pages forward, and only that path counts raw rows against limit.
+        where = f"c.ROWID IN ({placeholders}) AND NOT ({predicate}) ORDER BY m.ROWID DESC LIMIT ?"
+        params = [*chat_ids, int(limit)]
+        rows = fetch_message_dicts(cursor, select_sql, where, params)
+        has_more = False
+        rows.reverse()
+        if rows:
+            rows = dedupe_rows(rows + fetch_reactions_for_messages(
+                cursor, select_sql, chat_ids, rows, available
+            ))
+    cmap = get_contacts_map()
+    items = present_rows(cursor, rows, cmap, True, mode)
+    filtered, next_since = annotate_batch(items, rows, since)
+    header = f"LAST {len(items)} RECENT MESSAGES FOR '{target}':"
+    lines = [format_item_line(item) for item in items]
+    emit_read_result(args, items, filtered, next_since, has_more, header, lines)
     conn.close()
-
 def get_edit_history(args):
     conn = get_db_connection()
     cursor = conn.cursor()
     msg_id = args.message_id
-
-    query = """
-    SELECT 
-        m.ROWID,
-        c.ROWID as chat_id,
-        COALESCE(c.display_name, ''),
-        c.chat_identifier,
-        m.date,
-        m.date_edited,
-        m.is_from_me,
-        h.id,
-        m.text,
-        m.attributedBody,
-        m.message_summary_info,
-        m.is_audio_message
-    FROM message m
-    LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-    LEFT JOIN chat c ON cmj.chat_id = c.ROWID
-    LEFT JOIN handle h ON m.handle_id = h.ROWID
-    WHERE m.ROWID = ?
-    LIMIT 1
-    """
-    cursor.execute(query, (msg_id,))
-    row = cursor.fetchone()
-    if not row:
+    available = message_column_names(cursor)
+    select_sql = message_select_list(available)
+    rows = fetch_message_dicts(cursor, select_sql, "m.ROWID = ? LIMIT 1", (msg_id,), MESSAGE_FROM_LOOSE)
+    if not rows:
         if getattr(args, 'json', False):
             print(json.dumps({'error': f'Message #{msg_id} not found'}))
         else:
@@ -1123,70 +1570,60 @@ def get_edit_history(args):
         conn.close()
         sys.exit(1)
 
-    row_id, chat_id, display_name, chat_ident, date_ns, date_edited_ns, is_from_me, handle, text, attr_body, summary_blob, is_audio_msg = row
-
-    apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
-    sec = (date_ns or 0) / 1_000_000_000
-    dt_utc = apple_epoch + datetime.timedelta(seconds=sec)
-    dt_local = dt_utc.astimezone()
-    ts = dt_local.strftime("%Y-%m-%d %I:%M %p")
-
+    row = rows[0]
     cmap = get_contacts_map()
-    sender_name = "Me"
-    if not is_from_me:
-        norm = normalize_handle(handle)
-        sender_name = cmap.get(norm, handle or "Unknown")
-
-    chat = display_name if display_name else (chat_ident or "Unknown")
-    
-    attachments_map = fetch_attachments_for_messages(cursor, [row_id])
-    att_list = attachments_map.get(row_id, [])
-    msg_text, is_audio, transcription = synthesize_message_text(text, attr_body, is_audio_msg, att_list)
-
-    is_edited, edit_count, last_edited, history = parse_edit_history(summary_blob, date_edited_ns, date_ns)
-
+    attachments_map = fetch_attachments_for_messages(cursor, [row["msg_id"]])
+    item = base_message_fields(row, cmap, True, attachments_map)
+    history = item["edit_history"]
     if not history:
         history = [{
             'revision': 0,
             'label': 'original',
-            'timestamp': ts,
-            'text': msg_text
+            'timestamp': item['timestamp'],
+            'timestamp_iso': item['timestamp_iso'],
+            'text': item['text']
         }]
 
     result = {
-        'msg_id': row_id,
-        'chat_id': chat_id,
-        'chat': chat,
-        'sender': sender_name,
-        'is_from_me': bool(is_from_me),
-        'timestamp': ts,
-        'is_audio_message': is_audio,
-        'transcription': transcription,
-        'is_edited': is_edited,
-        'has_edits': is_edited,
-        'edit_count': edit_count,
-        'last_edited': last_edited,
-        'current_text': msg_text,
+        'msg_id': item['msg_id'],
+        'guid': item['guid'],
+        'chat_id': item['chat_id'],
+        'chat': item['chat'] or 'Unknown',
+        'sender': item['sender'],
+        'handle': item['handle'],
+        'participant': item['participant'],
+        'is_from_me': item['is_from_me'],
+        'timestamp': item['timestamp'],
+        'timestamp_iso': item['timestamp_iso'],
+        'is_audio_message': item['is_audio_message'],
+        'transcription': item['transcription'],
+        'is_edited': item['is_edited'],
+        'has_edits': item['has_edits'],
+        'edit_count': item['edit_count'],
+        'last_edited': item['last_edited'],
+        'last_edited_iso': item['last_edited_iso'],
+        'current_text': item['text'],
         'edit_history': history,
-        'attachments': att_list
+        'attachments': item['attachments'],
+        'link_preview': item['link_preview'],
     }
 
     if getattr(args, 'json', False):
         print(json.dumps(result, indent=2))
     else:
-        if is_edited:
-            print(f"EDIT HISTORY FOR MESSAGE #{row_id} ({edit_count} edits, last edited: {last_edited}):")
+        if item['is_edited']:
+            print(f"EDIT HISTORY FOR MESSAGE #{item['msg_id']} ({item['edit_count']} edits, last edited: {item['last_edited']}):")
             print("=" * 85)
-            print(f"Chat: {chat} (ID: {chat_id}) | Sender: {sender_name} | Current: {msg_text}")
+            print(f"Chat: {result['chat']} (ID: {item['chat_id']}) | Sender: {item['sender']} | Current: {item['text']}")
             print("-" * 85)
             for h in history:
                 label_display = "[Original]" if h['revision'] == 0 else f"[Edit {h['revision']}]"
                 print(f"{label_display:<12} {h['timestamp']}: {h['text']}")
         else:
-            print(f"Message #{row_id} has no edit history (original message only).")
+            print(f"Message #{item['msg_id']} has no edit history (original message only).")
             print("=" * 85)
-            print(f"Chat: {chat} | Sender: {sender_name} | Date: {ts}")
-            print(f"Text: {msg_text}")
+            print(f"Chat: {result['chat']} | Sender: {item['sender']} | Date: {item['timestamp']}")
+            print(f"Text: {item['text']}")
     conn.close()
 
 def edit_message(args):
@@ -1422,21 +1859,18 @@ def main():
     list_parser.set_defaults(func=list_chats)
     
     read_parser = subparsers.add_parser("read", help="Read recent messages from a chat")
-    read_parser.add_argument("chat", help="Chat ID, display name, or contact identifier")
-    read_parser.add_argument("--days", type=int, default=14, help="Days of history to fetch (default 14)")
-    read_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    read_parser.add_argument("chat", help="Numeric chat ROWID (list/chat_id), display name, phone number, or email")
+    add_read_presentation_args(read_parser, with_days=True)
     read_parser.set_defaults(func=read_messages)
 
     recent_parser = subparsers.add_parser("recent", help="Get recent messages preview")
-    recent_parser.add_argument("chat", help="Chat ID, display name, or contact identifier")
-    recent_parser.add_argument("--limit", type=int, default=5, help="Number of recent messages to preview (default 5)")
-    recent_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    recent_parser.add_argument("chat", help="Numeric chat ROWID (list/chat_id), display name, phone number, or email")
+    add_read_presentation_args(recent_parser, with_limit=True)
     recent_parser.set_defaults(func=get_recent_messages)
 
     search_parser = subparsers.add_parser("search", help="Search message history")
     search_parser.add_argument("query", help="Search keyword or phrase")
-    search_parser.add_argument("--limit", type=int, default=30, help="Max results (default 30)")
-    search_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    add_read_presentation_args(search_parser, with_limit=True, default_limit=30)
     search_parser.set_defaults(func=search_messages)
 
     search_group_parser = subparsers.add_parser("search-group", help="Search group chats by participant names/handles")
