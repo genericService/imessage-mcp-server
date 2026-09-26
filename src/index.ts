@@ -45,9 +45,15 @@ function shellQuote(arg: string): string {
   return `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
+function useSshForCli(): boolean {
+  // An explicit database override is a local fixture or copy; do not hop over SSH.
+  if (process.env.IMESSAGE_DB_PATH) return false;
+  return process.env.IMESSAGE_SSH_FDA !== 'false';
+}
+
 export async function runImessageCli(cliArgs: string[]): Promise<string> {
   try {
-    if (IMESSAGE_SSH_FDA) {
+    if (useSshForCli()) {
       const remoteCommand = [PYTHON_BIN, CLI_PATH, ...cliArgs]
         .map(shellQuote)
         .join(' ');
@@ -86,7 +92,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.2.1';
+const SERVER_VERSION = '1.3.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -131,7 +137,7 @@ const SERVER_INSTRUCTIONS = `
 iMessage MCP Server Instructions:
 1. Discovery: Call 'imessage_list_chats' to discover available conversation IDs, display names, and handles.
 2. Search: Call 'imessage_search_messages' to search past message history by keyword or voice note speech-to-text transcriptions, or 'imessage_search_contacts' to find contacts.
-3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' using a chat ID or contact identifier to review past messages. Messages surface audio voice note transcriptions, durations, and edit history.
+3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' with chat or its alias chat_id. The value is the numeric chat ROWID from imessage_list_chats (rowid / chat_id), or a display name, phone number, or email. Pass since_msg_id to poll only messages with a greater id, and with_meta true to read next_since_msg_id (advance the cursor with that, not the last visible msg_id). Messages include ISO timestamps, link previews, structured reactions, voice note transcriptions, and edit history. Tapbacks are not ordinary text.
 4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
 5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
 6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments (converts HEIC photos to JPEG and CAF voice notes to playable/transcribable M4A audio with on-device speech-to-text transcripts).
@@ -160,40 +166,193 @@ function maskToken(token: string): string {
 }
 
 /**
+ * Argument readers. Schema aliases and these keys stay in lockstep.
+ */
+export function readArg(args: Record<string, unknown> | undefined, keys: readonly string[]): unknown {
+  if (!args) return undefined;
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(args, key)) continue;
+    const value = args[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'string' && value.trim() === '') continue;
+    return value;
+  }
+  return undefined;
+}
+
+export function readStringArg(args: Record<string, unknown> | undefined, keys: readonly string[]): string {
+  const value = readArg(args, keys);
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'string') return value.trim();
+  return '';
+}
+
+export function readIntArg(args: Record<string, unknown> | undefined, keys: readonly string[]): number | undefined {
+  const value = readArg(args, keys);
+  if (value === undefined) return undefined;
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  if (typeof value === 'string' && /^-?\d+$/.test(value.trim())) return parseInt(value.trim(), 10);
+  throw new Error(`Invalid integer for parameter "${keys[0]}"`);
+}
+
+export function readBoolArg(args: Record<string, unknown> | undefined, keys: readonly string[]): boolean {
+  const value = readArg(args, keys);
+  if (value === true) return true;
+  if (value === false || value === undefined) return false;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') return ['1', 'true', 'yes'].includes(value.trim().toLowerCase());
+  return false;
+}
+
+export const CHAT_ARG_KEYS = ['chat', 'chat_id', 'chatId', 'thread_id', 'threadId', 'conversation_id', 'conversationId'] as const;
+
+export function readChatArg(args: Record<string, unknown> | undefined): string {
+  return readStringArg(args, CHAT_ARG_KEYS);
+}
+
+function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
+  const n = value === undefined ? fallback : value;
+  return Math.max(min, Math.min(Math.floor(n), max));
+}
+
+function appendPresentationArgs(cli: string[], args: Record<string, unknown> | undefined): void {
+  const since = readIntArg(args, ['since_msg_id', 'sinceMsgId', 'after_msg_id', 'afterMsgId', 'since_id', 'since']);
+  if (since !== undefined) {
+    if (since < 0) {
+      throw new Error('Invalid parameter "since_msg_id" (non-negative integer message ROWID expected)');
+    }
+    cli.push('--since-msg-id', String(since));
+  }
+  const reactions = readStringArg(args, ['reactions', 'reaction_mode', 'reactions_mode', 'reactionsMode']);
+  if (reactions) {
+    if (reactions !== 'attach' && reactions !== 'separate') {
+      throw new Error('Invalid parameter "reactions" (expected "attach" or "separate")');
+    }
+    cli.push('--reactions', reactions);
+  }
+  if (readBoolArg(args, ['include_filtered', 'includeFiltered'])) {
+    cli.push('--include-filtered');
+  }
+  if (readBoolArg(args, ['with_meta', 'withMeta', 'summary'])) {
+    cli.push('--with-meta');
+  }
+}
+
+const MISSING_CHAT =
+  'Missing required parameter "chat" (also accepted as chat_id, chatId, thread_id, or conversation_id). Use the numeric ROWID from imessage_list_chats.';
+
+const CHAT_VALUE_HELP =
+  'Numeric chat ROWID from imessage_list_chats (field `rowid`, also returned as `chat_id`), for example "46". A display name, phone number, or email also matches. Call imessage_list_chats to discover the ROWID.';
+
+const chatArgProperties = {
+  chat: {
+    type: 'string',
+    description: `Conversation to read. ${CHAT_VALUE_HELP}`
+  },
+  chat_id: {
+    type: 'string',
+    description: `Alias of chat. ${CHAT_VALUE_HELP}`
+  },
+  chatId: {
+    type: 'string',
+    description: 'Alias of chat / chat_id. Same accepted values.'
+  },
+  thread_id: {
+    type: 'string',
+    description: 'Alias of chat. Same accepted values.'
+  },
+  conversation_id: {
+    type: 'string',
+    description: 'Alias of chat. Same accepted values.'
+  }
+};
+
+const chatAnyOf = [
+  { required: ['chat'] },
+  { required: ['chat_id'] },
+  { required: ['chatId'] },
+  { required: ['thread_id'] },
+  { required: ['conversation_id'] }
+];
+
+const readWindowProperties = {
+  since_msg_id: {
+    type: 'number',
+    description:
+      'Polling cursor. When set, return only rows in this chat whose message ROWID is strictly greater than this id (a single indexed range read). Pair with with_meta and advance the cursor using next_since_msg_id, which includes filtered tapback ids. Aliases: sinceMsgId, after_msg_id, since_id, since.'
+  },
+  sinceMsgId: { type: 'number', description: 'Alias of since_msg_id.' },
+  after_msg_id: { type: 'number', description: 'Alias of since_msg_id.' },
+  since_id: { type: 'number', description: 'Alias of since_msg_id.' },
+  since: {
+    type: 'number',
+    description: 'Alias of since_msg_id when the value is a message ROWID, not a calendar timestamp.'
+  },
+  reactions: {
+    type: 'string',
+    enum: ['attach', 'separate'],
+    description:
+      'How to return tapbacks. "attach" (default) nests them on the target message. "separate" lists each tapback as a structured record (kind "reaction") in id order. Tapbacks are never repeated as Loved/Liked text. Alias: reactions_mode.'
+  },
+  reactions_mode: {
+    type: 'string',
+    enum: ['attach', 'separate'],
+    description: 'Alias of reactions.'
+  },
+  include_filtered: {
+    type: 'boolean',
+    description:
+      'When true, filtered rows such as tapbacks are included inline as structured records so their ids are visible. Alias: includeFiltered.'
+  },
+  includeFiltered: { type: 'boolean', description: 'Alias of include_filtered.' },
+  with_meta: {
+    type: 'boolean',
+    description:
+      'When true, wrap JSON as {messages, filtered, next_since_msg_id, has_more}. filtered counts omitted rows by kind (reaction). Advance a poll with next_since_msg_id. Aliases: withMeta, summary.'
+  },
+  withMeta: { type: 'boolean', description: 'Alias of with_meta.' },
+  summary: { type: 'boolean', description: 'Alias of with_meta.' }
+};
+
+/**
  * Detailed MCP tool definitions for iMessage integration.
  */
-const TOOLS: Tool[] = [
+export const TOOLS: Tool[] = [
   {
     name: 'imessage_list_chats',
     description:
-      'List active iMessage chats and conversations. Returns chat ROWIDs, display names, contact identifiers (phone numbers or emails), and recent activity order. Use this tool first to discover chat identifiers before reading or sending messages.',
+      'List active iMessage chats and conversations. Returns chat ROWIDs (`rowid` and `chat_id`), display names, contact identifiers (phone numbers or emails), and recent activity order. Pass that ROWID as `chat` or `chat_id` to read or poll a thread.',
     inputSchema: {
       type: 'object',
       properties: {
         limit: {
           type: 'number',
-          description: 'Maximum number of recent chats to return (default: 30, max: 100).'
-        }
+          description: 'Maximum number of recent chats to return (default: 30, max: 100). Aliases: count, max.'
+        },
+        count: { type: 'number', description: 'Alias of limit.' },
+        max: { type: 'number', description: 'Alias of limit.' }
       }
     }
   },
   {
     name: 'imessage_read_messages',
     description:
-      'Read recent message history from a specific iMessage chat. Accepts a numeric chat ROWID, contact display name, or phone number/email address. Returned messages indicate voice note audio transcriptions, duration, edit state (is_edited, has_edits, edit_count, last_edited), and include revision history.',
+      'Read recent message history from a specific iMessage chat. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats, or a display name, phone number, or email. Messages include ISO-8601 timestamps, link previews (url, title, subtitle, artist, site_name), structured tapbacks, voice note transcriptions, and edit history. Outgoing rows use sender "Me" with an empty handle; the other party is `participant`.',
     inputSchema: {
       type: 'object',
       properties: {
-        chat: {
-          type: 'string',
-          description: 'Target chat identifier. Can be a numeric chat ROWID (e.g. "46"), a contact name, or phone number (e.g. "+15550199480").'
-        },
+        ...chatArgProperties,
         days: {
           type: 'number',
-          description: 'Number of past days of message history to retrieve (default: 14).'
-        }
+          description: 'Number of past days of message history to retrieve (default: 14). Alias: lookback_days.'
+        },
+        lookback_days: {
+          type: 'number',
+          description: 'Alias of days.'
+        },
+        ...readWindowProperties
       },
-      required: ['chat']
+      anyOf: chatAnyOf
     }
   },
   {
@@ -205,14 +364,35 @@ const TOOLS: Tool[] = [
       properties: {
         query: {
           type: 'string',
-          description: 'Search keyword or phrase to search for across message history.'
+          description: 'Search keyword or phrase to search for across message history. Aliases: q, search.'
+        },
+        q: {
+          type: 'string',
+          description: 'Alias of query.'
+        },
+        search: {
+          type: 'string',
+          description: 'Alias of query.'
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of matching search results to return (default: 30).'
-        }
+          description: 'Maximum number of matching search results to return (default: 30). Aliases: count, max.'
+        },
+        count: {
+          type: 'number',
+          description: 'Alias of limit.'
+        },
+        max: {
+          type: 'number',
+          description: 'Alias of limit.'
+        },
+        ...readWindowProperties
       },
-      required: ['query']
+      anyOf: [
+        { required: ['query'] },
+        { required: ['q'] },
+        { required: ['search'] }
+      ]
     }
   },
   {
@@ -232,16 +412,13 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_get_chat_members',
     description:
-      'Get members and participants of a specific iMessage chat (useful for group chats).',
+      'Get members and participants of a specific iMessage chat (useful for group chats). `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats, or a display name, phone number, or email.',
     inputSchema: {
       type: 'object',
       properties: {
-        chat: {
-          type: 'string',
-          description: 'Chat ROWID or display name to inspect group chat members for.'
-        }
+        ...chatArgProperties
       },
-      required: ['chat']
+      anyOf: chatAnyOf
     }
   },
   {
@@ -253,8 +430,11 @@ const TOOLS: Tool[] = [
       properties: {
         path: {
           type: 'string',
-          description: 'POSIX path to attachment file (e.g. "/Users/matthias/Library/Messages/Attachments/.../IMG_4031.png").'
-        }
+          description: 'POSIX path to attachment file (e.g. "/Users/matthias/Library/Messages/Attachments/.../IMG_4031.png"). Aliases: file, file_path, filepath.'
+        },
+        file: { type: 'string', description: 'Alias of path.' },
+        file_path: { type: 'string', description: 'Alias of path.' },
+        filepath: { type: 'string', description: 'Alias of path.' }
       },
       required: ['path']
     }
@@ -268,7 +448,11 @@ const TOOLS: Tool[] = [
       properties: {
         recipient: {
           type: 'string',
-          description: "Target recipient phone number, email address, group chat display name, or numeric chat ROWID (e.g. '+15550199480', 'user@example.com', '46', or 'chat123456789012345678')."
+          description: "Target recipient phone number, email address, group chat display name, or numeric chat ROWID (e.g. '+15550199480', 'user@example.com', '46', or 'chat123456789012345678'). Alias: to."
+        },
+        to: {
+          type: 'string',
+          description: 'Alias of recipient.'
         },
         message: {
           type: 'string',
@@ -293,20 +477,20 @@ const TOOLS: Tool[] = [
   {
     name: 'imessage_get_recent_messages',
     description:
-      'Preview the last N recent messages from a chat to quickly verify thread context, participants, conversation topic, voice note transcriptions, and message edit history before sending a reply.',
+      'Preview the last N messages in a chat, or poll for rows newer than since_msg_id. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats (`rowid` / `chat_id`), or a display name, phone number, or email. Results include ISO timestamps, link previews, and structured tapbacks (not as Loved/Liked text). Outgoing rows use sender "Me" with an empty handle and a separate `participant`. Pass with_meta to get filtered counts and next_since_msg_id.',
     inputSchema: {
       type: 'object',
       properties: {
-        chat: {
-          type: 'string',
-          description: 'Target chat ROWID, display name, or handle (e.g. "46" or "Chani").'
-        },
+        ...chatArgProperties,
         limit: {
           type: 'number',
-          description: 'Number of recent messages to preview (default: 5, max: 50).'
-        }
+          description: 'Number of recent messages to preview (default: 5, max: 50). With since_msg_id, the limit applies to raw rows so the cursor can page. Aliases: count, max.'
+        },
+        count: { type: 'number', description: 'Alias of limit.' },
+        max: { type: 'number', description: 'Alias of limit.' },
+        ...readWindowProperties
       },
-      required: ['chat']
+      anyOf: chatAnyOf
     }
   },
   {
@@ -319,10 +503,17 @@ const TOOLS: Tool[] = [
         participants: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of participant names or phone numbers to match (e.g. ["Chani", "Paul Atreides"]).'
+          description: 'Array of participant names or phone numbers to match (e.g. ["Chani", "Paul Atreides"]). Alias: participant (a single string or the same array).'
+        },
+        participant: {
+          type: 'string',
+          description: 'Alias of participants when matching a single name or handle.'
         }
       },
-      required: ['participants']
+      anyOf: [
+        { required: ['participants'] },
+        { required: ['participant'] }
+      ]
     }
   },
   {
@@ -334,10 +525,16 @@ const TOOLS: Tool[] = [
       properties: {
         message_id: {
           type: 'number',
-          description: 'Numeric message ROWID (e.g. 198097) to inspect rewrite and edit history for.'
-        }
+          description: 'Numeric message ROWID (e.g. 198097) to inspect rewrite and edit history for. Aliases: msg_id, messageId.'
+        },
+        msg_id: { type: 'number', description: 'Alias of message_id.' },
+        messageId: { type: 'number', description: 'Alias of message_id.' }
       },
-      required: ['message_id']
+      anyOf: [
+        { required: ['message_id'] },
+        { required: ['msg_id'] },
+        { required: ['messageId'] }
+      ]
     }
   },
   {
@@ -349,14 +546,28 @@ const TOOLS: Tool[] = [
       properties: {
         message_id: {
           type: 'number',
-          description: 'Numeric message ROWID of the outgoing message to edit.'
+          description: 'Numeric message ROWID of the outgoing message to edit. Aliases: msg_id, messageId.'
         },
+        msg_id: { type: 'number', description: 'Alias of message_id.' },
+        messageId: { type: 'number', description: 'Alias of message_id.' },
         new_text: {
           type: 'string',
-          description: 'New revised text content for the message.'
-        }
+          description: 'New revised text content for the message. Aliases: newText, text.'
+        },
+        newText: { type: 'string', description: 'Alias of new_text.' },
+        text: { type: 'string', description: 'Alias of new_text.' }
       },
-      required: ['message_id', 'new_text']
+      anyOf: [
+        { required: ['message_id', 'new_text'] },
+        { required: ['message_id', 'newText'] },
+        { required: ['message_id', 'text'] },
+        { required: ['msg_id', 'new_text'] },
+        { required: ['msg_id', 'newText'] },
+        { required: ['msg_id', 'text'] },
+        { required: ['messageId', 'new_text'] },
+        { required: ['messageId', 'newText'] },
+        { required: ['messageId', 'text'] }
+      ]
     }
   },
   {
@@ -482,17 +693,18 @@ function createMcpServer(): Server {
     let targetParam: string | undefined = undefined;
     let dryRunParam: boolean | undefined = undefined;
 
+    const toolArgs = args as Record<string, unknown> | undefined;
     if (name === 'imessage_send_message') {
-      targetParam = String(args?.recipient || args?.confirm_token || '');
+      targetParam = readStringArg(toolArgs, ['recipient', 'to', 'confirm_token']);
       dryRunParam = Boolean(args?.dry_run);
     } else if (name === 'imessage_read_messages' || name === 'imessage_get_recent_messages' || name === 'imessage_get_chat_members') {
-      targetParam = String(args?.chat || '');
+      targetParam = readChatArg(toolArgs);
     } else if (name === 'imessage_search_messages' || name === 'imessage_search_contacts') {
-      targetParam = String(args?.query || '');
+      targetParam = readStringArg(toolArgs, ['query', 'q', 'search']);
     } else if (name === 'imessage_get_attachment_payload') {
-      targetParam = String(args?.path || '');
+      targetParam = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
     } else if (name === 'imessage_get_edit_history' || name === 'imessage_edit_message') {
-      targetParam = String(args?.message_id || '');
+      targetParam = readStringArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
     }
 
     try {
@@ -504,50 +716,60 @@ function createMcpServer(): Server {
           content: [{ type: 'text', text: content }]
         };
       } else if (name === 'imessage_list_chats') {
-        const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 100)) : 30;
+        const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
         const stdout = await runImessageCli(['list', '--limit', String(limit), '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_read_messages') {
-        const chat = String(args?.chat || '').trim();
-        const days = typeof args?.days === 'number' ? Math.max(1, Math.min(Math.floor(args.days), 365)) : 14;
+        const chat = readChatArg(toolArgs);
+        const days = clampInt(readIntArg(toolArgs, ['days', 'lookback_days', 'lookbackDays']), 14, 1, 365);
         if (!chat) {
-          throw new Error('Missing required parameter "chat"');
+          throw new Error(MISSING_CHAT);
         }
-        const stdout = await runImessageCli(['read', chat, '--days', String(days), '--json']);
+        const cliArgs = ['read', chat, '--days', String(days), '--json'];
+        appendPresentationArgs(cliArgs, toolArgs);
+        const stdout = await runImessageCli(cliArgs);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_search_messages') {
-        const query = String(args?.query || '').trim();
-        const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 100)) : 30;
+        const query = readStringArg(toolArgs, ['query', 'q', 'search']);
+        const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
         if (!query) {
           throw new Error('Missing required parameter "query"');
         }
-        const stdout = await runImessageCli(['search', query, '--limit', String(limit), '--json']);
+        const cliArgs = ['search', query, '--limit', String(limit), '--json'];
+        appendPresentationArgs(cliArgs, toolArgs);
+        const stdout = await runImessageCli(cliArgs);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_search_contacts') {
-        const query = String(args?.query || '').trim();
+        const query = readStringArg(toolArgs, ['query', 'q', 'search']);
         const stdout = await runImessageCli(['contacts', query, '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_get_recent_messages') {
-        const chat = String(args?.chat || '').trim();
-        const limit = typeof args?.limit === 'number' ? Math.max(1, Math.min(Math.floor(args.limit), 50)) : 5;
+        const chat = readChatArg(toolArgs);
+        const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 5, 1, 50);
         if (!chat) {
-          throw new Error('Missing required parameter "chat"');
+          throw new Error(MISSING_CHAT);
         }
-        const stdout = await runImessageCli(['recent', chat, '--limit', String(limit), '--json']);
+        const cliArgs = ['recent', chat, '--limit', String(limit), '--json'];
+        appendPresentationArgs(cliArgs, toolArgs);
+        const stdout = await runImessageCli(cliArgs);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_search_group_chats') {
-        const raw = args?.participants;
-        const participants: string[] = Array.isArray(raw) ? raw.map(p => String(p).trim()).filter(Boolean) : [];
+        const raw = readArg(toolArgs, ['participants', 'participant']);
+        const participants: string[] = Array.isArray(raw)
+          ? raw.map(p => String(p).trim()).filter(Boolean)
+          : typeof raw === 'string' && raw.trim()
+            ? [raw.trim()]
+            : [];
         if (participants.length === 0) {
           throw new Error('Missing required parameter "participants" (non-empty array)');
         }
@@ -556,16 +778,16 @@ function createMcpServer(): Server {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_get_chat_members') {
-        const chat = String(args?.chat || '').trim();
+        const chat = readChatArg(toolArgs);
         if (!chat) {
-          throw new Error('Missing required parameter "chat"');
+          throw new Error(MISSING_CHAT);
         }
         const stdout = await runImessageCli(['members', chat, '--json']);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_get_attachment_payload') {
-        const filePath = String(args?.path || '').trim();
+        const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
         if (!filePath) {
           throw new Error('Missing required parameter "path"');
         }
@@ -574,8 +796,8 @@ function createMcpServer(): Server {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_get_edit_history') {
-        const messageId = typeof args?.message_id === 'number' ? Math.floor(args.message_id) : parseInt(String(args?.message_id || ''), 10);
-        if (isNaN(messageId) || messageId <= 0) {
+        const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+        if (messageId === undefined || messageId <= 0) {
           throw new Error('Missing or invalid required parameter "message_id" (positive integer ROWID expected)');
         }
         const stdout = await runImessageCli(['edits', String(messageId), '--json']);
@@ -583,9 +805,9 @@ function createMcpServer(): Server {
           content: [{ type: 'text', text: stdout }]
         };
       } else if (name === 'imessage_edit_message') {
-        const messageId = typeof args?.message_id === 'number' ? Math.floor(args.message_id) : parseInt(String(args?.message_id || ''), 10);
-        const newText = String(args?.new_text || '').trim();
-        if (isNaN(messageId) || messageId <= 0) {
+        const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+        const newText = readStringArg(toolArgs, ['new_text', 'newText', 'text']);
+        if (messageId === undefined || messageId <= 0) {
           throw new Error('Missing or invalid required parameter "message_id" (positive integer ROWID expected)');
         }
         if (!newText) {
@@ -599,7 +821,7 @@ function createMcpServer(): Server {
         const dryRun = Boolean(args?.dry_run);
         const confirmToken = String(args?.confirm_token || '').trim();
 
-        let recipient = String(args?.recipient || '').trim();
+        let recipient = readStringArg(toolArgs, ['recipient', 'to']);
         let message = String(args?.message || '').trim();
         let attachment = String(args?.attachment || '').trim();
 
@@ -980,7 +1202,7 @@ app.get('/', (_req, res) => {
     <li><code>imessage_get_chat_members</code>: Get members of a group chat.</li>
     <li><code>imessage_get_attachment_payload</code>: Fetch attachment metadata and base64 payload.</li>
     <li><code>imessage_send_message</code>: Send an iMessage with text and/or attachments.</li>
-    <li><code>imessage_get_recent_messages</code>: Preview last N messages before sending.</li>
+    <li><code>imessage_get_recent_messages</code>: Preview last N messages, or poll with since_msg_id. chat and chat_id both accept the list ROWID.</li>
     <li><code>imessage_search_group_chats</code>: Find group chats by participant set.</li>
     <li><code>imessage_get_edit_history</code>: Inspect rewrite and edit history of a message by ROWID.</li>
     <li><code>imessage_edit_message</code>: Edit a sent outgoing iMessage within Apple's 15-minute window.</li>
