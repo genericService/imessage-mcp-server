@@ -149,7 +149,8 @@ iMessage MCP Server Instructions:
 5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
 6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments (converts HEIC photos to JPEG and CAF voice notes to playable/transcribable M4A audio with on-device speech-to-text transcripts).
 7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
-8. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
+8. Call History: Call 'imessage_get_call_history' to inspect phone and FaceTime call history, or pass 'include_calls: true' on reading tools to merge call records into conversation timelines.
+9. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
 `.trim();
 
 function publicBaseUrl(): string {
@@ -251,6 +252,9 @@ function appendPresentationArgs(cli: string[], args: Record<string, unknown> | u
   if (readBoolArg(args, ['include_filtered', 'includeFiltered'])) {
     cli.push('--include-filtered');
   }
+  if (readBoolArg(args, ['include_calls', 'includeCalls'])) {
+    cli.push('--include-calls');
+  }
   if (readBoolArg(args, ['with_meta', 'withMeta', 'summary'])) {
     cli.push('--with-meta');
   }
@@ -328,6 +332,12 @@ const readWindowProperties = {
       'When true, filtered rows such as tapbacks are included inline as structured records so their ids are visible. Alias: includeFiltered.'
   },
   includeFiltered: { type: 'boolean', description: 'Alias of include_filtered.' },
+  include_calls: {
+    type: 'boolean',
+    description:
+      'When true, merge phone and FaceTime calls with that chat\'s participants into the timeline in chronological order (kind: "call", text: null). Calls do not affect since_msg_id cursor pagination. Alias: includeCalls.'
+  },
+  includeCalls: { type: 'boolean', description: 'Alias of include_calls.' },
   with_meta: {
     type: 'boolean',
     description:
@@ -594,6 +604,61 @@ export const TOOLS: Tool[] = [
     }
   },
   {
+    name: 'imessage_get_call_history',
+    description:
+      'Retrieve call and FaceTime history from macOS CallHistoryDB. Filter by contact handle or name, chat ROWID (resolves chat participants to handles), time window (since/until), or call_type. Each record returns id, handle, contact name, direction (incoming/outgoing), answered, missed, duration_seconds, call_type, timestamp, and timestamp_iso.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        handle: {
+          type: 'string',
+          description:
+            'Filter by phone number, email address, or contact name (e.g. "+15550199480", "user@example.com", or "Chani"). Aliases: contact, recipient, phone, email.'
+        },
+        contact: { type: 'string', description: 'Alias of handle.' },
+        recipient: { type: 'string', description: 'Alias of handle.' },
+        phone: { type: 'string', description: 'Alias of handle.' },
+        email: { type: 'string', description: 'Alias of handle.' },
+        chat: {
+          type: 'string',
+          description:
+            'Filter calls with participants of a specific chat. Accepts numeric chat ROWID or chat identifier. Aliases: chat_id, chatId, thread_id, conversation_id.'
+        },
+        chat_id: { type: 'string', description: 'Alias of chat.' },
+        chatId: { type: 'string', description: 'Alias of chat.' },
+        thread_id: { type: 'string', description: 'Alias of chat.' },
+        conversation_id: { type: 'string', description: 'Alias of chat.' },
+        since: {
+          type: 'string',
+          description:
+            'Filter calls after this timestamp (ISO 8601 string, Unix epoch seconds, or Apple epoch seconds).'
+        },
+        until: {
+          type: 'string',
+          description:
+            'Filter calls before this timestamp (ISO 8601 string, Unix epoch seconds, or Apple epoch seconds).'
+        },
+        call_type: {
+          type: 'string',
+          enum: ['phone', 'facetime_video', 'facetime_audio', 'unknown'],
+          description:
+            'Filter by call type: "phone", "facetime_video", "facetime_audio", or "unknown". Alias: callType.'
+        },
+        callType: {
+          type: 'string',
+          enum: ['phone', 'facetime_video', 'facetime_audio', 'unknown'],
+          description: 'Alias of call_type.'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of calls to return (default: 30, max: 100). Aliases: count, max.'
+        },
+        count: { type: 'number', description: 'Alias of limit.' },
+        max: { type: 'number', description: 'Alias of limit.' }
+      }
+    }
+  },
+  {
     name: 'imessage_get_readme',
     description:
       'Retrieve the full iMessage MCP Server README documentation (markdown), setup guides, client configurations, and API signatures.',
@@ -772,6 +837,8 @@ function createMcpServer(): Server {
       targetParam = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
     } else if (name === 'imessage_get_edit_history' || name === 'imessage_edit_message') {
       targetParam = readStringArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+    } else if (name === 'imessage_get_call_history') {
+      targetParam = readStringArg(toolArgs, ['handle', 'contact', 'recipient', 'phone', 'email', 'chat', 'chat_id']);
     }
 
     try {
@@ -881,6 +948,34 @@ function createMcpServer(): Server {
           throw new Error('Missing or empty required parameter "new_text"');
         }
         const stdout = await runImessageCli(['edit', String(messageId), '--text', newText, '--json']);
+        result = {
+          content: [{ type: 'text', text: stdout }]
+        };
+      } else if (name === 'imessage_get_call_history') {
+        const handle = readStringArg(toolArgs, ['handle', 'contact', 'recipient', 'phone', 'email']);
+        const chat = readChatArg(toolArgs);
+        const since = readStringArg(toolArgs, ['since']);
+        const until = readStringArg(toolArgs, ['until']);
+        const callType = readStringArg(toolArgs, ['call_type', 'callType', 'type']);
+        const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
+
+        const cliArgs = ['calls', '--limit', String(limit), '--json'];
+        if (handle) {
+          cliArgs.push('--handle', handle);
+        }
+        if (chat) {
+          cliArgs.push('--chat', chat);
+        }
+        if (since) {
+          cliArgs.push('--since', since);
+        }
+        if (until) {
+          cliArgs.push('--until', until);
+        }
+        if (callType) {
+          cliArgs.push('--call-type', callType);
+        }
+        const stdout = await runImessageCli(cliArgs);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -1273,6 +1368,7 @@ app.get('/', (_req, res) => {
     <li><code>imessage_search_group_chats</code>: Find group chats by participant set.</li>
     <li><code>imessage_get_edit_history</code>: Inspect rewrite and edit history of a message by ROWID.</li>
     <li><code>imessage_edit_message</code>: Edit a sent outgoing iMessage within Apple's 15-minute window.</li>
+    <li><code>imessage_get_call_history</code>: Retrieve phone and FaceTime call history.</li>
     <li><code>imessage_get_readme</code>: Full server README and setup guide.</li>
   </ul>
 </body>
