@@ -15,6 +15,11 @@ It connects your local Mac's iMessage database (`~/Library/Messages/chat.db`), m
 - **Dual MCP Transports:** Supports modern Streamable HTTP (`/mcp`) and Server-Sent Events (`/sse`).
 - **Full-Text Message Search:** Instant SQLite query across historical iMessage text and rich attributed bodies.
 - **Message Rewrite & Edit History:** Surfaces edit status indicators (`is_edited`, `has_edits`, `edit_count`, `last_edited`) on pulled messages, decoding binary property lists (`message_summary_info`) in `chat.db` for full chronological revision histories.
+- **Incremental reads:** `since_msg_id` returns only rows in that chat with a greater message ROWID, so a poller can advance with `next_since_msg_id` instead of re-reading an overlapping window.
+- **Link previews:** Shared links (Spotify and other URL balloons) include `link_preview` with url, title, subtitle, artist, and site name. The raw `.pluginPayloadAttachment` stays on `attachments`.
+- **Structured tapbacks:** Love, like, dislike, laugh, emphasize, question, and custom emoji reactions are nested on the target message (or listed separately). They are not returned as "Loved …" text.
+- **Zoned timestamps:** Each message keeps its human `timestamp` and adds `timestamp_iso` in ISO 8601 with the server machine's local UTC offset.
+- **Sender identity:** Outgoing rows use sender `Me` and an empty `handle`. The other party's handle is `participant`, because `chat.db` stores that handle on `is_from_me` rows.
 - **Message Editing:** Programmatically edit sent messages within Apple's 15-minute protocol window (up to 5 revisions) via `imessage_edit_message` and `imessage edit`, routing through the IMCore bridge.
 - **Contact Resolution:** Integrates with macOS Contacts database (`AddressBook-v22.abcddb`) to resolve names, phone numbers, and emails.
 - **Voice Note Transcriptions & Audio Processing:** Surfaces Apple on-device speech-to-text transcriptions, audio durations (e.g. `[voice note, 15s: "transcript"]`), and full-text search across voice memo transcripts. Automatically converts proprietary CoreAudio `.caf` files to universal `.m4a` (AAC) via macOS `afconvert` for speech and multimodal AI models.
@@ -258,9 +263,9 @@ Returns:
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
 | `imessage_list_chats` | List recent conversations with AddressBook names and participant sets | `limit` (number, default: 30) |
-| `imessage_read_messages` | Read message history with inline attachment details, voice note audio transcriptions, durations, edit state indicators, and revision history | `chat` (string, required), `days` (number, default: 14) |
-| `imessage_get_recent_messages` | Preview last N messages to verify thread context, participants, voice note transcriptions, and edit history before sending | `chat` (string, required), `limit` (number, default: 5) |
-| `imessage_search_messages` | Full-text search across historical iMessages and voice note speech-to-text transcriptions | `query` (string, required), `limit` (number, default: 30) |
+| `imessage_read_messages` | Read message history with attachments, link previews, tapbacks, voice notes, edit history, and ISO timestamps | `chat` or alias `chat_id` (numeric ROWID from `imessage_list_chats`, or a name/phone/email), `days` (default: 14), `since_msg_id`, `reactions`, `with_meta` |
+| `imessage_get_recent_messages` | Preview the last N messages, or poll rows newer than `since_msg_id` | `chat` or `chat_id`, `limit` (default: 5, max: 50), `since_msg_id`, `reactions` (`attach` or `separate`), `include_filtered`, `with_meta` |
+| `imessage_search_messages` | Full-text search across historical iMessages and voice note transcriptions, optionally only after a message id | `query` (aliases `q`, `search`), `limit` (default: 30), `since_msg_id` |
 | `imessage_get_edit_history` | Retrieve full rewrite and edit history with revision timestamps for an iMessage by ROWID | `message_id` (number, required) |
 | `imessage_search_group_chats` | Exact participant set search across group chats | `participants` (array of strings, required) |
 | `imessage_search_contacts` | Search macOS Address Book by name, phone, or email | `query` (string, optional) |
@@ -279,9 +284,9 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | Command | Description | Example |
 | :--- | :--- | :--- |
 | `list` | List recent conversations with participant handles | `bin/imessage list --limit 10 --json` |
-| `read` | Read chat history for a contact or group chat | `bin/imessage read "+15550199808" --days 7` |
-| `recent` | Preview last N messages in a conversation thread | `bin/imessage recent "+15550199808" --limit 5 --json` |
-| `search` | Search message history by keyword or phrase | `bin/imessage search "Arrakis" --limit 20` |
+| `read` | Read chat history for a contact or group chat | `bin/imessage read 46 --days 7 --since-msg-id 1200 --json` |
+| `recent` | Preview last N messages, or rows after a message id | `bin/imessage recent 46 --limit 5 --since-msg-id 1200 --with-meta --json` |
+| `search` | Search message history by keyword or phrase | `bin/imessage search "Arrakis" --limit 20 --since-msg-id 1200` |
 | `edits` | Inspect complete rewrite and revision history for a message | `bin/imessage edits 198097 --json` |
 | `edit` | Edit a previously sent outgoing message | `bin/imessage edit 198097 --text "Paul Atreides revised" --json` |
 | `send` | Send message or attachment to contact or chat ID | `bin/imessage send "+15550199808" --message "Hello" --dry-run` |
@@ -310,6 +315,48 @@ If you wish to log AI agent action executions for security auditing, set `ENABLE
 ```
 
 ---
+
+## Reading messages
+
+`chat` and `chat_id` are the same parameter. Pass the numeric chat ROWID from `imessage_list_chats` (`rowid`, also copied to `chat_id`). A display name, phone number, or email still matches when you do not have the ROWID yet.
+
+Polling a busy thread:
+
+1. Call `imessage_get_recent_messages` with `with_meta: true`.
+2. Store `next_since_msg_id` from the response (it is also on each message).
+3. On the next poll, pass that value as `since_msg_id`. The read is `message.ROWID > cursor` inside that chat, not a rescan of the last N texts.
+4. When `has_more` is true, call again immediately with the new cursor. With `since_msg_id` set, `limit` counts raw rows, including tapbacks, so a burst cannot hide later texts.
+
+Default JSON stays an array of messages. `with_meta: true` wraps it:
+
+```json
+{
+  "messages": [],
+  "filtered": { "reaction": 2 },
+  "next_since_msg_id": 1204,
+  "has_more": false
+}
+```
+
+`filtered.reaction` is how many tapback rows were omitted from `messages` because they were attached to a target. `skipped_before` on each message is the same count since the previous returned row. A missing ROWID that was never stored (a deleted row, for example) is not included in that count. `include_filtered: true` or `reactions: "separate"` puts those rows back in id order as `kind: "reaction"` records with `text: null`.
+
+Outgoing messages (`is_from_me`) use `sender: "Me"` and `handle: ""`. `participant` is the other handle `chat.db` stored on that row. Incoming messages keep the sender handle in both `handle` and `participant`.
+
+`timestamp` is unchanged (`2026-09-25 09:25 PM`). `timestamp_iso` is ISO 8601 with the host's local offset (`2026-09-25T21:25:00-07:00`). Edit revisions include `timestamp_iso` as well.
+
+`link_preview` is `null` unless the row has URL-balloon metadata. The plugin payload file remains an attachment.
+
+Tapback `type` is `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`, or `emoji` (custom emoji in `emoji`). `action` is `added` or `removed`. Each reaction includes `target_msg_id` and `target_guid`. A reaction whose target is outside the current window is returned as its own structured record so a poll does not drop it.
+
+### Check on a real Mac after deploy
+
+The fixture database covers the shapes this server parses. A live `chat.db` can still differ:
+
+- `payload_data` for a current Spotify (or other) share may be an `NSKeyedArchiver` of `LPLinkMetadata`, a plain binary plist, or a newer specialization class. Confirm `link_preview.url`, `title`, `subtitle` or `artist`, and `site_name` on one real share, and that the `.pluginPayloadAttachment` is still listed under `attachments`.
+- Tapback rows should use `associated_message_type` 2000–2006 (added) and 3000–3006 (removed), with `associated_message_guid` like `p:0/<message guid>`. Custom emoji reactions need the `associated_message_emoji` column (Ventura and later). If a reaction still shows up as text, note the integer type and guid prefix.
+- On a 1:1 thread, an `is_from_me` row's `handle_id` points at the other person. Confirm `sender` is `Me`, `handle` is empty, and `participant` is that other handle. Group chats often leave `handle_id` empty on outgoing rows.
+- `timestamp_iso` should use the Mac's local offset, including daylight-saving changes.
+- Edit history for a real edited message should still list every revision. This build does not change how `message_summary_info` is decoded.
 
 ## Known Limitations & Considerations
 
