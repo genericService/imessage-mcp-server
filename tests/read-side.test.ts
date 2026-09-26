@@ -328,3 +328,42 @@ describe('parameter aliases', () => {
     }
   });
 });
+
+describe('delivery and read receipts on message records', () => {
+  it('surfaces delivery and read receipts with ISO timestamps on outgoing messages', async () => {
+    const data = await cliJson(['recent', '7', '--limit', '20', '--json']);
+    const msg101 = data.find((m: any) => m.msg_id === 101);
+    expect(msg101).toBeDefined();
+    expect(msg101.is_from_me).toBe(true);
+    expect(msg101.is_delivered).toBe(true);
+    expect(typeof msg101.delivered_at).toBe('string');
+    expect(typeof msg101.delivered_at_iso).toBe('string');
+    expect(msg101.is_read).toBe(true);
+    expect(typeof msg101.read_at).toBe('string');
+    expect(typeof msg101.read_at_iso).toBe('string');
+  });
+
+  it('surfaces unread outgoing message with delivery timestamp but null read timestamp', async () => {
+    const data = await cliJson(['recent', '7', '--limit', '20', '--json']);
+    const msg107 = data.find((m: any) => m.msg_id === 107);
+    expect(msg107).toBeDefined();
+    expect(msg107.is_from_me).toBe(true);
+    expect(msg107.is_delivered).toBe(true);
+    expect(typeof msg107.delivered_at_iso).toBe('string');
+    expect(msg107.is_read).toBe(false);
+    expect(msg107.read_at).toBeNull();
+    expect(msg107.read_at_iso).toBeNull();
+  });
+
+  it('surfaces incoming message receipt fields cleanly', async () => {
+    const data = await cliJson(['recent', '7', '--limit', '20', '--json']);
+    const msg100 = data.find((m: any) => m.msg_id === 100);
+    expect(msg100).toBeDefined();
+    expect(msg100.is_from_me).toBe(false);
+    expect(msg100.is_delivered).toBe(false);
+    expect(msg100.delivered_at).toBeNull();
+    expect(msg100.delivered_at_iso).toBeNull();
+    expect(msg100.is_read).toBe(true);
+    expect(typeof msg100.read_at_iso).toBe('string');
+  });
+});
