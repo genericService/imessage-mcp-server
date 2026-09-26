@@ -154,7 +154,11 @@ def build(path):
             balloon_bundle_id TEXT,
             payload_data BLOB,
             cache_has_attachments INTEGER DEFAULT 0,
-            item_type INTEGER DEFAULT 0
+            item_type INTEGER DEFAULT 0,
+            is_delivered INTEGER DEFAULT 0,
+            date_delivered INTEGER DEFAULT 0,
+            is_read INTEGER DEFAULT 0,
+            date_read INTEGER DEFAULT 0
         );
         CREATE TABLE chat_message_join (
             chat_id INTEGER,
@@ -212,6 +216,10 @@ def build(path):
         payload=None,
         summary=None,
         date_edited=0,
+        is_delivered=0,
+        date_delivered=0,
+        is_read=0,
+        date_read=0,
     ):
         date_ns = apple_ns(offset)
         c.execute(
@@ -220,8 +228,9 @@ def build(path):
                 ROWID, guid, text, handle_id, date, date_edited, is_from_me,
                 is_audio_message, message_summary_info, associated_message_guid,
                 associated_message_type, associated_message_emoji, balloon_bundle_id,
-                payload_data, cache_has_attachments, item_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0)
+                payload_data, cache_has_attachments, item_type,
+                is_delivered, date_delivered, is_read, date_read
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
             """,
             (
                 rowid,
@@ -238,6 +247,10 @@ def build(path):
                 balloon,
                 payload,
                 1 if payload else 0,
+                is_delivered,
+                date_delivered,
+                is_read,
+                date_read,
             ),
         )
         c.execute(
@@ -246,8 +259,19 @@ def build(path):
         )
 
     # Outgoing rows intentionally store Chani's handle_id, matching chat.db.
-    add_message(100, 7, 1, 0, "The spice must flow", 0)
-    add_message(101, 7, 1, 1, "Acknowledged", 1)
+    add_message(100, 7, 1, 0, "The spice must flow", 0, is_read=1, date_read=apple_ns(0))
+    add_message(
+        101,
+        7,
+        1,
+        1,
+        "Acknowledged",
+        1,
+        is_delivered=1,
+        date_delivered=apple_ns(1) + 1_000_000_000,
+        is_read=1,
+        date_read=apple_ns(1) + 5_000_000_000,
+    )
     add_message(
         102,
         7,
@@ -299,6 +323,10 @@ def build(path):
         7,
         summary=edit_summary_blob(),
         date_edited=apple_ns(9),
+        is_delivered=1,
+        date_delivered=apple_ns(7) + 2_000_000_000,
+        is_read=0,
+        date_read=0,
     )
     add_message(
         108,

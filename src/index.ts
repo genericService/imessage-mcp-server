@@ -28,6 +28,13 @@ import {
   secretsEqual
 } from './oauth.js';
 import { isRateLimited, recordAuthFailure } from './ratelimit.js';
+import {
+  initGlobalWatcher,
+  stopGlobalWatcher,
+  WatcherService,
+  deliverWebhook,
+  parseWatcherConfig,
+} from './watcher.js';
 
 const execFileAsync = promisify(execFile);
 const PYTHON_BIN = '/usr/bin/python3';
@@ -137,7 +144,7 @@ const SERVER_INSTRUCTIONS = `
 iMessage MCP Server Instructions:
 1. Discovery: Call 'imessage_list_chats' to discover available conversation IDs, display names, and handles.
 2. Search: Call 'imessage_search_messages' to search past message history by keyword or voice note speech-to-text transcriptions, or 'imessage_search_contacts' to find contacts.
-3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' with chat or its alias chat_id. The value is the numeric chat ROWID from imessage_list_chats (rowid / chat_id), or a display name, phone number, or email. Pass since_msg_id to poll only messages with a greater id, and with_meta true to read next_since_msg_id (advance the cursor with that, not the last visible msg_id). Messages include ISO timestamps, link previews, structured reactions, voice note transcriptions, and edit history. Tapbacks are not ordinary text.
+3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' with chat or its alias chat_id. The value is the numeric chat ROWID from imessage_list_chats (rowid / chat_id), or a display name, phone number, or email. Pass since_msg_id to poll only messages with a greater id, and with_meta true to read next_since_msg_id (advance the cursor with that, not the last visible msg_id). Messages include ISO timestamps, delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso; note that read_at on outgoing messages requires the recipient to have read receipts enabled), link previews, structured reactions, voice note transcriptions, and edit history. Tapbacks are structured reaction objects.
 4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
 5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
 6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments (converts HEIC photos to JPEG and CAF voice notes to playable/transcribable M4A audio with on-device speech-to-text transcripts).
@@ -363,7 +370,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_read_messages',
     description:
-      'Read recent message history from a specific iMessage chat. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats, or a display name, phone number, or email. Messages include ISO-8601 timestamps, link previews (url, title, subtitle, artist, site_name), structured tapbacks, voice note transcriptions, and edit history. Outgoing rows use sender "Me" with an empty handle; the other party is `participant`.',
+      'Read recent message history from a specific iMessage chat. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats, or a display name, phone number, or email. Messages include ISO-8601 timestamps, delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso), link previews (url, title, subtitle, artist, site_name), structured tapbacks, voice note transcriptions, and edit history. Outgoing rows use sender "Me" with an empty handle; the other party is `participant`. Read receipts on outgoing messages only appear when the recipient has enabled read receipts.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -503,7 +510,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_get_recent_messages',
     description:
-      'Preview the last N messages in a chat, or poll for rows newer than since_msg_id. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats (`rowid` / `chat_id`), or a display name, phone number, or email. Results include ISO timestamps, link previews, and structured tapbacks (not as Loved/Liked text). Outgoing rows use sender "Me" with an empty handle and a separate `participant`. Pass with_meta to get filtered counts and next_since_msg_id.',
+      'Preview the last N messages in a chat, or poll for rows newer than since_msg_id. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats (`rowid` / `chat_id`), or a display name, phone number, or email. Results include ISO timestamps, delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso), link previews, and structured tapbacks (not as Loved/Liked text). Outgoing rows use sender "Me" with an empty handle and a separate `participant`. Pass with_meta to get filtered counts and next_since_msg_id. Read receipts on outgoing messages only appear when the recipient has enabled read receipts.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -678,6 +685,20 @@ function pruneExpiredConfirmTokens(now = Date.now()): void {
   }
 }
 
+export const activeMcpServers = new Set<Server>();
+
+export const globalResourceNotifier = {
+  async sendResourceUpdated(params: { uri: string }): Promise<void> {
+    for (const s of activeMcpServers) {
+      try {
+        await s.sendResourceUpdated(params);
+      } catch {
+        // Ignored if not supported or not subscribed
+      }
+    }
+  }
+};
+
 /**
  * Creates and configures an instance of the MCP Server.
  */
@@ -693,7 +714,7 @@ function createMcpServer(): Server {
           listChanged: true
         },
         resources: {
-          subscribe: false,
+          subscribe: true,
           listChanged: false
         }
       },
@@ -701,6 +722,8 @@ function createMcpServer(): Server {
       supportedProtocolVersions: SUPPORTED_SPEC_VERSIONS
     }
   );
+
+  activeMcpServers.add(server);
 
   server.setRequestHandler('server/discover', async () => {
     return {
@@ -713,7 +736,7 @@ function createMcpServer(): Server {
           cacheScope: 'client'
         },
         resources: {
-          subscribe: false,
+          subscribe: true,
           listChanged: false
         }
       },
@@ -745,6 +768,12 @@ function createMcpServer(): Server {
           name: 'README.md',
           description: 'Full iMessage MCP Server Documentation & Usage Guide',
           mimeType: 'text/markdown'
+        },
+        {
+          uri: 'resource://messages/recent',
+          name: 'Recent Messages Notification',
+          description: 'Resource tracking new messages in iMessage chat.db for real-time notifications',
+          mimeType: 'application/json'
         }
       ]
     };
@@ -765,7 +794,29 @@ function createMcpServer(): Server {
         ]
       };
     }
+    if (uri === 'resource://messages/recent') {
+      return {
+        contents: [
+          {
+            uri: 'resource://messages/recent',
+            mimeType: 'application/json',
+            text: JSON.stringify({
+              status: 'active',
+              timestamp_iso: new Date().toISOString()
+            })
+          }
+        ]
+      };
+    }
     throw new Error(`Resource not found: ${uri}`);
+  });
+
+  server.setRequestHandler('resources/subscribe', async () => {
+    return {};
+  });
+
+  server.setRequestHandler('resources/unsubscribe', async () => {
+    return {};
   });
 
   server.setRequestHandler('tools/call', async (request, ctx) => {
@@ -1656,6 +1707,8 @@ app.post('/messages', authMiddleware, async (req, res) => {
 });
 
 if (process.env.NODE_ENV !== 'test') {
+  initGlobalWatcher(globalResourceNotifier);
+
   if (USE_HTTPS) {
     const certDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'certs');
     const certPath = path.join(certDir, 'server.crt');
@@ -1693,4 +1746,12 @@ if (process.env.NODE_ENV !== 'test') {
   }
 }
 
-export { app };
+export {
+  app,
+  initGlobalWatcher,
+  stopGlobalWatcher,
+  WatcherService,
+  deliverWebhook,
+  parseWatcherConfig,
+  createMcpServer,
+};

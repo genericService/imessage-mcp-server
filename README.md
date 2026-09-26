@@ -20,6 +20,9 @@ It connects your local Mac's iMessage database (`~/Library/Messages/chat.db`), m
 - **Structured tapbacks:** Love, like, dislike, laugh, emphasize, question, and custom emoji reactions are nested on the target message (or listed separately). They are not returned as "Loved …" text.
 - **Zoned timestamps:** Each message keeps its human `timestamp` and adds `timestamp_iso` in ISO 8601 with the server machine's local UTC offset.
 - **Sender identity:** Outgoing rows use sender `Me` and an empty `handle`. The other party's handle is `participant`, because `chat.db` stores that handle on `is_from_me` rows.
+- **Delivery & Read Receipts:** Surfaces `is_delivered`, `delivered_at`, `delivered_at_iso`, `is_read`, `read_at`, and `read_at_iso` on message records. Read receipts on outgoing rows indicate that the recipient has read receipts enabled.
+- **Webhook Wakeups & Change Watcher:** Detects changes to `chat.db` and `chat.db-wal` using filesystem events and polling fallback, sending debounced webhook notifications to external bots. Payloads contain strictly event metadata with zero message text or contact names. Includes HMAC-SHA256 signatures and restart state persistence.
+- **MCP Resource Subscriptions:** Exposes `resource://messages/recent` with live updates over MCP for clients subscribed to server resources.
 - **Message Editing:** Programmatically edit sent messages within Apple's 15-minute protocol window (up to 5 revisions) via `imessage_edit_message` and `imessage edit`, routing through the IMCore bridge.
 - **Contact Resolution:** Integrates with macOS Contacts database (`AddressBook-v22.abcddb`) to resolve names, phone numbers, and emails.
 - **Voice Note Transcriptions & Audio Processing:** Surfaces Apple on-device speech-to-text transcriptions, audio durations (e.g. `[voice note, 15s: "transcript"]`), and full-text search across voice memo transcripts. Automatically converts proprietary CoreAudio `.caf` files to universal `.m4a` (AAC) via macOS `afconvert` for speech and multimodal AI models.
@@ -296,6 +299,7 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | `members` | List members and handles in a group chat | `bin/imessage members 1767 --json` |
 | `search-group` | Search group chats by exact participant set | `bin/imessage search-group "paul@caladan.org" "chani@sietch.net"` |
 | `attachment` | Inspect attachment file metadata and base64 payload | `bin/imessage attachment "~/Library/Messages/Attachments/..."` |
+| `changes` | Query message ROWIDs and receipt transitions since cursor | `bin/imessage changes --since-id 1200 --json` |
 
 ---
 
@@ -344,6 +348,18 @@ Default JSON stays an array of messages. `with_meta: true` wraps it:
 
 Outgoing messages (`is_from_me`) use `sender: "Me"` and `handle: ""`. `participant` is the other handle `chat.db` stored on that row. Incoming messages keep the sender handle in both `handle` and `participant`.
 
+### Delivery and Read Receipts
+
+Every message record includes delivery and read receipt indicators:
+- `is_delivered` (boolean): `true` when the message has reached Apple delivery networks or the recipient device.
+- `delivered_at` (string | null): Formatted local timestamp of delivery.
+- `delivered_at_iso` (string | null): ISO-8601 delivery timestamp with local UTC offset.
+- `is_read` (boolean): `true` when the recipient has opened or read the message.
+- `read_at` (string | null): Formatted local timestamp when read.
+- `read_at_iso` (string | null): ISO-8601 read timestamp with local UTC offset.
+
+On outgoing rows, `read_at` only exists when the recipient has read receipts enabled. Typing indicators are transient in memory and are not stored in SQLite `chat.db`.
+
 `timestamp` is unchanged (`2026-09-25 09:25 PM`). `timestamp_iso` is ISO 8601 with the host's local offset (`2026-09-25T21:25:00-07:00`). Edit revisions include `timestamp_iso` as well.
 
 `link_preview` is `null` unless the row has URL-balloon metadata. The plugin payload file remains an attachment.
@@ -359,10 +375,74 @@ Call records are read from macOS Core Data SQLite storage at `~/Library/Applicat
 - **Cursor safety:** Call entries do not have message ROWIDs and do not affect `next_since_msg_id` or `filtered.reaction` counts. Incremental polling via `since_msg_id` advances strictly on message rows.
 - **Resilience:** If `CallHistory.storedata` is missing or unreadable due to missing Full Disk Access permissions, the tool returns a non-fatal status object explaining the issue rather than throwing an exception.
 
+---
+
+## Webhook Wakeups & Change Watcher
+
+The server can monitor `chat.db` and `chat.db-wal` for incoming messages, reactions, and receipt transitions, and send debounced HTTP POST notifications to external webhook endpoints. This allows an external agent or bot to wake up on activity and fetch message details via `since_msg_id` without continuous polling.
+
+### Privacy & Payload Design
+
+Webhook payloads contain zero message content, sender names, or contact handles. They carry strictly event metadata and cursors:
+
+```json
+{
+  "event": "message_in",
+  "chat_id": 7,
+  "newest_msg_id": 105,
+  "count": 1,
+  "since_msg_id_hint": 104,
+  "occurred_at_iso": "2026-09-26T11:15:00-07:00"
+}
+```
+
+Upon receiving a webhook, the client calls `imessage_get_recent_messages` using `since_msg_id_hint` to retrieve full content securely.
+
+### Configuration
+
+Enable the watcher by setting `WATCH_ENABLED=true` in `.env` or the environment.
+
+Configure rules using either `WATCH_RULES` (inline JSON string) or `WATCH_CONFIG_FILE` (path to a JSON file, default `~/.imessage-mcp/watch-config.json`):
+
+```json
+[
+  {
+    "webhook_url": "https://bot.example.com/webhook",
+    "chats": [7, "+15550199480"],
+    "events": ["message_in", "reaction", "read_receipt", "delivered"],
+    "debounce_ms": 3000,
+    "secret": "your-shared-hmac-secret"
+  }
+]
+```
+
+### Rule Fields
+
+- `webhook_url` (string, required): Endpoint URL to receive POST notifications.
+- `chats` (array of numbers or strings, required): List of chat ROWIDs or participant handles to watch. Rules without chats are rejected to prevent broadcast leakage.
+- `events` (array of strings, optional): Events to emit. Supported values: `message_in`, `message_out`, `reaction`, `read_receipt`, `delivered`. Defaults to `["message_in", "reaction"]`. Outgoing messages (`message_out`) only fire when explicitly included in `events`.
+- `debounce_ms` (number, optional, default: 3000): Debounce window grouping rapid event bursts for a chat into a single aggregated notification with an updated `count` and `newest_msg_id`.
+- `secret` (string, optional): Shared secret. When present, each webhook request includes an `X-Signature-SHA256: sha256=<hex>` HMAC signature header.
+
+### State Persistence & Resilience
+
+- **State File:** Tracked in `WATCH_STATE_FILE` (default `~/.imessage-mcp/watch-state.json`). It records `last_seen_msg_id` and outgoing receipt statuses so server restarts do not replay past messages or miss offline updates.
+- **Filesystem Watcher & Polling:** Uses `fs.watch` on the database directory combined with a fallback interval (`WATCH_POLL_INTERVAL_MS`, default 5000ms) to ensure timely detection even under aggressive macOS SQLite WAL checkpoints.
+- **Bounded Retries:** Webhook delivery uses exponential backoff up to 3 retries with a 5000ms request timeout. Delivery errors are logged without payload bodies or secrets, and never crash the server.
+
+### MCP Resource Subscriptions
+
+Clients connected over MCP can also subscribe to `resource://messages/recent`. When new messages land in `chat.db`, the server notifies subscribed clients via standard MCP resource update notifications.
+
+---
+
 ### Check on a real Mac after deploy
 
 The fixture database covers the shapes this server parses. A live `chat.db` and `CallHistory.storedata` can still differ:
 
+- Real `chat.db` receipt columns: verify that `is_delivered`, `date_delivered`, `is_read`, and `date_read` match expectations across macOS versions.
+- Receipt timing: verify read receipt delivery timing when communicating with recipients who have read receipts enabled.
+- Filesystem event delivery: confirm that `fs.watch` picks up SQLite WAL changes on `chat.db-wal` on APFS.
 - `payload_data` for a current Spotify (or other) share may be an `NSKeyedArchiver` of `LPLinkMetadata`, a plain binary plist, or a newer specialization class. Confirm `link_preview.url`, `title`, `subtitle` or `artist`, and `site_name` on one real share, and that the `.pluginPayloadAttachment` is still listed under `attachments`.
 - Tapback rows should use `associated_message_type` 2000 to 2006 (added) and 3000 to 3006 (removed), with `associated_message_guid` like `p:0/<message guid>`. Custom emoji reactions need the `associated_message_emoji` column (Ventura and later). If a reaction still shows up as text, note the integer type and guid prefix.
 - On a 1:1 thread, an `is_from_me` row's `handle_id` points at the other person. Confirm `sender` is `Me`, `handle` is empty, and `participant` is that other handle. Group chats often leave `handle_id` empty on outgoing rows.
