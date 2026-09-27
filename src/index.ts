@@ -99,7 +99,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.4.1';
+const SERVER_VERSION = '1.5.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -150,7 +150,8 @@ iMessage MCP Server Instructions:
 6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments (converts HEIC photos to JPEG and CAF voice notes to playable/transcribable M4A audio with on-device speech-to-text transcripts).
 7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
 8. Call History: Call 'imessage_get_call_history' to inspect phone and FaceTime call history, or pass 'include_calls: true' on reading tools to merge call records into conversation timelines.
-9. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
+9. Index Status: Call 'imessage_index_status' to inspect local search index statistics, sync freshness, and lag.
+10. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
 `.trim();
 
 function publicBaseUrl(): string {
@@ -419,6 +420,13 @@ export const TOOLS: Tool[] = [
           type: 'number',
           description: 'Alias of limit.'
         },
+        order: {
+          type: 'string',
+          enum: ['recent', 'relevance'],
+          description:
+            'Sort order for search results: "recent" (default) sorts by timestamp descending; "relevance" sorts by BM25 match score when the local search index is enabled and caught up.'
+        },
+        ...chatArgProperties,
         ...readWindowProperties
       },
       anyOf: [
@@ -659,6 +667,15 @@ export const TOOLS: Tool[] = [
     }
   },
   {
+    name: 'imessage_index_status',
+    description:
+      'Inspect the status of the local search index, including total indexed messages, indexed attachments, indexed contacts, database file size, last indexed message ID, and sync lag behind chat.db.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
     name: 'imessage_get_readme',
     description:
       'Retrieve the full iMessage MCP Server README documentation (markdown), setup guides, client configurations, and API signatures.',
@@ -849,6 +866,11 @@ function createMcpServer(): Server {
         result = {
           content: [{ type: 'text', text: content }]
         };
+      } else if (name === 'imessage_index_status') {
+        const stdout = await runImessageCli(['index', 'status', '--json']);
+        result = {
+          content: [{ type: 'text', text: stdout }]
+        };
       } else if (name === 'imessage_list_chats') {
         const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
         const stdout = await runImessageCli(['list', '--limit', String(limit), '--json']);
@@ -873,7 +895,18 @@ function createMcpServer(): Server {
         if (!query) {
           throw new Error('Missing required parameter "query"');
         }
+        const order = readStringArg(toolArgs, ['order']);
+        const chat = readChatArg(toolArgs);
         const cliArgs = ['search', query, '--limit', String(limit), '--json'];
+        if (order) {
+          if (order !== 'recent' && order !== 'relevance') {
+            throw new Error('Invalid parameter "order" (expected "recent" or "relevance")');
+          }
+          cliArgs.push('--order', order);
+        }
+        if (chat) {
+          cliArgs.push('--chat', chat);
+        }
         appendPresentationArgs(cliArgs, toolArgs);
         const stdout = await runImessageCli(cliArgs);
         result = {
@@ -1369,6 +1402,7 @@ app.get('/', (_req, res) => {
     <li><code>imessage_get_edit_history</code>: Inspect rewrite and edit history of a message by ROWID.</li>
     <li><code>imessage_edit_message</code>: Edit a sent outgoing iMessage within Apple's 15-minute window.</li>
     <li><code>imessage_get_call_history</code>: Retrieve phone and FaceTime call history.</li>
+    <li><code>imessage_index_status</code>: Inspect local search index statistics, sync freshness, and lag.</li>
     <li><code>imessage_get_readme</code>: Full server README and setup guide.</li>
   </ul>
 </body>

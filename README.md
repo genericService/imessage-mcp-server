@@ -269,7 +269,7 @@ Returns:
 | `imessage_read_messages` | Read message history with attachments, link previews, tapbacks, voice notes, edit history, and ISO timestamps | `chat` or alias `chat_id` (numeric ROWID from `imessage_list_chats`, or a name/phone/email), `days` (default: 14), `since_msg_id`, `reactions`, `include_calls`, `with_meta` |
 | `imessage_get_recent_messages` | Preview the last N messages, or poll rows newer than `since_msg_id` | `chat` or `chat_id`, `limit` (default: 5, max: 50), `since_msg_id`, `reactions` (`attach` or `separate`), `include_filtered`, `include_calls`, `with_meta` |
 | `imessage_get_call_history` | Retrieve phone and FaceTime call history with direction, duration, and status | `handle` (or `contact`), `chat` (or `chat_id`), `since`, `until`, `call_type`, `limit` (default: 30) |
-| `imessage_search_messages` | Full-text search across historical iMessages and voice note transcriptions, optionally only after a message id | `query` (aliases `q`, `search`), `limit` (default: 30), `since_msg_id` |
+| `imessage_search_messages` | Full-text search across historical iMessages and voice note transcriptions, with optional BM25 relevance sorting | `query` (aliases `q`, `search`), `limit` (default: 30), `order` (`recent` or `relevance`), `chat`, `since_msg_id` |
 | `imessage_get_edit_history` | Retrieve full rewrite and edit history with revision timestamps for an iMessage by ROWID | `message_id` (number, required) |
 | `imessage_search_group_chats` | Exact participant set search across group chats | `participants` (array of strings, required) |
 | `imessage_search_contacts` | Search macOS Address Book by name, phone, or email | `query` (string, optional) |
@@ -277,6 +277,7 @@ Returns:
 | `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (converts HEIC to JPEG and CAF voice notes to M4A with transcriptions) | `path` (string, required) |
 | `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports dry_run preview & confirm_token) | `recipient` (string, required), `message`, `attachment`, `dry_run`, `confirm_token` |
 | `imessage_edit_message` | Edit a previously sent message by ROWID (subject to 15-minute Apple protocol window and 5-edit limit) | `message_id` (number, required), `text` (string, required) |
+| `imessage_index_status` | Inspect status, row counts, database file size, and sync lag of the local search index | *(none)* |
 | `imessage_get_readme` | Retrieve full server README documentation & usage guide | *(none)* |
 
 ---
@@ -291,7 +292,7 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | `read` | Read chat history for a contact or group chat | `bin/imessage read 46 --days 7 --since-msg-id 1200 --include-calls --json` |
 | `recent` | Preview last N messages, or rows after a message id | `bin/imessage recent 46 --limit 5 --since-msg-id 1200 --include-calls --with-meta --json` |
 | `calls` | Retrieve phone and FaceTime call history | `bin/imessage calls --limit 20 --json` |
-| `search` | Search message history by keyword or phrase | `bin/imessage search "Arrakis" --limit 20 --since-msg-id 1200` |
+| `search` | Search message history by keyword or phrase | `bin/imessage search "Arrakis" --limit 20 --order relevance --since-msg-id 1200` |
 | `edits` | Inspect complete rewrite and revision history for a message | `bin/imessage edits 198097 --json` |
 | `edit` | Edit a previously sent outgoing message | `bin/imessage edit 198097 --text "Paul Atreides revised" --json` |
 | `send` | Send message or attachment to contact or chat ID | `bin/imessage send "+15550199808" --message "Hello" --dry-run` |
@@ -300,6 +301,10 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | `search-group` | Search group chats by exact participant set | `bin/imessage search-group "paul@caladan.org" "chani@sietch.net"` |
 | `attachment` | Inspect attachment file metadata and base64 payload | `bin/imessage attachment "~/Library/Messages/Attachments/..."` |
 | `changes` | Query message ROWIDs and receipt transitions since cursor | `bin/imessage changes --since-id 1200 --json` |
+| `index build` | Build local sidecar search index in batches | `bin/imessage index build --batch-size 5000` |
+| `index status` | Show index row counts, lag, and file size | `bin/imessage index status --json` |
+| `index sync` | Incrementally sync new rows and recheck recent edits | `bin/imessage index sync --recheck-days 14` |
+| `index rebuild` | Delete and rebuild index database from scratch | `bin/imessage index rebuild` |
 
 ---
 
@@ -456,6 +461,69 @@ Rules are read once at server startup from `WATCH_RULES` or `WATCH_CONFIG_FILE`;
 ### MCP Resource Subscriptions
 
 Clients connected over MCP can also subscribe to `resource://messages/recent`. When new messages land in `chat.db`, the server notifies subscribed clients via standard MCP resource update notifications.
+
+---
+
+## Local Search & Metadata Index (Optional Sidecar)
+
+The server includes an optional local SQLite sidecar index designed to accelerate full-text searches and repeat reads across large message histories without duplicating the message database or attachment files.
+
+`chat.db` remains the read-only single source of truth. The index never writes to `~/Library/Messages` and never makes network calls or cloud synchronizations.
+
+### What the Index Stores
+
+The index is stored in a single SQLite database in WAL mode (`~/.imessage-mcp/index.db` by default) with restricted permissions (directory `0700`, file `0600`):
+
+- **`messages_idx`**: Core message metadata including message ROWID (`msg_id`), GUID, chat ID, handle ID, `is_from_me`, Apple epoch timestamp, Unix epoch seconds, item type, attachment flag, and decoded plain text (`text_decoded`). For messages stored with `attributedBody`, text is decoded once at index time using the server's binary parser.
+- **`messages_fts`**: An SQLite FTS5 virtual table built over `messages_idx` (`content='messages_idx'`). It uses the `unicode61` tokenizer with `remove_diacritics 2`, enabling fast prefix, phrase, and accent-insensitive searches across English, Spanish, and other languages.
+- **`attachments_idx`**: Attachment metadata only: attachment ROWID, message ID, filename, transfer name, MIME type, UTI, size in bytes, and the original file path in `chat.db`.
+- **`contacts_idx`**: Normalized handles (E.164 phone numbers or lowercase email addresses) and display names resolved from macOS AddressBook.
+- **`meta`**: Index schema version, last indexed message ID, last full sync timestamp, and `chat.db` filesystem inode and file size at sync time.
+
+### What the Index Never Stores
+
+- **No Attachment Files:** Binary attachment files, images, voice notes, and videos are never copied. The index stores only metadata and the original filesystem path already referenced by `chat.db`.
+- **No Raw Message Blobs:** Full raw database rows, binary property lists, and raw `attributedBody` blobs are not stored in the index.
+- **No Read or Delivery Status:** Read and delivery receipts are dynamic and change over time. They are never cached in the index and are always read live from `chat.db`.
+
+### Environment Variables
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INDEX_ENABLED` | `false` | Set to `true` to enable sidecar indexing and accelerated search. When `false`, missing, or lagging behind `chat.db`, all tools fall back transparently to reading `chat.db` directly. |
+| `INDEX_DB_PATH` | `~/.imessage-mcp/index.db` | Filesystem path for the index SQLite database. Directory is created with `0700` and database file with `0600`. |
+| `INDEX_RECHECK_DAYS` | `14` | Lookback window in days for detecting in-place message edits, unsends, and deletions during periodic sync passes. |
+
+### Keeping the Index Current
+
+The index stays synchronized with `chat.db` through three mechanisms:
+
+1. **Initial Build:** Run `bin/imessage index build` (or automatic build on first sync). It reads `chat.db` in batches of 5,000 rows, runs with low process priority (`os.nice(10)`), streams progress to `stderr`, and handles histories of any size without loading everything into memory.
+2. **Incremental Ingestion:** Whenever `INDEX_ENABLED=true`, the server watcher detects new rows and indexes everything past `last_indexed_msg_id`. This runs independently of webhook rules (`WATCH_ENABLED`).
+3. **Edits, Unsends, and Deletions:** Because `chat.db` updates edited and retracted rows in place, the server re-checks the last N days (configured by `INDEX_RECHECK_DAYS`, default 14) at server startup and every 10 minutes. Changed messages have their `text_decoded` refreshed in the index, and deleted rows are purged.
+
+### Fallback Behavior & Safety
+
+If the index file is missing, corrupt, using an outdated schema version, or lagging behind `chat.db`'s newest message ROWID, the server logs a warning to `stderr` and falls back directly to `chat.db`. It never returns partial or stale search results silently.
+
+### Search Sorting (Recent vs Relevance)
+
+When searching with `imessage_search_messages` or `bin/imessage search`:
+- **`order: "recent"`** (default): Sorts matching messages chronologically descending. Matches existing server behavior.
+- **`order: "relevance"`**: Sorts matching messages by BM25 match quality score from SQLite FTS5.
+
+### Disk-Size Expectations & Removal
+
+Because the index stores only plain text and lightweight metadata, its footprint is small (typically under 5% of `chat.db` size, and orders of magnitude smaller than the Attachments directory).
+
+To remove or reset the index:
+```bash
+# Delete index files
+rm -f ~/.imessage-mcp/index.db ~/.imessage-mcp/index.db-wal ~/.imessage-mcp/index.db-shm
+
+# Or trigger a clean rebuild via CLI
+bin/imessage index rebuild
+```
 
 ---
 

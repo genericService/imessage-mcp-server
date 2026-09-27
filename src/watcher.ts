@@ -128,7 +128,7 @@ export function ruleMatchesEvent(
   return false;
 }
 
-export const WATCHER_USER_AGENT = 'imessage-mcp-server/1.4.1';
+export const WATCHER_USER_AGENT = 'imessage-mcp-server/1.5.0';
 
 /**
  * Header names the watcher controls itself. Custom rule headers may not override them,
@@ -244,7 +244,9 @@ export async function deliverWebhook(
 }
 
 export function parseWatcherConfig(): WatcherConfig | null {
-  const isEnabled = process.env.WATCH_ENABLED === 'true';
+  const isWatchEnabled = process.env.WATCH_ENABLED === 'true';
+  const isIndexEnabled = process.env.INDEX_ENABLED === 'true';
+  const isEnabled = isWatchEnabled || isIndexEnabled;
 
   let rawRules: any = null;
   const envRules = process.env.WATCH_RULES;
@@ -319,6 +321,8 @@ export class WatcherService {
   private isChecking = false;
   private pendingRecheck = false;
   private resourceNotifier: ResourceNotificationTarget | null = null;
+  private indexSyncTimer: NodeJS.Timeout | null = null;
+  private isIndexSyncing = false;
 
   constructor(config: WatcherConfig, resourceNotifier: ResourceNotificationTarget | null = null) {
     this.config = config;
@@ -329,6 +333,22 @@ export class WatcherService {
 
   public getState(): WatchState {
     return { ...this.state };
+  }
+
+  public async syncIndex(recheckDays?: number): Promise<void> {
+    if (this.isIndexSyncing) return;
+    this.isIndexSyncing = true;
+    try {
+      const args = ['index', 'sync'];
+      if (typeof recheckDays === 'number') {
+        args.push('--recheck-days', String(recheckDays));
+      }
+      await runImessageCli(args);
+    } catch (err: any) {
+      console.warn(`[Watcher] Index sync failed: ${err.message}`);
+    } finally {
+      this.isIndexSyncing = false;
+    }
   }
 
   private loadState(): WatchState {
@@ -386,6 +406,20 @@ export class WatcherService {
       this.scheduleCheck();
     }, interval);
 
+    if (process.env.INDEX_ENABLED === 'true') {
+      const recheckDays = parseInt(process.env.INDEX_RECHECK_DAYS || '14', 10);
+      this.syncIndex(Number.isFinite(recheckDays) ? recheckDays : 14).catch((err) => {
+        console.warn(`[Watcher] Initial index sync failed: ${err.message}`);
+      });
+
+      this.indexSyncTimer = setInterval(() => {
+        const days = parseInt(process.env.INDEX_RECHECK_DAYS || '14', 10);
+        this.syncIndex(Number.isFinite(days) ? days : 14).catch((err) => {
+          console.warn(`[Watcher] Periodic index sync failed: ${err.message}`);
+        });
+      }, 10 * 60 * 1000);
+    }
+
     await this.checkChanges();
   }
 
@@ -393,6 +427,10 @@ export class WatcherService {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
+    }
+    if (this.indexSyncTimer) {
+      clearInterval(this.indexSyncTimer);
+      this.indexSyncTimer = null;
     }
     if (this.checkDebounceTimer) {
       clearTimeout(this.checkDebounceTimer);
@@ -502,6 +540,15 @@ export class WatcherService {
           ...this.state.receipt_state,
           ...result.receipt_state,
         };
+      }
+
+      if (
+        process.env.INDEX_ENABLED === 'true' &&
+        (hadNewMessages || (typeof result.max_msg_id === 'number' && result.max_msg_id > this.state.last_seen_msg_id))
+      ) {
+        this.syncIndex(0).catch((err) => {
+          console.warn(`[Watcher] Incremental index sync failed: ${err.message}`);
+        });
       }
 
       if (hadNewMessages || hadReceiptEvents) {
