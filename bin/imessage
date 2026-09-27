@@ -49,6 +49,651 @@ def get_call_history_connection():
     except Exception as e:
         return None, f"Could not open call history database in read-only mode ({e}). Check Full Disk Access permissions."
 
+INDEX_SCHEMA_VERSION = 1
+
+def get_index_db_path():
+    override = os.environ.get("INDEX_DB_PATH")
+    if override and override.strip():
+        return os.path.abspath(os.path.expanduser(override.strip()))
+    return os.path.expanduser("~/.imessage-mcp/index.db")
+
+def is_index_enabled():
+    val = os.environ.get("INDEX_ENABLED", "").strip().lower()
+    return val in ("true", "1", "yes")
+
+def get_recheck_days():
+    raw = os.environ.get("INDEX_RECHECK_DAYS")
+    if raw and raw.strip():
+        try:
+            return max(1, int(raw.strip()))
+        except ValueError:
+            pass
+    return 14
+
+def ensure_index_dir_and_permissions(db_path):
+    dir_path = os.path.dirname(db_path)
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(dir_path, 0o700)
+    except Exception:
+        pass
+    if os.path.exists(db_path):
+        try:
+            os.chmod(db_path, 0o600)
+        except Exception:
+            pass
+
+def get_index_db_connection(read_only=False):
+    db_path = get_index_db_path()
+    if read_only:
+        if not os.path.exists(db_path):
+            return None
+        uri = f"file:{db_path}?mode=ro"
+        return sqlite3.connect(uri, uri=True)
+    ensure_index_dir_and_permissions(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    try:
+        os.chmod(db_path, 0o600)
+    except Exception:
+        pass
+    return conn
+
+def init_index_schema(conn, force=False):
+    c = conn.cursor()
+    if force:
+        c.executescript("""
+            DROP TRIGGER IF EXISTS messages_idx_ai;
+            DROP TRIGGER IF EXISTS messages_idx_ad;
+            DROP TRIGGER IF EXISTS messages_idx_au;
+            DROP TABLE IF EXISTS messages_fts;
+            DROP TABLE IF EXISTS messages_idx;
+            DROP TABLE IF EXISTS attachments_idx;
+            DROP TABLE IF EXISTS contacts_idx;
+            DROP TABLE IF EXISTS meta;
+        """)
+
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS messages_idx (
+            msg_id INTEGER PRIMARY KEY,
+            guid TEXT,
+            chat_id INTEGER,
+            handle_id INTEGER,
+            is_from_me INTEGER,
+            date INTEGER,
+            date_unix INTEGER,
+            item_type INTEGER,
+            has_attachments INTEGER,
+            text_decoded TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_idx_chat_id ON messages_idx(chat_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_idx_date_unix ON messages_idx(date_unix);
+        CREATE INDEX IF NOT EXISTS idx_messages_idx_date ON messages_idx(date);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            text_decoded,
+            content='messages_idx',
+            content_rowid='msg_id',
+            tokenize="unicode61 remove_diacritics 2"
+        );
+
+        CREATE TRIGGER IF NOT EXISTS messages_idx_ai AFTER INSERT ON messages_idx BEGIN
+            INSERT INTO messages_fts(rowid, text_decoded) VALUES (new.msg_id, new.text_decoded);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_idx_ad AFTER DELETE ON messages_idx BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, text_decoded) VALUES('delete', old.msg_id, old.text_decoded);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_idx_au AFTER UPDATE ON messages_idx BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, text_decoded) VALUES('delete', old.msg_id, old.text_decoded);
+            INSERT INTO messages_fts(rowid, text_decoded) VALUES (new.msg_id, new.text_decoded);
+        END;
+
+        CREATE TABLE IF NOT EXISTS attachments_idx (
+            attachment_id INTEGER,
+            msg_id INTEGER,
+            filename TEXT,
+            transfer_name TEXT,
+            mime_type TEXT,
+            uti TEXT,
+            total_bytes INTEGER,
+            path TEXT,
+            PRIMARY KEY (attachment_id, msg_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_attachments_idx_msg_id ON attachments_idx(msg_id);
+
+        CREATE TABLE IF NOT EXISTS contacts_idx (
+            handle TEXT PRIMARY KEY,
+            display_name TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS meta (
+            schema_version INTEGER,
+            last_indexed_msg_id INTEGER,
+            last_full_sync_at TEXT,
+            chat_db_inode INTEGER,
+            chat_db_size INTEGER
+        );
+    """)
+
+    c.execute("SELECT COUNT(*) FROM meta")
+    if c.fetchone()[0] == 0:
+        c.execute("""
+            INSERT INTO meta (schema_version, last_indexed_msg_id, last_full_sync_at, chat_db_inode, chat_db_size)
+            VALUES (?, 0, NULL, 0, 0)
+        """, (INDEX_SCHEMA_VERSION,))
+    conn.commit()
+
+def build_index(batch_size=5000, force_rebuild=False):
+    try:
+        os.nice(15)
+    except Exception:
+        pass
+
+    db_path = get_index_db_path()
+    if force_rebuild and os.path.exists(db_path):
+        for ext in ("", "-wal", "-shm"):
+            p = db_path + ext
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+    conn_idx = get_index_db_connection()
+    init_index_schema(conn_idx, force=force_rebuild)
+
+    conn_chat = get_db_connection()
+    cur_chat = conn_chat.cursor()
+    cur_idx = conn_idx.cursor()
+
+    cur_idx.execute("SELECT last_indexed_msg_id FROM meta LIMIT 1")
+    meta_row = cur_idx.fetchone()
+    last_id = meta_row[0] if (meta_row and not force_rebuild) else 0
+
+    cur_chat.execute("SELECT MAX(ROWID) FROM message")
+    max_row = cur_chat.fetchone()
+    max_id = max_row[0] if (max_row and max_row[0]) else 0
+
+    chat_db_path = get_db_path()
+    try:
+        st = os.stat(chat_db_path)
+        inode = st.st_ino
+        size = st.st_size
+    except Exception:
+        inode = 0
+        size = 0
+
+    sys.stderr.write(f"[Index] Building index from msg_id {last_id} to {max_id} (batch size: {batch_size})...\n")
+
+    available_cols = message_column_names(cur_chat)
+    att_cols = set()
+    try:
+        cur_chat.execute("PRAGMA table_info(attachment)")
+        att_cols = {r[1] for r in cur_chat.fetchall()}
+    except Exception:
+        pass
+
+    uti_select = "a.uti" if "uti" in att_cols else "NULL AS uti"
+    user_info_select = "a.user_info" if "user_info" in att_cols else "NULL AS user_info"
+    attr_body_select = "m.attributedBody" if "attributedBody" in available_cols else "NULL AS attributed_body"
+    item_type_select = "m.item_type" if "item_type" in available_cols else "0 AS item_type"
+
+    total_indexed = 0
+
+    while True:
+        query = f"""
+            SELECT 
+                m.ROWID as msg_id,
+                m.guid,
+                MIN(cmj.chat_id) as chat_id,
+                m.handle_id,
+                m.is_from_me,
+                m.date,
+                {item_type_select},
+                m.text,
+                {attr_body_select}
+            FROM message m
+            LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+            WHERE m.ROWID > ?
+            GROUP BY m.ROWID
+            ORDER BY m.ROWID ASC
+            LIMIT ?
+        """
+        cur_chat.execute(query, (last_id, batch_size))
+        rows = cur_chat.fetchall()
+        if not rows:
+            break
+
+        msg_ids = [r[0] for r in rows]
+        att_map = {}
+        if msg_ids:
+            placeholders = ",".join(["?"] * len(msg_ids))
+            att_query = f"""
+                SELECT 
+                    maj.message_id,
+                    a.ROWID,
+                    a.filename,
+                    a.mime_type,
+                    a.transfer_name,
+                    a.total_bytes,
+                    {uti_select},
+                    {user_info_select}
+                FROM message_attachment_join maj
+                JOIN attachment a ON maj.attachment_id = a.ROWID
+                WHERE maj.message_id IN ({placeholders})
+            """
+            cur_chat.execute(att_query, msg_ids)
+            for a_msg_id, a_id, a_fn, a_mime, a_tf, a_bytes, a_uti, a_uinfo in cur_chat.fetchall():
+                if a_msg_id not in att_map:
+                    att_map[a_msg_id] = []
+                att_map[a_msg_id].append({
+                    "attachment_id": a_id,
+                    "filename": a_fn,
+                    "mime_type": a_mime,
+                    "transfer_name": a_tf,
+                    "total_bytes": a_bytes or 0,
+                    "uti": a_uti,
+                    "user_info": a_uinfo,
+                })
+
+        batch_msgs = []
+        batch_atts = []
+
+        for r in rows:
+            m_id, guid, chat_id, handle_id, is_from_me, date_val, item_type, text_val, attr_body = r
+            atts = att_map.get(m_id, [])
+            has_atts = 1 if atts else 0
+
+            date_num = int(date_val) if date_val else 0
+            if abs(date_num) > 10_000_000_000:
+                apple_sec = date_num / 1_000_000_000
+            else:
+                apple_sec = float(date_num)
+            date_unix = int(978307200 + apple_sec) if date_num else 0
+
+            decoded = text_val or ""
+            if not decoded or not decoded.strip():
+                if attr_body:
+                    decoded = parse_attributed_body(attr_body)
+                else:
+                    decoded = ""
+
+            for a in atts:
+                if a.get("user_info"):
+                    p = extract_attachment_user_info(a["user_info"])
+                    transcript = p.get("audio-transcription")
+                    if transcript:
+                        if decoded:
+                            decoded = f"{decoded} {transcript}"
+                        else:
+                            decoded = transcript
+                        break
+
+            batch_msgs.append((
+                m_id, guid, chat_id, handle_id, int(is_from_me or 0),
+                date_num, date_unix, int(item_type or 0), has_atts, decoded
+            ))
+
+            for a in atts:
+                fn = os.path.basename(a["filename"]) if a["filename"] else (a["transfer_name"] or "attachment")
+                batch_atts.append((
+                    a["attachment_id"],
+                    m_id,
+                    fn,
+                    a["transfer_name"] or fn,
+                    a["mime_type"] or "application/octet-stream",
+                    a["uti"] or None,
+                    a["total_bytes"],
+                    a["filename"] or "",
+                ))
+
+        cur_idx.executemany("""
+            INSERT INTO messages_idx (
+                msg_id, guid, chat_id, handle_id, is_from_me,
+                date, date_unix, item_type, has_attachments, text_decoded
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(msg_id) DO UPDATE SET
+                guid = excluded.guid,
+                chat_id = excluded.chat_id,
+                handle_id = excluded.handle_id,
+                is_from_me = excluded.is_from_me,
+                date = excluded.date,
+                date_unix = excluded.date_unix,
+                item_type = excluded.item_type,
+                has_attachments = excluded.has_attachments,
+                text_decoded = excluded.text_decoded
+        """, batch_msgs)
+
+        if batch_atts:
+            cur_idx.executemany("""
+                INSERT INTO attachments_idx (
+                    attachment_id, msg_id, filename, transfer_name,
+                    mime_type, uti, total_bytes, path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(attachment_id, msg_id) DO UPDATE SET
+                    filename = excluded.filename,
+                    transfer_name = excluded.transfer_name,
+                    mime_type = excluded.mime_type,
+                    uti = excluded.uti,
+                    total_bytes = excluded.total_bytes,
+                    path = excluded.path
+            """, batch_atts)
+
+        last_id = rows[-1][0]
+        cur_idx.execute("UPDATE meta SET last_indexed_msg_id = ?", (last_id,))
+        conn_idx.commit()
+        total_indexed += len(rows)
+        sys.stderr.write(f"[Index] Indexed up to msg_id {last_id} ({total_indexed} rows in this run)...\n")
+
+    cmap = get_contacts_map()
+    if cmap:
+        cur_idx.executemany(
+            """INSERT INTO contacts_idx (handle, display_name)
+               VALUES (?, ?)
+               ON CONFLICT(handle) DO UPDATE SET display_name = excluded.display_name""",
+            [(k, v) for k, v in cmap.items()]
+        )
+
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    cur_idx.execute("""
+        UPDATE meta SET 
+            last_indexed_msg_id = ?,
+            last_full_sync_at = ?,
+            chat_db_inode = ?,
+            chat_db_size = ?
+    """, (last_id, now_iso, inode, size))
+    conn_idx.commit()
+
+    conn_chat.close()
+    conn_idx.close()
+    sys.stderr.write(f"[Index] Build complete: indexed {total_indexed} rows up to msg_id {last_id}.\n")
+
+def sync_index(recheck_days=None):
+    db_path = get_index_db_path()
+    if not os.path.exists(db_path):
+        build_index()
+        return
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        c = conn.cursor()
+        c.execute("SELECT schema_version FROM meta LIMIT 1")
+        row = c.fetchone()
+        conn.close()
+        if not row or row[0] != INDEX_SCHEMA_VERSION:
+            sys.stderr.write("[Index] Schema version changed or missing. Rebuilding index.\n")
+            build_index(force_rebuild=True)
+            return
+    except Exception as err:
+        sys.stderr.write(f"[Index] Error verifying index schema ({err}). Rebuilding index.\n")
+        build_index(force_rebuild=True)
+        return
+
+    build_index(batch_size=5000, force_rebuild=False)
+
+    if recheck_days is None:
+        recheck_days = get_recheck_days()
+
+    if recheck_days > 0:
+        conn_idx = get_index_db_connection()
+        conn_chat = get_db_connection()
+        cur_idx = conn_idx.cursor()
+        cur_chat = conn_chat.cursor()
+
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        threshold_dt = now_dt - datetime.timedelta(days=recheck_days)
+        threshold_unix = int(threshold_dt.timestamp())
+
+        cur_idx.execute("SELECT msg_id, text_decoded FROM messages_idx WHERE date_unix >= ?", (threshold_unix,))
+        indexed_rows = {r[0]: r[1] for r in cur_idx.fetchall()}
+
+        if indexed_rows:
+            placeholders = ",".join(["?"] * len(indexed_rows))
+            available_cols = message_column_names(cur_chat)
+            attr_select = "m.attributedBody" if "attributedBody" in available_cols else "NULL AS attributed_body"
+            cur_chat.execute(f"""
+                SELECT m.ROWID, m.text, {attr_select}
+                FROM message m
+                WHERE m.ROWID IN ({placeholders})
+            """, list(indexed_rows.keys()))
+            chat_rows = {r[0]: (r[1], r[2]) for r in cur_chat.fetchall()}
+
+            to_delete = [mid for mid in indexed_rows if mid not in chat_rows]
+            if to_delete:
+                del_ph = ",".join(["?"] * len(to_delete))
+                cur_idx.execute(f"DELETE FROM messages_idx WHERE msg_id IN ({del_ph})", to_delete)
+                cur_idx.execute(f"DELETE FROM attachments_idx WHERE msg_id IN ({del_ph})", to_delete)
+                conn_idx.commit()
+                sys.stderr.write(f"[Index] Removed {len(to_delete)} deleted messages from index.\n")
+
+            updated_count = 0
+            for mid, (raw_text, attr_body) in chat_rows.items():
+                old_text = indexed_rows.get(mid) or ""
+                new_text = raw_text or ""
+                if not new_text or not new_text.strip():
+                    if attr_body:
+                        new_text = parse_attributed_body(attr_body)
+                    else:
+                        new_text = ""
+                if new_text != old_text:
+                    cur_idx.execute("UPDATE messages_idx SET text_decoded = ? WHERE msg_id = ?", (new_text, mid))
+                    updated_count += 1
+
+            if updated_count > 0:
+                conn_idx.commit()
+                sys.stderr.write(f"[Index] Refreshed {updated_count} edited messages in index.\n")
+
+            att_cols = set()
+            try:
+                cur_chat.execute("PRAGMA table_info(attachment)")
+                att_cols = {r[1] for r in cur_chat.fetchall()}
+            except Exception:
+                pass
+            uti_select = "a.uti" if "uti" in att_cols else "NULL AS uti"
+            cur_chat.execute(f"""
+                SELECT maj.message_id, a.ROWID, a.filename, a.mime_type, a.transfer_name, a.total_bytes, {uti_select}
+                FROM message_attachment_join maj
+                JOIN attachment a ON maj.attachment_id = a.ROWID
+                WHERE maj.message_id IN ({placeholders})
+            """, list(indexed_rows.keys()))
+            recheck_atts = cur_chat.fetchall()
+            if recheck_atts:
+                batch_atts = []
+                for m_id, a_id, a_fn, a_mime, a_tf, a_bytes, a_uti in recheck_atts:
+                    fn = os.path.basename(a_fn) if a_fn else (a_tf or "attachment")
+                    batch_atts.append((
+                        a_id, m_id, fn, a_tf or fn, a_mime or "application/octet-stream",
+                        a_uti or None, a_bytes or 0, a_fn or ""
+                    ))
+                cur_idx.executemany("""
+                    INSERT INTO attachments_idx (
+                        attachment_id, msg_id, filename, transfer_name,
+                        mime_type, uti, total_bytes, path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(attachment_id, msg_id) DO UPDATE SET
+                        filename = excluded.filename,
+                        transfer_name = excluded.transfer_name,
+                        mime_type = excluded.mime_type,
+                        uti = excluded.uti,
+                        total_bytes = excluded.total_bytes,
+                        path = excluded.path
+                """, batch_atts)
+                conn_idx.commit()
+
+        conn_chat.close()
+        conn_idx.close()
+
+def get_index_status():
+    db_path = get_index_db_path()
+    enabled = is_index_enabled()
+    exists = os.path.exists(db_path)
+
+    conn_chat = get_db_connection()
+    cur_chat = conn_chat.cursor()
+    cur_chat.execute("SELECT MAX(ROWID) FROM message")
+    max_row = cur_chat.fetchone()
+    chat_max_id = max_row[0] if (max_row and max_row[0]) else 0
+    conn_chat.close()
+
+    if not exists:
+        return {
+            "enabled": enabled,
+            "index_db_path": db_path,
+            "exists": False,
+            "schema_version": None,
+            "last_indexed_msg_id": 0,
+            "chat_db_max_msg_id": chat_max_id,
+            "lag": chat_max_id,
+            "is_caught_up": False,
+            "messages_count": 0,
+            "attachments_count": 0,
+            "contacts_count": 0,
+            "file_size_bytes": 0,
+            "last_full_sync_at": None,
+        }
+
+    try:
+        conn_idx = get_index_db_connection(read_only=True)
+        cur_idx = conn_idx.cursor()
+        cur_idx.execute("SELECT schema_version, last_indexed_msg_id, last_full_sync_at FROM meta LIMIT 1")
+        meta = cur_idx.fetchone()
+        schema_version, last_id, last_sync = meta if meta else (None, 0, None)
+
+        cur_idx.execute("SELECT COUNT(*) FROM messages_idx")
+        messages_count = cur_idx.fetchone()[0]
+
+        cur_idx.execute("SELECT COUNT(*) FROM attachments_idx")
+        attachments_count = cur_idx.fetchone()[0]
+
+        cur_idx.execute("SELECT COUNT(*) FROM contacts_idx")
+        contacts_count = cur_idx.fetchone()[0]
+
+        conn_idx.close()
+
+        file_size = os.path.getsize(db_path)
+        lag = max(0, chat_max_id - (last_id or 0))
+        is_caught_up = (lag == 0)
+
+        return {
+            "enabled": enabled,
+            "index_db_path": db_path,
+            "exists": True,
+            "schema_version": schema_version,
+            "last_indexed_msg_id": last_id or 0,
+            "chat_db_max_msg_id": chat_max_id,
+            "lag": lag,
+            "is_caught_up": is_caught_up,
+            "messages_count": messages_count,
+            "attachments_count": attachments_count,
+            "contacts_count": contacts_count,
+            "file_size_bytes": file_size,
+            "last_full_sync_at": last_sync,
+        }
+    except Exception as err:
+        return {
+            "enabled": enabled,
+            "index_db_path": db_path,
+            "exists": True,
+            "error": str(err),
+            "schema_version": None,
+            "last_indexed_msg_id": 0,
+            "chat_db_max_msg_id": chat_max_id,
+            "lag": chat_max_id,
+            "is_caught_up": False,
+            "messages_count": 0,
+            "attachments_count": 0,
+            "contacts_count": 0,
+            "file_size_bytes": os.path.getsize(db_path) if os.path.exists(db_path) else 0,
+            "last_full_sync_at": None,
+        }
+
+def cli_index_status(args):
+    status = get_index_status()
+    if getattr(args, "json", False):
+        print(json.dumps(status, indent=2))
+    else:
+        status_label = "Enabled (Caught up)" if status.get("is_caught_up") else ("Enabled (Lagging)" if status.get("enabled") else "Disabled")
+        size_kb = status.get("file_size_bytes", 0) / 1024
+        print("iMessage Local Index Status:")
+        print("----------------------------")
+        print(f"Status: {status_label}")
+        print(f"Index Database: {status.get('index_db_path')}")
+        print(f"File Size: {size_kb:.1f} KB")
+        print(f"Schema Version: {status.get('schema_version')}")
+        print(f"Last Indexed Message ID: {status.get('last_indexed_msg_id')}")
+        print(f"chat.db Max Message ID: {status.get('chat_db_max_msg_id')}")
+        print(f"Lag: {status.get('lag')} messages behind")
+        print(f"Messages Indexed: {status.get('messages_count')}")
+        print(f"Attachments Indexed: {status.get('attachments_count')}")
+        print(f"Contacts Indexed: {status.get('contacts_count')}")
+        print(f"Last Sync: {status.get('last_full_sync_at')}")
+
+def is_index_healthy_and_caught_up():
+    if not is_index_enabled():
+        return False
+    status = get_index_status()
+    if not status.get("exists"):
+        sys.stderr.write("[Index] Warning: Index database does not exist. Falling back to live chat.db search.\n")
+        return False
+    if status.get("schema_version") != INDEX_SCHEMA_VERSION:
+        sys.stderr.write(f"[Index] Warning: Index schema mismatch ({status.get('schema_version')} != {INDEX_SCHEMA_VERSION}). Falling back to live chat.db search.\n")
+        return False
+    if status.get("error"):
+        sys.stderr.write(f"[Index] Warning: Index database corrupted or error ({status.get('error')}). Falling back to live chat.db search.\n")
+        return False
+    if not status.get("is_caught_up"):
+        sys.stderr.write(f"[Index] Warning: Index is behind chat.db (lag: {status.get('lag')} rows). Falling back to live chat.db search.\n")
+        return False
+    return True
+
+def format_fts5_query(query_str):
+    q = (query_str or "").strip()
+    if not q:
+        return ""
+    if q.startswith('"') and q.endswith('"') and len(q) > 1:
+        inner = q[1:-1].replace('"', '""')
+        return f'"{inner}"'
+    tokens = q.split()
+    sanitized = []
+    for token in tokens:
+        clean = token.replace('"', '').strip()
+        if not clean:
+            continue
+        if clean.endswith('*'):
+            clean_word = clean[:-1].strip()
+            if clean_word:
+                sanitized.append(f'"{clean_word}"*')
+        else:
+            sanitized.append(f'"{clean}"*')
+    return " ".join(sanitized)
+
+def populate_cached_decoded_text(rows):
+    if not is_index_enabled() or not rows:
+        return
+    db_path = get_index_db_path()
+    if not os.path.exists(db_path):
+        return
+    try:
+        need_lookup = [r["msg_id"] for r in rows if not r.get("text") and r.get("attributed_body")]
+        if not need_lookup:
+            return
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        c = conn.cursor()
+        placeholders = ",".join(["?"] * len(need_lookup))
+        c.execute(f"SELECT msg_id, text_decoded FROM messages_idx WHERE msg_id IN ({placeholders})", need_lookup)
+        text_map = {r[0]: r[1] for r in c.fetchall()}
+        conn.close()
+        for r in rows:
+            if r["msg_id"] in text_map and text_map[r["msg_id"]]:
+                r["text"] = text_map[r["msg_id"]]
+                r["attributed_body"] = None
+    except Exception:
+        pass
+
 def format_size(bytes_num):
     if not bytes_num: return "0 B"
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -275,6 +920,19 @@ def normalize_handle(val):
     return clean.lower()
 
 def get_contacts_map():
+    if is_index_enabled():
+        db_path = get_index_db_path()
+        if os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                c = conn.cursor()
+                c.execute("SELECT handle, display_name FROM contacts_idx")
+                rows = c.fetchall()
+                conn.close()
+                if rows:
+                    return {r[0]: r[1] for r in rows}
+            except Exception:
+                pass
     ab_paths = glob.glob(os.path.expanduser('~/Library/Application Support/AddressBook/**/*.abcddb'), recursive=True)
     cmap = {}
     for p in ab_paths:
@@ -1497,6 +2155,7 @@ def read_messages(args):
         params.append(since)
     where += " ORDER BY m.ROWID ASC"
     rows = fetch_message_dicts(cursor, select_sql, where, params)
+    populate_cached_decoded_text(rows)
     mode = presentation_options(args)
     items = present_rows(cursor, rows, None, False, mode)
     filtered, next_since = annotate_batch(items, rows, since)
@@ -1514,28 +2173,102 @@ def search_messages(args):
     cursor = conn.cursor()
     query_str = args.query
     limit = args.limit or 30
+    order = getattr(args, "order", None) or "recent"
+    if order not in ("recent", "relevance"):
+        order = "recent"
     available = message_column_names(cursor)
     select_sql = message_select_list(available)
-    where = """(
-        m.text LIKE ?
-        OR (m.text IS NULL AND m.attributedBody LIKE ?)
-        OR EXISTS (
-            SELECT 1 FROM message_attachment_join maj
-            JOIN attachment a ON maj.attachment_id = a.ROWID
-            WHERE maj.message_id = m.ROWID AND a.user_info LIKE ?
-        )
-    )"""
-    params = [f"%{query_str}%", f"%{query_str}%", f"%{query_str}%"]
     since = getattr(args, "since_msg_id", None)
-    if since is not None:
-        where += " AND m.ROWID > ?"
-        params.append(since)
-    where += " ORDER BY m.date DESC LIMIT ?"
-    params.append(int(limit) + 1)
-    rows = fetch_message_dicts(cursor, select_sql, where, params)
-    has_more = len(rows) > limit
-    if has_more:
-        rows = rows[:limit]
+    chat_filter = getattr(args, "chat", None)
+
+    use_index = is_index_healthy_and_caught_up()
+    matching_ids = None
+
+    if use_index:
+        try:
+            fts_query = format_fts5_query(query_str)
+            if not fts_query:
+                matching_ids = []
+            else:
+                conn_idx = get_index_db_connection(read_only=True)
+                cur_idx = conn_idx.cursor()
+                where_clauses = ["messages_fts MATCH ?"]
+                params = [fts_query]
+
+                if since is not None:
+                    where_clauses.append("idx.msg_id > ?")
+                    params.append(since)
+
+                if chat_filter:
+                    chat_ids = resolve_chat_ids(cursor, chat_filter)
+                    if chat_ids:
+                        placeholders = ",".join(["?"] * len(chat_ids))
+                        where_clauses.append(f"idx.chat_id IN ({placeholders})")
+                        params.extend(chat_ids)
+                    else:
+                        where_clauses.append("1 = 0")
+
+                order_sql = "bm25(messages_fts) ASC, idx.date DESC" if order == "relevance" else "idx.date DESC, idx.msg_id DESC"
+                sql = f"""
+                    SELECT idx.msg_id
+                    FROM messages_fts fts
+                    JOIN messages_idx idx ON fts.rowid = idx.msg_id
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY {order_sql}
+                    LIMIT ?
+                """
+                params.append(int(limit) + 1)
+                cur_idx.execute(sql, params)
+                matching_ids = [r[0] for r in cur_idx.fetchall()]
+                conn_idx.close()
+        except Exception as err:
+            sys.stderr.write(f"[Index] Warning: FTS query failed ({err}). Falling back to live chat.db search.\n")
+            use_index = False
+            matching_ids = None
+
+    if matching_ids is not None:
+        has_more = len(matching_ids) > limit
+        if has_more:
+            matching_ids = matching_ids[:limit]
+
+        if not matching_ids:
+            rows = []
+        else:
+            placeholders = ",".join(["?"] * len(matching_ids))
+            fetched = fetch_message_dicts(cursor, select_sql, f"m.ROWID IN ({placeholders})", matching_ids)
+            row_map = {r["msg_id"]: r for r in fetched}
+            rows = [row_map[mid] for mid in matching_ids if mid in row_map]
+    else:
+        where = """(
+            m.text LIKE ?
+            OR (m.text IS NULL AND m.attributedBody LIKE ?)
+            OR EXISTS (
+                SELECT 1 FROM message_attachment_join maj
+                JOIN attachment a ON maj.attachment_id = a.ROWID
+                WHERE maj.message_id = m.ROWID AND a.user_info LIKE ?
+            )
+        )"""
+        params = [f"%{query_str}%", f"%{query_str}%", f"%{query_str}%"]
+        if since is not None:
+            where += " AND m.ROWID > ?"
+            params.append(since)
+        if chat_filter:
+            chat_ids = resolve_chat_ids(cursor, chat_filter)
+            if chat_ids:
+                placeholders = chat_placeholders(chat_ids)
+                where += f" AND c.ROWID IN ({placeholders})"
+                params.extend(chat_ids)
+            else:
+                where += " AND 1 = 0"
+
+        where += " ORDER BY m.date DESC LIMIT ?"
+        params.append(int(limit) + 1)
+        rows = fetch_message_dicts(cursor, select_sql, where, params)
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+
+    populate_cached_decoded_text(rows)
     mode = presentation_options(args)
     items = present_rows(cursor, rows, None, False, mode)
     filtered, next_since = annotate_batch(items, rows, since)
@@ -1549,6 +2282,41 @@ def search_messages(args):
 
 def search_contacts(args):
     query = (args.query or "").lower()
+    if is_index_enabled():
+        db_path = get_index_db_path()
+        if os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                c = conn.cursor()
+                if query:
+                    c.execute("""
+                        SELECT handle, display_name FROM contacts_idx
+                        WHERE LOWER(handle) LIKE ? OR LOWER(display_name) LIKE ?
+                    """, (f"%{query}%", f"%{query}%"))
+                else:
+                    c.execute("SELECT handle, display_name FROM contacts_idx LIMIT 100")
+                rows = c.fetchall()
+                conn.close()
+                if rows:
+                    contacts = []
+                    for h, name in rows:
+                        contacts.append({
+                            'name': name or "Unknown",
+                            'organization': "",
+                            'phone': h if '@' not in h else "",
+                            'email': h if '@' in h else ""
+                        })
+                    if getattr(args, 'json', False):
+                        print(json.dumps(contacts, indent=2))
+                    else:
+                        print(f"{'Name':<30} | {'Phone / Email':<30}")
+                        print("-" * 65)
+                        for c_item in contacts:
+                            target = c_item['phone'] or c_item['email']
+                            print(f"{c_item['name']:<30} | {target:<30}")
+                    return
+            except Exception:
+                pass
     ab_paths = glob.glob(os.path.expanduser('~/Library/Application Support/AddressBook/**/*.abcddb'), recursive=True)
     
     contacts = []
@@ -1926,6 +2694,7 @@ def get_recent_messages(args):
             rows = dedupe_rows(rows + fetch_reactions_for_messages(
                 cursor, select_sql, chat_ids, rows, available
             ))
+    populate_cached_decoded_text(rows)
     cmap = get_contacts_map()
     items = present_rows(cursor, rows, cmap, True, mode)
     filtered, next_since = annotate_batch(items, rows, since)
@@ -2482,7 +3251,28 @@ def main():
     search_parser = subparsers.add_parser("search", help="Search message history")
     search_parser.add_argument("query", help="Search keyword or phrase")
     add_read_presentation_args(search_parser, with_limit=True, default_limit=30)
+    search_parser.add_argument("--order", choices=["recent", "relevance"], default="recent", help="Sort order for search results (recent or relevance)")
+    search_parser.add_argument("--chat", default=None, help="Filter search to a specific chat ROWID or identifier")
     search_parser.set_defaults(func=search_messages)
+
+    index_parser = subparsers.add_parser("index", help="Manage local sidecar index")
+    index_sub = index_parser.add_subparsers(dest="index_action", required=True)
+
+    build_p = index_sub.add_parser("build", help="Build index database from chat.db")
+    build_p.add_argument("--batch-size", type=int, default=5000, help="Batch size for indexing (default: 5000)")
+    build_p.set_defaults(func=lambda a: build_index(batch_size=a.batch_size, force_rebuild=False))
+
+    rebuild_p = index_sub.add_parser("rebuild", help="Delete and rebuild index database")
+    rebuild_p.add_argument("--batch-size", type=int, default=5000, help="Batch size for indexing (default: 5000)")
+    rebuild_p.set_defaults(func=lambda a: build_index(batch_size=a.batch_size, force_rebuild=True))
+
+    status_p = index_sub.add_parser("status", help="Show index status, row counts, lag, and file size")
+    status_p.add_argument("--json", action="store_true", help="Output status in JSON format")
+    status_p.set_defaults(func=cli_index_status)
+
+    sync_p = index_sub.add_parser("sync", help="Incrementally sync new rows and recheck recent edits/deletes")
+    sync_p.add_argument("--recheck-days", type=int, default=None, help="Days of history to re-check for edits and deletes")
+    sync_p.set_defaults(func=lambda a: sync_index(recheck_days=a.recheck_days))
 
     search_group_parser = subparsers.add_parser("search-group", help="Search group chats by participant names/handles")
     search_group_parser.add_argument("participants", nargs="+", help="Participant names or phone numbers")
