@@ -274,7 +274,8 @@ Returns:
 | `imessage_search_group_chats` | Exact participant set search across group chats | `participants` (array of strings, required) |
 | `imessage_search_contacts` | Search macOS Address Book by name, phone, or email | `query` (string, optional) |
 | `imessage_get_chat_members` | List members and resolved contact names in group chats | `chat` (string, required) |
-| `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (converts HEIC to JPEG and CAF voice notes to M4A with transcriptions) | `path` (string, required) |
+| `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (converts HEIC to JPEG and CAF voice notes to M4A with transcriptions) | `path` (or `message_id`) |
+| `imessage_download_image` | Download and extract an image attachment (converts HEIC to JPEG, optional destination `output_path`) | `message_id` (or `path`), `output_path`, `include_base64` |
 | `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports dry_run preview & confirm_token) | `recipient` (string, required), `message`, `attachment`, `dry_run`, `confirm_token` |
 | `imessage_edit_message` | Edit a previously sent message by ROWID (subject to 15-minute Apple protocol window and 5-edit limit) | `message_id` (number, required), `text` (string, required) |
 | `imessage_index_status` | Inspect status, row counts, database file size, and sync lag of the local search index | *(none)* |
@@ -299,7 +300,8 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | `contacts` | Search AddressBook contacts by name, email, or phone | `bin/imessage contacts "Paul Atreides" --json` |
 | `members` | List members and handles in a group chat | `bin/imessage members 1767 --json` |
 | `search-group` | Search group chats by exact participant set | `bin/imessage search-group "paul@caladan.org" "chani@sietch.net"` |
-| `attachment` | Inspect attachment file metadata and base64 payload | `bin/imessage attachment "~/Library/Messages/Attachments/..."` |
+| `attachment` | Inspect attachment file metadata and base64 payload by path or message ID | `bin/imessage attachment --message-id 198097 --json` |
+| `download-image` | Download/convert image attachment to JPEG, optionally saving to output path | `bin/imessage download-image --message-id 198097 --output-path ~/Downloads/photo.jpg --json` |
 | `changes` | Query message ROWIDs and receipt transitions since cursor | `bin/imessage changes --since-id 1200 --json` |
 | `index build` | Build local sidecar search index in batches | `bin/imessage index build --batch-size 5000` |
 | `index status` | Show index row counts, lag, and file size | `bin/imessage index status --json` |

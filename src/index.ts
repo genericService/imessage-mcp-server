@@ -99,7 +99,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.6.0';
+const SERVER_VERSION = '1.7.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -147,7 +147,7 @@ iMessage MCP Server Instructions:
 3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' with chat or its alias chat_id. The value is the numeric chat ROWID from imessage_list_chats (rowid / chat_id), or a display name, phone number, or email. Pass since_msg_id to poll only messages with a greater id, and with_meta true to read next_since_msg_id (advance the cursor with that, not the last visible msg_id). Messages include ISO timestamps, reply context (reply_to with parent msg_id, guid, sender, and text), delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso; note that read_at on outgoing messages requires the recipient to have read receipts enabled), link previews, structured reactions, voice note transcriptions, and edit history. Tapbacks are structured reaction objects.
 4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
 5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
-6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments (converts HEIC photos to JPEG and CAF voice notes to playable/transcribable M4A audio with on-device speech-to-text transcripts).
+6. Multimodal Attachments & Images: Call 'imessage_download_image' to download image attachments by message_id or path, converting HEIC photos to JPEG and saving to output_path. Call 'imessage_get_attachment_payload' to get base64 data for any attachment (converts HEIC photos to JPEG and CAF voice notes to playable/transcribable M4A audio with on-device speech-to-text transcripts).
 7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
 8. Call History: Call 'imessage_get_call_history' to inspect phone and FaceTime call history, or pass 'include_calls: true' on reading tools to merge call records into conversation timelines.
 9. Index Status: Call 'imessage_index_status' to inspect local search index statistics, sync freshness, and lag.
@@ -465,7 +465,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_get_attachment_payload',
     description:
-      'Fetch metadata and base64 payload for an attachment file (converts HEIC photos to JPEG and CAF audio voice notes to M4A for multimodal LLMs, returning duration and on-device speech-to-text transcriptions).',
+      'Fetch metadata and base64 payload for an attachment file (converts HEIC photos to JPEG and CAF audio voice notes to M4A for multimodal LLMs, returning duration and on-device speech-to-text transcriptions). Accepts either path or message_id.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -475,9 +475,67 @@ export const TOOLS: Tool[] = [
         },
         file: { type: 'string', description: 'Alias of path.' },
         file_path: { type: 'string', description: 'Alias of path.' },
-        filepath: { type: 'string', description: 'Alias of path.' }
+        filepath: { type: 'string', description: 'Alias of path.' },
+        message_id: {
+          type: 'integer',
+          description: 'Optional numeric message ROWID to look up attachment from chat.db. Aliases: messageId, msg_id, msgId.'
+        },
+        messageId: { type: 'integer', description: 'Alias of message_id.' },
+        msg_id: { type: 'integer', description: 'Alias of message_id.' },
+        msgId: { type: 'integer', description: 'Alias of message_id.' }
       },
-      required: ['path']
+      anyOf: [
+        { required: ['path'] },
+        { required: ['file'] },
+        { required: ['file_path'] },
+        { required: ['filepath'] },
+        { required: ['message_id'] },
+        { required: ['messageId'] },
+        { required: ['msg_id'] },
+        { required: ['msgId'] }
+      ]
+    }
+  },
+  {
+    name: 'imessage_download_image',
+    description:
+      'Download and extract an image attachment from an iMessage by message ID or file path. Converts HEIC photos to JPEG for multimodal LLMs and optionally copies the image to a custom destination output_path.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: {
+          type: 'integer',
+          description: 'The numeric message ROWID containing the image attachment. Aliases: messageId, msg_id, msgId.'
+        },
+        messageId: { type: 'integer', description: 'Alias of message_id.' },
+        msg_id: { type: 'integer', description: 'Alias of message_id.' },
+        msgId: { type: 'integer', description: 'Alias of message_id.' },
+        path: {
+          type: 'string',
+          description: 'POSIX path to the image attachment file. Aliases: file, file_path, filepath.'
+        },
+        file: { type: 'string', description: 'Alias of path.' },
+        file_path: { type: 'string', description: 'Alias of path.' },
+        filepath: { type: 'string', description: 'Alias of path.' },
+        output_path: {
+          type: 'string',
+          description: 'Optional destination file path where the extracted/converted image should be saved.'
+        },
+        include_base64: {
+          type: 'boolean',
+          description: 'Whether to include base64-encoded image data in the response (default true).'
+        }
+      },
+      anyOf: [
+        { required: ['message_id'] },
+        { required: ['messageId'] },
+        { required: ['msg_id'] },
+        { required: ['msgId'] },
+        { required: ['path'] },
+        { required: ['file'] },
+        { required: ['file_path'] },
+        { required: ['filepath'] }
+      ]
     }
   },
   {
@@ -850,8 +908,9 @@ function createMcpServer(): Server {
       targetParam = readChatArg(toolArgs);
     } else if (name === 'imessage_search_messages' || name === 'imessage_search_contacts') {
       targetParam = readStringArg(toolArgs, ['query', 'q', 'search']);
-    } else if (name === 'imessage_get_attachment_payload') {
-      targetParam = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
+    } else if (name === 'imessage_get_attachment_payload' || name === 'imessage_download_image' || name === 'download_image') {
+      targetParam = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']) ||
+        readStringArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
     } else if (name === 'imessage_get_edit_history' || name === 'imessage_edit_message') {
       targetParam = readStringArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
     } else if (name === 'imessage_get_call_history') {
@@ -955,10 +1014,44 @@ function createMcpServer(): Server {
         };
       } else if (name === 'imessage_get_attachment_payload') {
         const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
-        if (!filePath) {
-          throw new Error('Missing required parameter "path"');
+        const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+        if (!filePath && messageId === undefined) {
+          throw new Error('Missing required parameter: either "path" or "message_id" must be provided');
         }
-        const stdout = await runImessageCli(['attachment', filePath, '--json']);
+        const cliArgs = ['attachment', '--json'];
+        if (filePath) {
+          cliArgs.push('--path', filePath);
+        }
+        if (messageId !== undefined) {
+          cliArgs.push('--message-id', String(messageId));
+        }
+        const stdout = await runImessageCli(cliArgs);
+        result = {
+          content: [{ type: 'text', text: stdout }]
+        };
+      } else if (name === 'imessage_download_image' || name === 'download_image') {
+        const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
+        const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+        const outputPath = readStringArg(toolArgs, ['output_path', 'outputPath', 'destination']);
+        const includeBase64 = toolArgs?.include_base64 !== false && toolArgs?.includeBase64 !== false;
+
+        if (!filePath && messageId === undefined) {
+          throw new Error('Missing required parameter: either "message_id" or "path" must be provided');
+        }
+        const cliArgs = ['download-image', '--json'];
+        if (filePath) {
+          cliArgs.push('--path', filePath);
+        }
+        if (messageId !== undefined) {
+          cliArgs.push('--message-id', String(messageId));
+        }
+        if (outputPath) {
+          cliArgs.push('--output-path', outputPath);
+        }
+        if (!includeBase64) {
+          cliArgs.push('--no-base64');
+        }
+        const stdout = await runImessageCli(cliArgs);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -1396,6 +1489,7 @@ app.get('/', (_req, res) => {
     <li><code>imessage_search_contacts</code>: Search macOS contacts by name, phone, or email.</li>
     <li><code>imessage_get_chat_members</code>: Get members of a group chat.</li>
     <li><code>imessage_get_attachment_payload</code>: Fetch attachment metadata and base64 payload.</li>
+    <li><code>imessage_download_image</code>: Download and extract image attachment (converts HEIC to JPEG).</li>
     <li><code>imessage_send_message</code>: Send an iMessage with text and/or attachments.</li>
     <li><code>imessage_get_recent_messages</code>: Preview last N messages, or poll with since_msg_id. chat and chat_id both accept the list ROWID.</li>
     <li><code>imessage_search_group_chats</code>: Find group chats by participant set.</li>

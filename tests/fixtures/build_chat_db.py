@@ -28,6 +28,7 @@ GUID = {
     108: "A1000000-0000-4000-8000-000000000108",
     111: "A1000000-0000-4000-8000-000000000111",
     200: "A1000000-0000-4000-8000-000000000200",
+    201: "A1000000-0000-4000-8000-000000000201",
 }
 
 SPOTIFY_URL = "https://open.spotify.com/track/spice-melange"
@@ -359,6 +360,7 @@ def build(path):
         payload=flat_gazette_payload(),
     )
     add_message(200, 8, 2, 0, "Unrelated Harkonnen rumor", 20)
+    add_message(201, 8, 2, 0, "Look at this sandworm", 21)
 
     c.execute(
         """
@@ -372,6 +374,21 @@ def build(path):
         ),
     )
     c.execute("INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (102, 1)")
+
+    img_fixture_path = os.path.join(os.path.dirname(__file__), "shai_hulud.jpg")
+    img_size = os.path.getsize(img_fixture_path) if os.path.exists(img_fixture_path) else 623
+    c.execute(
+        """
+        INSERT INTO attachment (ROWID, guid, filename, mime_type, transfer_name, total_bytes, uti)
+        VALUES (2, ?, ?, 'image/jpeg', 'shai_hulud.jpg', ?, 'public.jpeg')
+        """,
+        (
+            "ATT-SHAI-HULUD-1",
+            img_fixture_path,
+            img_size,
+        ),
+    )
+    c.execute("INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (201, 2)")
     conn.commit()
     conn.close()
 

@@ -729,6 +729,7 @@ describe('MCP 2026-07-28 Spec Compliance', () => {
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).toContain('imessage_list_chats');
+    expect(text).toContain('imessage_download_image');
   });
 });
 

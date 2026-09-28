@@ -2501,8 +2501,169 @@ def get_members(args):
             print(f"{m['chat_id']:<8} | {m['display_name']:<25} | {m['handle']:<30} | {m['service']:<10}")
     conn.close()
 
+def resolve_attachment_for_message(message_id, image_only=False):
+    """Resolve an attachment filepath from chat.db by message ROWID."""
+    try:
+        conn = sqlite3.connect(f"file:{get_db_path()}?mode=ro", uri=True)
+        c = conn.cursor()
+        c.execute("""
+            SELECT a.filename, a.mime_type, a.transfer_name, a.total_bytes, a.ROWID
+            FROM attachment a
+            JOIN message_attachment_join maj ON a.ROWID = maj.attachment_id
+            WHERE maj.message_id = ?
+            ORDER BY a.ROWID ASC
+        """, (message_id,))
+        rows = c.fetchall()
+        conn.close()
+    except Exception as e:
+        return None, None, f"Database error querying attachments for message #{message_id}: {e}"
+
+    if not rows:
+        return None, None, f"No attachments found for message #{message_id}"
+
+    image_exts = ('.jpg', '.jpeg', '.png', '.heic', '.heif', '.gif', '.webp', '.tiff', '.bmp')
+    for row in rows:
+        fn, mime, tname, size, rowid = row
+        if fn:
+            p = os.path.abspath(os.path.expanduser(fn))
+            ext = os.path.splitext(p)[1].lower()
+            is_img = (mime and mime.startswith('image/')) or ext in image_exts
+            if not image_only or is_img:
+                return p, mime, None
+
+    if not image_only and rows[0][0]:
+        return os.path.abspath(os.path.expanduser(rows[0][0])), rows[0][1], None
+
+    return None, None, f"No image attachment found for message #{message_id}"
+
+
+def download_image(args):
+    """Download and extract an image attachment with optional format conversion to JPEG."""
+    filepath = getattr(args, 'path', None)
+    message_id = getattr(args, 'message_id', None)
+    output_path = getattr(args, 'output_path', None)
+    include_base64 = getattr(args, 'include_base64', True)
+
+    if not filepath and message_id:
+        filepath, _, err = resolve_attachment_for_message(message_id, image_only=True)
+        if err or not filepath:
+            err_res = {
+                "success": False,
+                "message": err or f"No image found for message #{message_id}",
+                "message_id": message_id,
+                "file_path": None,
+                "mime_type": None,
+                "size_bytes": 0,
+                "base64": None
+            }
+            if getattr(args, 'json', False):
+                print(json.dumps(err_res, indent=2))
+            else:
+                print(f"ERROR: {err_res['message']}", file=sys.stderr)
+            sys.exit(1)
+
+    if not filepath:
+        err_res = {
+            "success": False,
+            "message": "Either --path or --message-id must be provided",
+            "message_id": message_id,
+            "file_path": None,
+            "mime_type": None,
+            "size_bytes": 0,
+            "base64": None
+        }
+        if getattr(args, 'json', False):
+            print(json.dumps(err_res, indent=2))
+        else:
+            print("ERROR: Either --path or --message-id must be provided", file=sys.stderr)
+        sys.exit(1)
+
+    filepath = os.path.abspath(os.path.expanduser(filepath))
+    if not os.path.exists(filepath):
+        err_res = {
+            "success": False,
+            "message": f"Attachment file not found at '{filepath}'",
+            "message_id": message_id,
+            "file_path": filepath,
+            "mime_type": None,
+            "size_bytes": 0,
+            "base64": None
+        }
+        if getattr(args, 'json', False):
+            print(json.dumps(err_res, indent=2))
+        else:
+            print(f"ERROR: Attachment file not found at '{filepath}'", file=sys.stderr)
+        sys.exit(1)
+
+    target_path = filepath
+    mime = "application/octet-stream"
+    ext = os.path.splitext(filepath)[1].lower()
+    parent_name = os.path.basename(os.path.dirname(filepath)) or "file"
+    file_base = os.path.splitext(os.path.basename(filepath))[0]
+
+    if ext in ['.heic', '.heif']:
+        jpg_path = f"/tmp/imessage_conv_{parent_name}_{file_base}.jpg"
+        subprocess.run(['sips', '-s', 'format', 'jpeg', filepath, '--out', jpg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(jpg_path):
+            target_path = jpg_path
+            mime = "image/jpeg"
+    elif ext in ['.jpg', '.jpeg']:
+        mime = "image/jpeg"
+    elif ext == '.png':
+        mime = "image/png"
+    elif ext == '.gif':
+        mime = "image/gif"
+    elif ext == '.webp':
+        mime = "image/webp"
+    elif ext == '.tiff':
+        mime = "image/tiff"
+    elif ext == '.bmp':
+        mime = "image/bmp"
+
+    final_path = target_path
+    if output_path:
+        out_abs = os.path.abspath(os.path.expanduser(output_path))
+        os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+        import shutil
+        shutil.copy2(target_path, out_abs)
+        final_path = out_abs
+
+    size_bytes = os.path.getsize(final_path)
+    b64_str = None
+    if include_base64:
+        with open(final_path, 'rb') as f:
+            b64_str = base64.b64encode(f.read()).decode('utf-8')
+
+    res = {
+        "success": True,
+        "message": "Image downloaded successfully",
+        "message_id": message_id,
+        "file_path": final_path,
+        "mime_type": mime,
+        "size_bytes": size_bytes,
+        "base64": b64_str
+    }
+
+    if getattr(args, 'json', False):
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"Image downloaded: {final_path} ({size_bytes} bytes, {mime})")
+
+
 def get_attachment_payload(args):
-    filepath = os.path.abspath(os.path.expanduser(args.path))
+    filepath = getattr(args, 'path_flag', None) or getattr(args, 'path', None)
+    message_id = getattr(args, 'message_id', None)
+    if not filepath and message_id:
+        filepath, _, err = resolve_attachment_for_message(message_id, image_only=False)
+        if err or not filepath:
+            print(f"ERROR: {err or 'Attachment not found'}", file=sys.stderr)
+            sys.exit(1)
+
+    if not filepath:
+        print("ERROR: Missing required argument 'path' or '--message-id'", file=sys.stderr)
+        sys.exit(1)
+
+    filepath = os.path.abspath(os.path.expanduser(filepath))
     if not os.path.exists(filepath):
         print(f"ERROR: Attachment file not found at '{filepath}'", file=sys.stderr)
         sys.exit(1)
@@ -3366,9 +3527,29 @@ def main():
     members_parser.set_defaults(func=get_members)
 
     attachment_parser = subparsers.add_parser("attachment", help="Get base64/multimodal attachment payload")
-    attachment_parser.add_argument("path", help="POSIX path to attachment file")
+    attachment_parser.add_argument("path", nargs="?", default=None, help="POSIX path to attachment file")
+    attachment_parser.add_argument("--path", dest="path_flag", default=None, help="POSIX path to attachment file")
+    attachment_parser.add_argument("--message-id", type=int, default=None, help="Message ROWID containing attachment")
     attachment_parser.add_argument("--json", action="store_true", help="Output JSON with base64 data")
     attachment_parser.set_defaults(func=get_attachment_payload)
+
+    download_image_parser = subparsers.add_parser("download-image", help="Download and extract image attachment (converts HEIC to JPEG)")
+    download_image_parser.add_argument("--path", default=None, help="POSIX path to attachment file")
+    download_image_parser.add_argument("--message-id", type=int, default=None, help="Message ROWID containing attachment")
+    download_image_parser.add_argument("--output-path", default=None, help="Destination POSIX path to write or copy the image")
+    download_image_parser.add_argument("--include-base64", action="store_true", default=True, help="Include base64 payload")
+    download_image_parser.add_argument("--no-base64", dest="include_base64", action="store_false", help="Omit base64 payload")
+    download_image_parser.add_argument("--json", action="store_true", help="Output JSON")
+    download_image_parser.set_defaults(func=download_image)
+
+    download_image_alias = subparsers.add_parser("download_image", help="Alias for download-image")
+    download_image_alias.add_argument("--path", default=None, help="POSIX path to attachment file")
+    download_image_alias.add_argument("--message-id", type=int, default=None, help="Message ROWID containing attachment")
+    download_image_alias.add_argument("--output-path", default=None, help="Destination POSIX path to write or copy the image")
+    download_image_alias.add_argument("--include-base64", action="store_true", default=True, help="Include base64 payload")
+    download_image_alias.add_argument("--no-base64", dest="include_base64", action="store_false", help="Omit base64 payload")
+    download_image_alias.add_argument("--json", action="store_true", help="Output JSON")
+    download_image_alias.set_defaults(func=download_image)
 
     send_parser = subparsers.add_parser("send", help="Send an iMessage")
     send_parser.add_argument("recipient", help="Recipient identifier")

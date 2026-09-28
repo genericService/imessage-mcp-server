@@ -406,3 +406,52 @@ describe('replies and reply context', () => {
   });
 });
 
+describe('image download and attachment enhancements', () => {
+  const fixtureImg = path.resolve(__dirname, 'fixtures/shai_hulud.jpg');
+
+  it('downloads an image by direct POSIX path', async () => {
+    const res = await cliJson(['download-image', '--path', fixtureImg, '--json']);
+    expect(res.success).toBe(true);
+    expect(res.file_path).toBe(fixtureImg);
+    expect(res.mime_type).toBe('image/jpeg');
+    expect(res.size_bytes).toBeGreaterThan(0);
+    expect(typeof res.base64).toBe('string');
+    expect(res.base64.length).toBeGreaterThan(0);
+  });
+
+  it('downloads an image by message ID resolving from chat.db', async () => {
+    const res = await cliJson(['download-image', '--message-id', '201', '--json']);
+    expect(res.success).toBe(true);
+    expect(res.message_id).toBe(201);
+    expect(res.file_path).toContain('shai_hulud.jpg');
+    expect(res.mime_type).toBe('image/jpeg');
+    expect(res.size_bytes).toBeGreaterThan(0);
+    expect(typeof res.base64).toBe('string');
+  });
+
+  it('copies downloaded image to custom output_path', async () => {
+    const customOut = path.join(os.tmpdir(), `imessage-test-out-${Date.now()}.jpg`);
+    try {
+      const res = await cliJson(['download-image', '--message-id', '201', '--output-path', customOut, '--json']);
+      expect(res.success).toBe(true);
+      expect(res.file_path).toBe(customOut);
+      expect(fs.existsSync(customOut)).toBe(true);
+      expect(fs.statSync(customOut).size).toBe(res.size_bytes);
+    } finally {
+      fs.rmSync(customOut, { force: true });
+    }
+  });
+
+  it('fetches attachment payload by message_id via attachment command', async () => {
+    const res = await cliJson(['attachment', '--message-id', '201', '--json']);
+    expect(res.path).toContain('shai_hulud.jpg');
+    expect(res.mime_type).toBe('image/jpeg');
+    expect(res.size_bytes).toBeGreaterThan(0);
+    expect(typeof res.base64).toBe('string');
+  });
+
+  it('fails gracefully when message has no image attachment', async () => {
+    await expect(cli(['download-image', '--message-id', '100', '--json'])).rejects.toThrow();
+  });
+});
+
