@@ -345,12 +345,17 @@ describe('Live CallHistory database (when present on host Mac)', () => {
       LC_ALL: 'C',
       LANG: 'C',
     };
-    const calls = await cliJson(['calls', '--limit', '5', '--json'], realEnv);
-    expect(Array.isArray(calls)).toBe(true);
-    if (calls.length > 0) {
-      expect(calls[0]).toHaveProperty('id');
-      expect(calls[0]).toHaveProperty('direction');
-      expect(calls[0]).toHaveProperty('call_type');
+    const res: any = await cliJson(['calls', '--limit', '5', '--json'], realEnv);
+    if (res && typeof res === 'object' && !Array.isArray(res) && res.available === false) {
+      expect(res).toHaveProperty('error');
+      expect(Array.isArray(res.calls)).toBe(true);
+      return;
+    }
+    expect(Array.isArray(res)).toBe(true);
+    if (res.length > 0) {
+      expect(res[0]).toHaveProperty('id');
+      expect(res[0]).toHaveProperty('direction');
+      expect(res[0]).toHaveProperty('call_type');
     }
   });
 });

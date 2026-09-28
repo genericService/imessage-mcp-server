@@ -158,7 +158,9 @@ def build(path):
             is_delivered INTEGER DEFAULT 0,
             date_delivered INTEGER DEFAULT 0,
             is_read INTEGER DEFAULT 0,
-            date_read INTEGER DEFAULT 0
+            date_read INTEGER DEFAULT 0,
+            reply_to_guid TEXT,
+            thread_originator_guid TEXT
         );
         CREATE TABLE chat_message_join (
             chat_id INTEGER,
@@ -220,6 +222,8 @@ def build(path):
         date_delivered=0,
         is_read=0,
         date_read=0,
+        reply_to_guid=None,
+        thread_originator_guid=None,
     ):
         date_ns = apple_ns(offset)
         c.execute(
@@ -229,8 +233,9 @@ def build(path):
                 is_audio_message, message_summary_info, associated_message_guid,
                 associated_message_type, associated_message_emoji, balloon_bundle_id,
                 payload_data, cache_has_attachments, item_type,
-                is_delivered, date_delivered, is_read, date_read
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                is_delivered, date_delivered, is_read, date_read,
+                reply_to_guid, thread_originator_guid
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rowid,
@@ -251,6 +256,8 @@ def build(path):
                 date_delivered,
                 is_read,
                 date_read,
+                reply_to_guid,
+                thread_originator_guid,
             ),
         )
         c.execute(
@@ -271,6 +278,7 @@ def build(path):
         date_delivered=apple_ns(1) + 1_000_000_000,
         is_read=1,
         date_read=apple_ns(1) + 5_000_000_000,
+        reply_to_guid=GUID[100],
     )
     add_message(
         102,
@@ -327,6 +335,7 @@ def build(path):
         date_delivered=apple_ns(7) + 2_000_000_000,
         is_read=0,
         date_read=0,
+        thread_originator_guid=GUID[105],
     )
     add_message(
         108,

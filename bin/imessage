@@ -1225,6 +1225,8 @@ def message_select_list(available):
         field("date_delivered", "date_delivered_ns"),
         field("is_read", "is_read"),
         field("date_read", "date_read_ns"),
+        field("reply_to_guid", "reply_to_guid"),
+        field("thread_originator_guid", "thread_originator_guid"),
     ]
     return ",\n        ".join(parts)
 
@@ -1512,6 +1514,7 @@ def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
         "participant": participant,
         "is_from_me": is_from_me,
         "text": msg_text,
+        "reply_to": None,
         "is_delivered": is_delivered,
         "delivered_at": deliv_human or None,
         "delivered_at_iso": deliv_iso,
@@ -1570,6 +1573,67 @@ def present_rows(cursor, rows, cmap, prefer_contact_name, reactions_mode):
         by_id[item["msg_id"]] = item
         if item.get("guid"):
             by_guid[item["guid"]] = item
+
+    missing_parent_guids = []
+    for row in rows:
+        if classify_associated_type(row.get("associated_message_type")):
+            continue
+        raw_reply = row.get("reply_to_guid") or row.get("thread_originator_guid")
+        p_guid = target_guid_from_associated(raw_reply)
+        if p_guid and p_guid not in by_guid and p_guid not in missing_parent_guids:
+            missing_parent_guids.append(p_guid)
+
+    resolved_parents = {}
+    if missing_parent_guids and cursor is not None:
+        try:
+            available = message_column_names(cursor)
+            select_sql = message_select_list(available)
+            placeholders = ",".join(["?"] * len(missing_parent_guids))
+            parent_rows = fetch_message_dicts(
+                cursor,
+                select_sql,
+                f"m.guid IN ({placeholders})",
+                missing_parent_guids,
+                MESSAGE_FROM_LOOSE,
+            )
+            if parent_rows:
+                populate_cached_decoded_text(parent_rows)
+                parent_msg_ids = [r["msg_id"] for r in parent_rows]
+                parent_atts = fetch_attachments_for_messages(cursor, parent_msg_ids)
+                for pr in parent_rows:
+                    p_item = base_message_fields(pr, cmap, prefer_contact_name, parent_atts)
+                    if p_item.get("guid"):
+                        resolved_parents[p_item["guid"]] = p_item
+        except Exception as e:
+            sys.stderr.write(f"[Warning] Failed to fetch reply parent messages: {e}\n")
+
+    for row in rows:
+        if classify_associated_type(row.get("associated_message_type")):
+            continue
+        raw_reply = row.get("reply_to_guid") or row.get("thread_originator_guid")
+        if not raw_reply:
+            continue
+        p_guid = target_guid_from_associated(raw_reply)
+        if not p_guid:
+            continue
+        item = by_id.get(row["msg_id"])
+        if not item:
+            continue
+        parent = by_guid.get(p_guid) or resolved_parents.get(p_guid)
+        if parent:
+            item["reply_to"] = {
+                "msg_id": parent.get("msg_id"),
+                "guid": parent.get("guid"),
+                "sender": parent.get("sender"),
+                "text": parent.get("text"),
+            }
+        else:
+            item["reply_to"] = {
+                "msg_id": None,
+                "guid": p_guid,
+                "sender": None,
+                "text": None,
+            }
 
     if reactions_mode == "separate":
         items = []
@@ -1700,8 +1764,20 @@ def format_item_line(item, prefix_chat=False):
             emoji = f" {reaction['emoji']}" if reaction.get("emoji") else ""
             bits.append(f"{reaction['type']}{emoji} {reaction['action']} by {reaction['sender']}")
         msg_text = f"{msg_text} [reactions: {'; '.join(bits)}]"
+    reply_prefix = ""
+    reply = item.get("reply_to")
+    if reply:
+        r_sender = reply.get("sender") or "someone"
+        r_text = reply.get("text") or ""
+        if r_text and r_text != "<empty message>":
+            snippet = r_text.replace("\n", " ").strip()
+            if len(snippet) > 80:
+                snippet = snippet[:77] + "..."
+            reply_prefix = f"[Replying to {r_sender}: \"{snippet}\"] "
+        else:
+            reply_prefix = f"[Replying to {r_sender}] "
     chat_bit = f" [{item['chat']}]" if prefix_chat else ""
-    return f"[{item['timestamp']}]{edit_marker}{chat_bit} {item['sender']}: {msg_text}"
+    return f"[{item['timestamp']}]{edit_marker}{chat_bit} {item['sender']}: {reply_prefix}{msg_text}"
 
 
 def reaction_predicate(available):

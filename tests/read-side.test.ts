@@ -367,3 +367,42 @@ describe('delivery and read receipts on message records', () => {
     expect(typeof msg100.read_at_iso).toBe('string');
   });
 });
+
+describe('replies and reply context', () => {
+  it('resolves in-batch reply_to with parent message details', async () => {
+    const data = await cliJson(['recent', '7', '--limit', '20', '--json']);
+    const replyMsg = data.find((m: any) => m.msg_id === 101);
+    expect(replyMsg).toBeDefined();
+    expect(replyMsg.reply_to).toEqual({
+      msg_id: 100,
+      guid: 'A1000000-0000-4000-8000-000000000100',
+      sender: '+15550199480',
+      text: 'The spice must flow',
+    });
+  });
+
+  it('formats text line with [Replying to <sender>: "<snippet>"] prefix', async () => {
+    const text = await cli(['recent', '7', '--limit', '20']);
+    expect(text).toContain('[Replying to +15550199480: "The spice must flow"] Acknowledged');
+  });
+
+  it('resolves out-of-batch parent message when parent is outside cursor window', async () => {
+    const data = await cliJson(['recent', '7', '--since-msg-id', '105', '--limit', '20', '--json']);
+    const replyMsg = data.find((m: any) => m.msg_id === 107);
+    expect(replyMsg).toBeDefined();
+    expect(replyMsg.reply_to).toEqual({
+      msg_id: 105,
+      guid: 'A1000000-0000-4000-8000-000000000105',
+      sender: '+15550199480',
+      text: 'See you on Caladan',
+    });
+  });
+
+  it('keeps reply_to null for regular unreplied messages', async () => {
+    const data = await cliJson(['recent', '7', '--limit', '20', '--json']);
+    const nonReply = data.find((m: any) => m.msg_id === 100);
+    expect(nonReply).toBeDefined();
+    expect(nonReply.reply_to).toBeNull();
+  });
+});
+

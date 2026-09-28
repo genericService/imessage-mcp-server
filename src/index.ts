@@ -99,7 +99,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.5.0';
+const SERVER_VERSION = '1.6.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -144,7 +144,7 @@ const SERVER_INSTRUCTIONS = `
 iMessage MCP Server Instructions:
 1. Discovery: Call 'imessage_list_chats' to discover available conversation IDs, display names, and handles.
 2. Search: Call 'imessage_search_messages' to search past message history by keyword or voice note speech-to-text transcriptions, or 'imessage_search_contacts' to find contacts.
-3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' with chat or its alias chat_id. The value is the numeric chat ROWID from imessage_list_chats (rowid / chat_id), or a display name, phone number, or email. Pass since_msg_id to poll only messages with a greater id, and with_meta true to read next_since_msg_id (advance the cursor with that, not the last visible msg_id). Messages include ISO timestamps, delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso; note that read_at on outgoing messages requires the recipient to have read receipts enabled), link previews, structured reactions, voice note transcriptions, and edit history. Tapbacks are structured reaction objects.
+3. Reading: Call 'imessage_read_messages' or 'imessage_get_recent_messages' with chat or its alias chat_id. The value is the numeric chat ROWID from imessage_list_chats (rowid / chat_id), or a display name, phone number, or email. Pass since_msg_id to poll only messages with a greater id, and with_meta true to read next_since_msg_id (advance the cursor with that, not the last visible msg_id). Messages include ISO timestamps, reply context (reply_to with parent msg_id, guid, sender, and text), delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso; note that read_at on outgoing messages requires the recipient to have read receipts enabled), link previews, structured reactions, voice note transcriptions, and edit history. Tapbacks are structured reaction objects.
 4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
 5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
 6. Multimodal Attachments: Call 'imessage_get_attachment_payload' to get base64 data for image/file attachments (converts HEIC photos to JPEG and CAF voice notes to playable/transcribable M4A audio with on-device speech-to-text transcripts).
@@ -371,7 +371,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_read_messages',
     description:
-      'Read recent message history from a specific iMessage chat. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats, or a display name, phone number, or email. Messages include ISO-8601 timestamps, delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso), link previews (url, title, subtitle, artist, site_name), structured tapbacks, voice note transcriptions, and edit history. Outgoing rows use sender "Me" with an empty handle; the other party is `participant`. Read receipts on outgoing messages only appear when the recipient has enabled read receipts.',
+      'Read recent message history from a specific iMessage chat. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats, or a display name, phone number, or email. Messages include ISO-8601 timestamps, reply context (reply_to with parent msg_id, guid, sender, text), delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso), link previews (url, title, subtitle, artist, site_name), structured tapbacks, voice note transcriptions, and edit history. Outgoing rows use sender "Me" with an empty handle; the other party is `participant`. Read receipts on outgoing messages only appear when the recipient has enabled read receipts.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -392,7 +392,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_search_messages',
     description:
-      'Full-text search across all historical iMessage conversations, including message text and voice note audio speech-to-text transcriptions. Returns matching messages, dates, chat IDs, senders, edit state (is_edited, edit_count), and revision history.',
+      'Full-text search across all historical iMessage conversations, including message text, reply context (reply_to), and voice note audio speech-to-text transcriptions. Returns matching messages, dates, chat IDs, senders, edit state (is_edited, edit_count), and revision history.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -518,7 +518,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_get_recent_messages',
     description:
-      'Preview the last N messages in a chat, or poll for rows newer than since_msg_id. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats (`rowid` / `chat_id`), or a display name, phone number, or email. Results include ISO timestamps, delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso), link previews, and structured tapbacks (not as Loved/Liked text). Outgoing rows use sender "Me" with an empty handle and a separate `participant`. Pass with_meta to get filtered counts and next_since_msg_id. Read receipts on outgoing messages only appear when the recipient has enabled read receipts.',
+      'Preview the last N messages in a chat, or poll for rows newer than since_msg_id. `chat` (alias `chat_id`) is the numeric chat ROWID from imessage_list_chats (`rowid` / `chat_id`), or a display name, phone number, or email. Results include ISO timestamps, reply context (reply_to with parent msg_id, guid, sender, text), delivery status (is_delivered, delivered_at, delivered_at_iso), read status (is_read, read_at, read_at_iso), link previews, and structured tapbacks (not as Loved/Liked text). Outgoing rows use sender "Me" with an empty handle and a separate `participant`. Pass with_meta to get filtered counts and next_since_msg_id. Read receipts on outgoing messages only appear when the recipient has enabled read receipts.',
     inputSchema: {
       type: 'object',
       properties: {
