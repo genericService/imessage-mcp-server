@@ -99,7 +99,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.7.0';
+const SERVER_VERSION = '1.8.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -465,7 +465,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_get_attachment_payload',
     description:
-      'Fetch metadata and base64 payload for an attachment file (converts HEIC photos to JPEG and CAF audio voice notes to M4A for multimodal LLMs, returning duration and on-device speech-to-text transcriptions). Accepts either path or message_id.',
+      'Fetch metadata and base64 payload for an attachment file (converts HEIC photos to JPEG and CAF audio voice notes to M4A for multimodal LLMs, delivering visual image blocks to agents, duration, and on-device speech-to-text transcriptions). Accepts either path or message_id.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -482,7 +482,11 @@ export const TOOLS: Tool[] = [
         },
         messageId: { type: 'integer', description: 'Alias of message_id.' },
         msg_id: { type: 'integer', description: 'Alias of message_id.' },
-        msgId: { type: 'integer', description: 'Alias of message_id.' }
+        msgId: { type: 'integer', description: 'Alias of message_id.' },
+        deliver_image: {
+          type: 'boolean',
+          description: 'If the attachment is an image, whether to deliver the visual image block directly to the agent (default true).'
+        }
       },
       anyOf: [
         { required: ['path'] },
@@ -499,7 +503,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_download_image',
     description:
-      'Download and extract an image attachment from an iMessage by message ID or file path. Converts HEIC photos to JPEG for multimodal LLMs and optionally copies the image to a custom destination output_path.',
+      'Download and extract an image attachment from an iMessage by message ID or file path, delivering the visual image block directly to multimodal agents. Converts HEIC photos to JPEG for multimodal LLMs and optionally copies the image to a custom destination output_path.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -524,6 +528,56 @@ export const TOOLS: Tool[] = [
         include_base64: {
           type: 'boolean',
           description: 'Whether to include base64-encoded image data in the response (default true).'
+        },
+        deliver_image: {
+          type: 'boolean',
+          description: 'Whether to deliver the visual image block directly to the agent (default true).'
+        }
+      },
+      anyOf: [
+        { required: ['message_id'] },
+        { required: ['messageId'] },
+        { required: ['msg_id'] },
+        { required: ['msgId'] },
+        { required: ['path'] },
+        { required: ['file'] },
+        { required: ['file_path'] },
+        { required: ['filepath'] }
+      ]
+    }
+  },
+  {
+    name: 'download_image',
+    description:
+      'Standard alias for imessage_download_image. Download and extract an image attachment from an iMessage by message ID or file path, delivering the visual image block directly to multimodal agents.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: {
+          type: 'integer',
+          description: 'The numeric message ROWID containing the image attachment. Aliases: messageId, msg_id, msgId.'
+        },
+        messageId: { type: 'integer', description: 'Alias of message_id.' },
+        msg_id: { type: 'integer', description: 'Alias of message_id.' },
+        msgId: { type: 'integer', description: 'Alias of message_id.' },
+        path: {
+          type: 'string',
+          description: 'POSIX path to the image attachment file. Aliases: file, file_path, filepath.'
+        },
+        file: { type: 'string', description: 'Alias of path.' },
+        file_path: { type: 'string', description: 'Alias of path.' },
+        filepath: { type: 'string', description: 'Alias of path.' },
+        output_path: {
+          type: 'string',
+          description: 'Optional destination file path where the extracted/converted image should be saved.'
+        },
+        include_base64: {
+          type: 'boolean',
+          description: 'Whether to include base64-encoded image data in the response (default true).'
+        },
+        deliver_image: {
+          type: 'boolean',
+          description: 'Whether to deliver the visual image block directly to the agent (default true).'
         }
       },
       anyOf: [
@@ -918,7 +972,13 @@ function createMcpServer(): Server {
     }
 
     try {
-      let result: { content: { type: 'text'; text: string }[]; isError?: boolean };
+      let result: {
+        content: (
+          | { type: 'text'; text: string }
+          | { type: 'image'; data: string; mimeType: string }
+        )[];
+        isError?: boolean;
+      };
       if (name === 'imessage_get_readme') {
         const readmePath = path.resolve(__dir, '../README.md');
         const content = await fs.promises.readFile(readmePath, 'utf8');
@@ -1015,6 +1075,7 @@ function createMcpServer(): Server {
       } else if (name === 'imessage_get_attachment_payload') {
         const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
         const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+        const deliverImage = toolArgs?.deliver_image !== false && toolArgs?.deliverImage !== false;
         if (!filePath && messageId === undefined) {
           throw new Error('Missing required parameter: either "path" or "message_id" must be provided');
         }
@@ -1026,14 +1087,36 @@ function createMcpServer(): Server {
           cliArgs.push('--message-id', String(messageId));
         }
         const stdout = await runImessageCli(cliArgs);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
+        let parsed: any;
+        try {
+          parsed = JSON.parse(stdout);
+        } catch {
+          parsed = null;
+        }
+
+        const content: (
+          | { type: 'text'; text: string }
+          | { type: 'image'; data: string; mimeType: string }
+        )[] = [{ type: 'text', text: stdout }];
+
+        if (deliverImage && parsed && typeof parsed.base64 === 'string') {
+          const mimeType = String(parsed.mime_type || parsed.mimeType || '');
+          if (mimeType.startsWith('image/')) {
+            content.push({
+              type: 'image',
+              data: parsed.base64,
+              mimeType
+            });
+          }
+        }
+
+        result = { content };
       } else if (name === 'imessage_download_image' || name === 'download_image') {
         const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
         const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
         const outputPath = readStringArg(toolArgs, ['output_path', 'outputPath', 'destination']);
         const includeBase64 = toolArgs?.include_base64 !== false && toolArgs?.includeBase64 !== false;
+        const deliverImage = toolArgs?.deliver_image !== false && toolArgs?.deliverImage !== false;
 
         if (!filePath && messageId === undefined) {
           throw new Error('Missing required parameter: either "message_id" or "path" must be provided');
@@ -1048,13 +1131,39 @@ function createMcpServer(): Server {
         if (outputPath) {
           cliArgs.push('--output-path', outputPath);
         }
-        if (!includeBase64) {
+        if (!includeBase64 && !deliverImage) {
           cliArgs.push('--no-base64');
         }
         const stdout = await runImessageCli(cliArgs);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
+        let parsed: any;
+        try {
+          parsed = JSON.parse(stdout);
+        } catch {
+          parsed = null;
+        }
+
+        let textOutput = stdout;
+        if (!includeBase64 && parsed && parsed.base64) {
+          const stripped = { ...parsed };
+          delete stripped.base64;
+          textOutput = JSON.stringify(stripped, null, 2);
+        }
+
+        const content: (
+          | { type: 'text'; text: string }
+          | { type: 'image'; data: string; mimeType: string }
+        )[] = [{ type: 'text', text: textOutput }];
+
+        if (deliverImage && parsed && typeof parsed.base64 === 'string') {
+          const mimeType = String(parsed.mime_type || parsed.mimeType || 'image/jpeg');
+          content.push({
+            type: 'image',
+            data: parsed.base64,
+            mimeType
+          });
+        }
+
+        result = { content };
       } else if (name === 'imessage_get_edit_history') {
         const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
         if (messageId === undefined || messageId <= 0) {

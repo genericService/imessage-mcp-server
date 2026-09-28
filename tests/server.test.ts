@@ -4,7 +4,7 @@ import { promisify } from 'util';
 import dotenv from 'dotenv';
 import path from 'path';
 import os from 'os';
-import { existsSync } from 'fs';
+import fs, { existsSync } from 'fs';
 
 const hasRealChatDb = existsSync(path.join(os.homedir(), 'Library/Messages/chat.db'));
 const dbIt = hasRealChatDb ? it : it.skip;
@@ -730,6 +730,109 @@ describe('MCP 2026-07-28 Spec Compliance', () => {
     const text = await res.text();
     expect(text).toContain('imessage_list_chats');
     expect(text).toContain('imessage_download_image');
+  });
+
+  it('should deliver multimodal image content block when calling imessage_download_image', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'imessage-img-test-'));
+    const testImgPath = path.join(tmpDir, 'arrakis_worm.jpg');
+    const fakeJpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xff, 0xdb]);
+    fs.writeFileSync(testImgPath, fakeJpegBytes);
+
+    try {
+      const res = await fetch(`${testUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${AUTH_TOKEN}`,
+          'Content-Type': 'application/json',
+          'MCP-Protocol-Version': '2026-07-28',
+          'Mcp-Method': 'tools/call',
+          'Mcp-Name': 'imessage_download_image'
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'test-download-img-1',
+          method: 'tools/call',
+          params: {
+            name: 'imessage_download_image',
+            arguments: {
+              path: testImgPath,
+              deliver_image: true
+            },
+            _meta: {
+              'io.modelcontextprotocol/protocolVersion': '2026-07-28'
+            }
+          }
+        })
+      });
+
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      const jsonLine = text.split('\n').find(l => l.startsWith('data: '));
+      const data = jsonLine ? JSON.parse(jsonLine.slice(6)) : JSON.parse(text);
+      expect(data.result).toBeDefined();
+      expect(data.result.content).toBeDefined();
+      expect(Array.isArray(data.result.content)).toBe(true);
+      expect(data.result.content.length).toBe(2);
+
+      const textBlock = data.result.content[0];
+      expect(textBlock.type).toBe('text');
+      expect(textBlock.text).toContain('arrakis_worm.jpg');
+
+      const imgBlock = data.result.content[1];
+      expect(imgBlock.type).toBe('image');
+      expect(imgBlock.mimeType).toBe('image/jpeg');
+      expect(imgBlock.data).toBe(fakeJpegBytes.toString('base64'));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('should deliver multimodal image content block when calling download_image alias', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'imessage-img-test-alias-'));
+    const testImgPath = path.join(tmpDir, 'caladan_sea.png');
+    const fakePngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    fs.writeFileSync(testImgPath, fakePngBytes);
+
+    try {
+      const res = await fetch(`${testUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${AUTH_TOKEN}`,
+          'Content-Type': 'application/json',
+          'MCP-Protocol-Version': '2026-07-28',
+          'Mcp-Method': 'tools/call',
+          'Mcp-Name': 'download_image'
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'test-download-img-alias',
+          method: 'tools/call',
+          params: {
+            name: 'download_image',
+            arguments: {
+              path: testImgPath,
+              deliver_image: true
+            },
+            _meta: {
+              'io.modelcontextprotocol/protocolVersion': '2026-07-28'
+            }
+          }
+        })
+      });
+
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      const jsonLine = text.split('\n').find(l => l.startsWith('data: '));
+      const data = jsonLine ? JSON.parse(jsonLine.slice(6)) : JSON.parse(text);
+      expect(data.result).toBeDefined();
+      expect(data.result.content.length).toBe(2);
+      expect(data.result.content[0].type).toBe('text');
+      expect(data.result.content[1].type).toBe('image');
+      expect(data.result.content[1].mimeType).toBe('image/png');
+      expect(data.result.content[1].data).toBe(fakePngBytes.toString('base64'));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 
