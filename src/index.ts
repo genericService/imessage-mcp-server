@@ -35,6 +35,7 @@ import {
   deliverWebhook,
   parseWatcherConfig,
 } from './watcher.js';
+import { identityGraph } from './identity_graph.js';
 
 const execFileAsync = promisify(execFile);
 const PYTHON_BIN = '/usr/bin/python3';
@@ -795,6 +796,173 @@ export const TOOLS: Tool[] = [
       type: 'object',
       properties: {}
     }
+  },
+  {
+    name: 'list_chats',
+    description:
+      'List active iMessage chats and conversations (universal alias for imessage_list_chats). Returns chat ROWIDs (`rowid` and `chat_id`), display names, contact identifiers, and recent activity order.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: {
+          type: 'number',
+          description: 'Maximum number of recent chats to return (default: 30, max: 100). Aliases: count, max.'
+        },
+        count: { type: 'number', description: 'Alias of limit.' },
+        max: { type: 'number', description: 'Alias of limit.' }
+      }
+    }
+  },
+  {
+    name: 'list_messages',
+    description:
+      'Read recent message history from a specific iMessage chat (universal alias for imessage_read_messages). Returns messages in strict chronological order.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...chatArgProperties,
+        days: {
+          type: 'number',
+          description: 'Number of past days of message history to retrieve (default: 14). Alias: lookback_days.'
+        },
+        lookback_days: {
+          type: 'number',
+          description: 'Alias of days.'
+        },
+        ...readWindowProperties
+      },
+      anyOf: chatAnyOf
+    }
+  },
+  {
+    name: 'send_message',
+    description:
+      'Send an outbound iMessage to a recipient or existing chat thread (universal alias for imessage_send_message). Supports text and attachments.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        recipient: {
+          type: 'string',
+          description: "Target recipient phone number, email address, group chat display name, or numeric chat ROWID. Alias: to."
+        },
+        to: { type: 'string', description: 'Alias of recipient.' },
+        message: { type: 'string', description: 'Optional text content of the iMessage to send.' },
+        attachment: { type: 'string', description: 'Optional local POSIX file path of an attachment to send.' },
+        dry_run: { type: 'boolean', description: 'If true, returns a structured safety preview.' },
+        confirm_token: { type: 'string', description: 'Confirmation token returned by dry_run.' }
+      },
+      required: ['recipient']
+    }
+  },
+  {
+    name: 'get_recent_messages',
+    description:
+      'Get the most recent messages across conversations or from a specific chat (universal alias for imessage_get_recent_messages). Returns messages in chronological order.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...chatArgProperties,
+        limit: {
+          type: 'number',
+          description: 'Number of recent messages to preview (default: 20, max: 50).'
+        },
+        count: { type: 'number', description: 'Alias of limit.' },
+        max: { type: 'number', description: 'Alias of limit.' },
+        ...readWindowProperties
+      }
+    }
+  },
+  {
+    name: 'search_messages',
+    description:
+      'Full-text search across all historical iMessage conversations (universal alias for imessage_search_messages), including message text, reply context, and voice note transcriptions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search keyword or phrase. Aliases: q, search.' },
+        q: { type: 'string', description: 'Alias of query.' },
+        search: { type: 'string', description: 'Alias of query.' },
+        limit: { type: 'number', description: 'Maximum number of matching results (default: 30).' },
+        count: { type: 'number', description: 'Alias of limit.' },
+        max: { type: 'number', description: 'Alias of limit.' },
+        order: { type: 'string', enum: ['recent', 'relevance'], description: 'Sort order.' },
+        ...chatArgProperties,
+        ...readWindowProperties
+      },
+      anyOf: [
+        { required: ['query'] },
+        { required: ['q'] },
+        { required: ['search'] }
+      ]
+    }
+  },
+  {
+    name: 'search_contacts',
+    description:
+      'Search macOS AddressBook contacts by name, phone number, or email address (universal alias for imessage_search_contacts).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Contact search term.' }
+      }
+    }
+  },
+  {
+    name: 'resolve_contact',
+    description:
+      'Resolve a contact across platforms (iMessage, WhatsApp, Instagram) using the Unified Contact Identity Graph. Returns canonical display name and all known platform identities (phone numbers, handles, emails).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Contact name, phone number, email address, or username to search.'
+        }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'link_contact_identity',
+    description:
+      'Link a platform identity (phone, email, Instagram username, WhatsApp JID) to a contact in the Unified Identity Graph.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Contact display name.' },
+        platform: { type: 'string', description: 'Platform name (imessage, whatsapp, instagram, etc.).' },
+        identifier: { type: 'string', description: 'Identifier value (phone number, username, email, JID).' },
+        identifier_type: { type: 'string', description: 'Optional identifier type (phone, email, username, jid, lid).' }
+      },
+      required: ['name', 'platform', 'identifier']
+    }
+  },
+  {
+    name: 'get_last_interaction',
+    description:
+      'Get the most recent direct message interaction with a specific contact or chat. Answers: "When did I last speak with user X and what was said?"',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact: { type: 'string', description: 'Contact display name, phone number, or email.' },
+        ...chatArgProperties
+      }
+    }
+  },
+  {
+    name: 'get_message_context',
+    description:
+      'Get surrounding context (messages before and after) around a specific message ROWID in a chat.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'number', description: 'Target message ROWID.' },
+        before: { type: 'number', description: 'Number of preceding messages (default 5).' },
+        after: { type: 'number', description: 'Number of following messages (default 5).' },
+        ...chatArgProperties
+      },
+      required: ['message_id']
+    }
   }
 ];
 
@@ -949,365 +1117,527 @@ function createMcpServer(): Server {
   });
 
   server.setRequestHandler('tools/call', async (request, ctx) => {
-    const { name, arguments: args } = request.params;
-    const startTime = Date.now();
-    let targetParam: string | undefined = undefined;
-    let dryRunParam: boolean | undefined = undefined;
+    return await executeToolCall(request.params.name, request.params.arguments as any, ctx);
+  });
 
-    const toolArgs = args as Record<string, unknown> | undefined;
-    if (name === 'imessage_send_message') {
-      targetParam = readStringArg(toolArgs, ['recipient', 'to', 'confirm_token']);
-      dryRunParam = Boolean(args?.dry_run);
-    } else if (name === 'imessage_read_messages' || name === 'imessage_get_recent_messages' || name === 'imessage_get_chat_members') {
-      targetParam = readChatArg(toolArgs);
-    } else if (name === 'imessage_search_messages' || name === 'imessage_search_contacts') {
-      targetParam = readStringArg(toolArgs, ['query', 'q', 'search']);
-    } else if (name === 'imessage_get_attachment_payload' || name === 'imessage_download_image' || name === 'download_image') {
-      targetParam = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']) ||
-        readStringArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
-    } else if (name === 'imessage_get_edit_history' || name === 'imessage_edit_message') {
-      targetParam = readStringArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
-    } else if (name === 'imessage_get_call_history') {
-      targetParam = readStringArg(toolArgs, ['handle', 'contact', 'recipient', 'phone', 'email', 'chat', 'chat_id']);
-    }
+  return server;
+}
 
-    try {
-      let result: {
-        content: (
-          | { type: 'text'; text: string }
-          | { type: 'image'; data: string; mimeType: string }
-        )[];
-        isError?: boolean;
+export async function executeToolCall(
+  name: string,
+  args: Record<string, unknown> | undefined,
+  ctx?: any
+): Promise<{
+  content: (
+    | { type: 'text'; text: string }
+    | { type: 'image'; data: string; mimeType: string }
+  )[];
+  isError?: boolean;
+}> {
+  const startTime = Date.now();
+  let targetParam: string | undefined = undefined;
+  let dryRunParam: boolean | undefined = undefined;
+
+  const toolArgs = args as Record<string, unknown> | undefined;
+
+  const nameMap: Record<string, string> = {
+    list_chats: 'imessage_list_chats',
+    list_messages: 'imessage_read_messages',
+    send_message: 'imessage_send_message',
+    get_recent_messages: 'imessage_get_recent_messages',
+    search_messages: 'imessage_search_messages',
+    search_contacts: 'imessage_search_contacts',
+  };
+  const effectiveName = nameMap[name] || name;
+
+  if (effectiveName === 'imessage_send_message') {
+    targetParam = readStringArg(toolArgs, ['recipient', 'to', 'confirm_token']);
+    dryRunParam = Boolean(args?.dry_run);
+  } else if (effectiveName === 'imessage_read_messages' || effectiveName === 'imessage_get_recent_messages' || effectiveName === 'imessage_get_chat_members') {
+    targetParam = readChatArg(toolArgs);
+  } else if (effectiveName === 'imessage_search_messages' || effectiveName === 'imessage_search_contacts' || effectiveName === 'resolve_contact') {
+    targetParam = readStringArg(toolArgs, ['query', 'q', 'search', 'name']);
+  } else if (effectiveName === 'imessage_get_attachment_payload' || effectiveName === 'imessage_download_image' || effectiveName === 'download_image') {
+    targetParam = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']) ||
+      readStringArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+  } else if (effectiveName === 'imessage_get_edit_history' || effectiveName === 'imessage_edit_message' || effectiveName === 'get_message_context') {
+    targetParam = readStringArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+  } else if (effectiveName === 'imessage_get_call_history' || effectiveName === 'get_last_interaction') {
+    targetParam = readStringArg(toolArgs, ['handle', 'contact', 'recipient', 'phone', 'email', 'chat', 'chat_id']);
+  }
+
+  try {
+    let result: {
+      content: (
+        | { type: 'text'; text: string }
+        | { type: 'image'; data: string; mimeType: string }
+      )[];
+      isError?: boolean;
+    };
+    if (effectiveName === 'imessage_get_readme') {
+      const readmePath = path.resolve(__dir, '../README.md');
+      const content = await fs.promises.readFile(readmePath, 'utf8');
+      result = {
+        content: [{ type: 'text', text: content }]
       };
-      if (name === 'imessage_get_readme') {
-        const readmePath = path.resolve(__dir, '../README.md');
-        const content = await fs.promises.readFile(readmePath, 'utf8');
-        result = {
-          content: [{ type: 'text', text: content }]
-        };
-      } else if (name === 'imessage_index_status') {
-        const stdout = await runImessageCli(['index', 'status', '--json']);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_list_chats') {
-        const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
-        const stdout = await runImessageCli(['list', '--limit', String(limit), '--json']);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_read_messages') {
-        const chat = readChatArg(toolArgs);
-        const days = clampInt(readIntArg(toolArgs, ['days', 'lookback_days', 'lookbackDays']), 14, 1, 365);
-        if (!chat) {
-          throw new Error(MISSING_CHAT);
+    } else if (effectiveName === 'imessage_index_status') {
+      const stdout = await runImessageCli(['index', 'status', '--json']);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_list_chats') {
+      const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
+      const stdout = await runImessageCli(['list', '--limit', String(limit), '--json']);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_read_messages') {
+      const chat = readChatArg(toolArgs);
+      const days = clampInt(readIntArg(toolArgs, ['days', 'lookback_days', 'lookbackDays']), 14, 1, 365);
+      if (!chat) {
+        throw new Error(MISSING_CHAT);
+      }
+      const cliArgs = ['read', chat, '--days', String(days), '--json'];
+      appendPresentationArgs(cliArgs, toolArgs);
+      const stdout = await runImessageCli(cliArgs);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_search_messages') {
+      const query = readStringArg(toolArgs, ['query', 'q', 'search']);
+      const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
+      if (!query) {
+        throw new Error('Missing required parameter "query"');
+      }
+      const order = readStringArg(toolArgs, ['order']);
+      const chat = readChatArg(toolArgs);
+      const cliArgs = ['search', query, '--limit', String(limit), '--json'];
+      if (order) {
+        if (order !== 'recent' && order !== 'relevance') {
+          throw new Error('Invalid parameter "order" (expected "recent" or "relevance")');
         }
-        const cliArgs = ['read', chat, '--days', String(days), '--json'];
-        appendPresentationArgs(cliArgs, toolArgs);
-        const stdout = await runImessageCli(cliArgs);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_search_messages') {
-        const query = readStringArg(toolArgs, ['query', 'q', 'search']);
-        const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
-        if (!query) {
-          throw new Error('Missing required parameter "query"');
-        }
-        const order = readStringArg(toolArgs, ['order']);
-        const chat = readChatArg(toolArgs);
-        const cliArgs = ['search', query, '--limit', String(limit), '--json'];
-        if (order) {
-          if (order !== 'recent' && order !== 'relevance') {
-            throw new Error('Invalid parameter "order" (expected "recent" or "relevance")');
-          }
-          cliArgs.push('--order', order);
-        }
-        if (chat) {
-          cliArgs.push('--chat', chat);
-        }
-        appendPresentationArgs(cliArgs, toolArgs);
-        const stdout = await runImessageCli(cliArgs);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_search_contacts') {
-        const query = readStringArg(toolArgs, ['query', 'q', 'search']);
-        const stdout = await runImessageCli(['contacts', query, '--json']);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_get_recent_messages') {
-        const chat = readChatArg(toolArgs);
-        const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 5, 1, 50);
-        if (!chat) {
-          throw new Error(MISSING_CHAT);
-        }
-        const cliArgs = ['recent', chat, '--limit', String(limit), '--json'];
-        appendPresentationArgs(cliArgs, toolArgs);
-        const stdout = await runImessageCli(cliArgs);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_search_group_chats') {
-        const raw = readArg(toolArgs, ['participants', 'participant']);
-        const participants: string[] = Array.isArray(raw)
-          ? raw.map(p => String(p).trim()).filter(Boolean)
-          : typeof raw === 'string' && raw.trim()
-            ? [raw.trim()]
-            : [];
-        if (participants.length === 0) {
-          throw new Error('Missing required parameter "participants" (non-empty array)');
-        }
-        const stdout = await runImessageCli(['search-group', ...participants, '--json']);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_get_chat_members') {
-        const chat = readChatArg(toolArgs);
-        if (!chat) {
-          throw new Error(MISSING_CHAT);
-        }
-        const stdout = await runImessageCli(['members', chat, '--json']);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_get_attachment_payload') {
-        const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
-        const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
-        const deliverImage = toolArgs?.deliver_image !== false && toolArgs?.deliverImage !== false;
-        if (!filePath && messageId === undefined) {
-          throw new Error('Missing required parameter: either "path" or "message_id" must be provided');
-        }
-        const cliArgs = ['attachment', '--json'];
-        if (filePath) {
-          cliArgs.push('--path', filePath);
-        }
-        if (messageId !== undefined) {
-          cliArgs.push('--message-id', String(messageId));
-        }
-        const stdout = await runImessageCli(cliArgs);
-        let parsed: any;
-        try {
-          parsed = JSON.parse(stdout);
-        } catch {
-          parsed = null;
-        }
-
-        const content: (
-          | { type: 'text'; text: string }
-          | { type: 'image'; data: string; mimeType: string }
-        )[] = [{ type: 'text', text: stdout }];
-
-        if (deliverImage && parsed && typeof parsed.base64 === 'string') {
-          const mimeType = String(parsed.mime_type || parsed.mimeType || '');
-          if (mimeType.startsWith('image/')) {
-            content.push({
-              type: 'image',
-              data: parsed.base64,
-              mimeType
-            });
+        cliArgs.push('--order', order);
+      }
+      if (chat) {
+        cliArgs.push('--chat', chat);
+      }
+      appendPresentationArgs(cliArgs, toolArgs);
+      const stdout = await runImessageCli(cliArgs);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_search_contacts') {
+      const query = readStringArg(toolArgs, ['query', 'q', 'search']);
+      const stdout = await runImessageCli(['contacts', query, '--json']);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'resolve_contact') {
+      const query = readStringArg(toolArgs, ['query', 'name', 'q', 'contact']);
+      if (!query) {
+        throw new Error('Missing required parameter "query"');
+      }
+      const record = identityGraph.resolveContact(query);
+      result = {
+        content: [{ type: 'text', text: JSON.stringify(record, null, 2) }]
+      };
+    } else if (effectiveName === 'link_contact_identity') {
+      const contactName = readStringArg(toolArgs, ['name', 'display_name', 'contact']);
+      const platform = readStringArg(toolArgs, ['platform']);
+      const identifier = readStringArg(toolArgs, ['identifier', 'value', 'phone', 'email', 'username', 'jid']);
+      const identifierType = readStringArg(toolArgs, ['identifier_type', 'type']);
+      if (!contactName || !platform || !identifier) {
+        throw new Error('Missing required parameters: "name", "platform", and "identifier" must be provided');
+      }
+      const record = identityGraph.linkContactIdentity(contactName, platform, identifier, identifierType || undefined);
+      result = {
+        content: [{ type: 'text', text: JSON.stringify(record, null, 2) }]
+      };
+    } else if (effectiveName === 'get_last_interaction') {
+      let chat = readChatArg(toolArgs);
+      const contact = readStringArg(toolArgs, ['contact', 'name', 'recipient', 'handle', 'phone', 'email']);
+      if (!chat && contact) {
+        const idRecord = identityGraph.resolveContact(contact);
+        if (idRecord) {
+          const phoneIdent = idRecord.identities.find(i => i.platform === 'imessage' || i.identifierType === 'phone');
+          if (phoneIdent) {
+            chat = phoneIdent.identifierValue;
           }
         }
+        if (!chat) {
+          chat = contact;
+        }
+      }
+      if (!chat) {
+        throw new Error('Either chat (chat_id) or contact must be provided');
+      }
 
-        result = { content };
-      } else if (name === 'imessage_download_image' || name === 'download_image') {
-        const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
-        const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
-        const outputPath = readStringArg(toolArgs, ['output_path', 'outputPath', 'destination']);
-        const includeBase64 = toolArgs?.include_base64 !== false && toolArgs?.includeBase64 !== false;
-        const deliverImage = toolArgs?.deliver_image !== false && toolArgs?.deliverImage !== false;
+      const cliArgs = ['recent', chat, '--limit', '5', '--json'];
+      appendPresentationArgs(cliArgs, toolArgs);
+      const stdout = await runImessageCli(cliArgs);
+      let msgs: any[] = [];
+      try {
+        const parsed = JSON.parse(stdout);
+        msgs = Array.isArray(parsed) ? parsed : (parsed.messages || []);
+      } catch (e) {}
 
-        if (!filePath && messageId === undefined) {
-          throw new Error('Missing required parameter: either "message_id" or "path" must be provided');
+      const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+      const responseData = {
+        success: true,
+        chat_id: chat,
+        contact: contact || null,
+        last_interaction_timestamp: lastMsg?.date || lastMsg?.timestamp || null,
+        last_message: lastMsg,
+        recent_context: msgs
+      };
+      result = {
+        content: [{ type: 'text', text: JSON.stringify(responseData, null, 2) }]
+      };
+    } else if (effectiveName === 'get_message_context') {
+      const chat = readChatArg(toolArgs);
+      const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId', 'id']);
+      const before = clampInt(readIntArg(toolArgs, ['before']), 5, 0, 50);
+      const after = clampInt(readIntArg(toolArgs, ['after']), 5, 0, 50);
+
+      if (messageId === undefined) {
+        throw new Error('Missing required parameter "message_id"');
+      }
+
+      const cliArgs = ['read', chat || '1', '--days', '365', '--json'];
+      appendPresentationArgs(cliArgs, toolArgs);
+      const stdout = await runImessageCli(cliArgs);
+      let msgs: any[] = [];
+      try {
+        const parsed = JSON.parse(stdout);
+        msgs = Array.isArray(parsed) ? parsed : (parsed.messages || []);
+      } catch (e) {}
+
+      let targetIdx = -1;
+      for (let i = 0; i < msgs.length; i++) {
+        if (Number(msgs[i].id) === messageId || Number(msgs[i].rowid) === messageId) {
+          targetIdx = i;
+          break;
         }
-        const cliArgs = ['download-image', '--json'];
-        if (filePath) {
-          cliArgs.push('--path', filePath);
-        }
-        if (messageId !== undefined) {
-          cliArgs.push('--message-id', String(messageId));
-        }
-        if (outputPath) {
-          cliArgs.push('--output-path', outputPath);
-        }
-        if (!includeBase64 && !deliverImage) {
-          cliArgs.push('--no-base64');
-        }
-        const stdout = await runImessageCli(cliArgs);
-        let parsed: any;
+      }
+
+      if (targetIdx === -1) {
+        result = {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: false,
+                  message: `Message '${messageId}' not found in the fetched thread window.`
+                },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      } else {
+        const startIdx = Math.max(0, targetIdx - before);
+        const endIdx = Math.min(msgs.length, targetIdx + after + 1);
+        const contextMsgs = msgs.slice(startIdx, endIdx);
+
+        result = {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: true,
+                  chat_id: chat,
+                  target_message_id: messageId,
+                  target_index: targetIdx - startIdx,
+                  messages: contextMsgs
+                },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      }
+    } else if (effectiveName === 'imessage_get_recent_messages') {
+      let chat = readChatArg(toolArgs);
+      const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 5, 1, 50);
+      if (!chat) {
         try {
-          parsed = JSON.parse(stdout);
-        } catch {
-          parsed = null;
-        }
+          const listStdout = await runImessageCli(['list', '--limit', '1', '--json']);
+          const listParsed = JSON.parse(listStdout);
+          const chats = Array.isArray(listParsed) ? listParsed : (listParsed.chats || []);
+          if (chats.length > 0) {
+            chat = String(chats[0].rowid || chats[0].chat_id || chats[0].id || '');
+          }
+        } catch (e) {}
+      }
+      if (!chat) {
+        throw new Error(MISSING_CHAT);
+      }
+      const cliArgs = ['recent', chat, '--limit', String(limit), '--json'];
+      appendPresentationArgs(cliArgs, toolArgs);
+      const stdout = await runImessageCli(cliArgs);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_search_group_chats') {
+      const raw = readArg(toolArgs, ['participants', 'participant']);
+      const participants: string[] = Array.isArray(raw)
+        ? raw.map(p => String(p).trim()).filter(Boolean)
+        : typeof raw === 'string' && raw.trim()
+          ? [raw.trim()]
+          : [];
+      if (participants.length === 0) {
+        throw new Error('Missing required parameter "participants" (non-empty array)');
+      }
+      const stdout = await runImessageCli(['search-group', ...participants, '--json']);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_get_chat_members') {
+      const chat = readChatArg(toolArgs);
+      if (!chat) {
+        throw new Error(MISSING_CHAT);
+      }
+      const stdout = await runImessageCli(['members', chat, '--json']);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_get_attachment_payload') {
+      const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
+      const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+      const deliverImage = toolArgs?.deliver_image !== false && toolArgs?.deliverImage !== false;
+      if (!filePath && messageId === undefined) {
+        throw new Error('Missing required parameter: either "path" or "message_id" must be provided');
+      }
+      const cliArgs = ['attachment', '--json'];
+      if (filePath) {
+        cliArgs.push('--path', filePath);
+      }
+      if (messageId !== undefined) {
+        cliArgs.push('--message-id', String(messageId));
+      }
+      const stdout = await runImessageCli(cliArgs);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(stdout);
+      } catch {
+        parsed = null;
+      }
 
-        let textOutput = stdout;
-        if (!includeBase64 && parsed && parsed.base64) {
-          const stripped = { ...parsed };
-          delete stripped.base64;
-          textOutput = JSON.stringify(stripped, null, 2);
-        }
+      const content: (
+        | { type: 'text'; text: string }
+        | { type: 'image'; data: string; mimeType: string }
+      )[] = [{ type: 'text', text: stdout }];
 
-        const content: (
-          | { type: 'text'; text: string }
-          | { type: 'image'; data: string; mimeType: string }
-        )[] = [{ type: 'text', text: textOutput }];
-
-        if (deliverImage && parsed && typeof parsed.base64 === 'string') {
-          const mimeType = String(parsed.mime_type || parsed.mimeType || 'image/jpeg');
+      if (deliverImage && parsed && typeof parsed.base64 === 'string') {
+        const mimeType = String(parsed.mime_type || parsed.mimeType || '');
+        if (mimeType.startsWith('image/')) {
           content.push({
             type: 'image',
             data: parsed.base64,
             mimeType
           });
         }
+      }
 
-        result = { content };
-      } else if (name === 'imessage_get_edit_history') {
-        const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
-        if (messageId === undefined || messageId <= 0) {
-          throw new Error('Missing or invalid required parameter "message_id" (positive integer ROWID expected)');
-        }
-        const stdout = await runImessageCli(['edits', String(messageId), '--json']);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_edit_message') {
-        const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
-        const newText = readStringArg(toolArgs, ['new_text', 'newText', 'text']);
-        if (messageId === undefined || messageId <= 0) {
-          throw new Error('Missing or invalid required parameter "message_id" (positive integer ROWID expected)');
-        }
-        if (!newText) {
-          throw new Error('Missing or empty required parameter "new_text"');
-        }
-        const stdout = await runImessageCli(['edit', String(messageId), '--text', newText, '--json']);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
-      } else if (name === 'imessage_get_call_history') {
-        const handle = readStringArg(toolArgs, ['handle', 'contact', 'recipient', 'phone', 'email']);
-        const chat = readChatArg(toolArgs);
-        const since = readStringArg(toolArgs, ['since']);
-        const until = readStringArg(toolArgs, ['until']);
-        const callType = readStringArg(toolArgs, ['call_type', 'callType', 'type']);
-        const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
+      result = { content };
+    } else if (effectiveName === 'imessage_download_image' || effectiveName === 'download_image') {
+      const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
+      const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+      const outputPath = readStringArg(toolArgs, ['output_path', 'outputPath', 'destination']);
+      const includeBase64 = toolArgs?.include_base64 !== false && toolArgs?.includeBase64 !== false;
+      const deliverImage = toolArgs?.deliver_image !== false && toolArgs?.deliverImage !== false;
 
-        const cliArgs = ['calls', '--limit', String(limit), '--json'];
-        if (handle) {
-          cliArgs.push('--handle', handle);
+      if (!filePath && messageId === undefined) {
+        throw new Error('Missing required parameter: either "message_id" or "path" must be provided');
+      }
+      const cliArgs = ['download-image', '--json'];
+      if (filePath) {
+        cliArgs.push('--path', filePath);
+      }
+      if (messageId !== undefined) {
+        cliArgs.push('--message-id', String(messageId));
+      }
+      if (outputPath) {
+        cliArgs.push('--output-path', outputPath);
+      }
+      if (!includeBase64 && !deliverImage) {
+        cliArgs.push('--no-base64');
+      }
+      const stdout = await runImessageCli(cliArgs);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(stdout);
+      } catch {
+        parsed = null;
+      }
+
+      let textOutput = stdout;
+      if (!includeBase64 && parsed && parsed.base64) {
+        const stripped = { ...parsed };
+        delete stripped.base64;
+        textOutput = JSON.stringify(stripped, null, 2);
+      }
+
+      const content: (
+        | { type: 'text'; text: string }
+        | { type: 'image'; data: string; mimeType: string }
+      )[] = [{ type: 'text', text: textOutput }];
+
+      if (deliverImage && parsed && typeof parsed.base64 === 'string') {
+        const mimeType = String(parsed.mime_type || parsed.mimeType || 'image/jpeg');
+        content.push({
+          type: 'image',
+          data: parsed.base64,
+          mimeType
+        });
+      }
+
+      result = { content };
+    } else if (effectiveName === 'imessage_get_edit_history') {
+      const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+      if (messageId === undefined || messageId <= 0) {
+        throw new Error('Missing or invalid required parameter "message_id" (positive integer ROWID expected)');
+      }
+      const stdout = await runImessageCli(['edits', String(messageId), '--json']);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_edit_message') {
+      const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
+      const newText = readStringArg(toolArgs, ['new_text', 'newText', 'text']);
+      if (messageId === undefined || messageId <= 0) {
+        throw new Error('Missing or invalid required parameter "message_id" (positive integer ROWID expected)');
+      }
+      if (!newText) {
+        throw new Error('Missing or empty required parameter "new_text"');
+      }
+      const stdout = await runImessageCli(['edit', String(messageId), '--text', newText, '--json']);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_get_call_history') {
+      const handle = readStringArg(toolArgs, ['handle', 'contact', 'recipient', 'phone', 'email']);
+      const chat = readChatArg(toolArgs);
+      const since = readStringArg(toolArgs, ['since']);
+      const until = readStringArg(toolArgs, ['until']);
+      const callType = readStringArg(toolArgs, ['call_type', 'callType', 'type']);
+      const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 30, 1, 100);
+
+      const cliArgs = ['calls', '--limit', String(limit), '--json'];
+      if (handle) {
+        cliArgs.push('--handle', handle);
+      }
+      if (chat) {
+        cliArgs.push('--chat', chat);
+      }
+      if (since) {
+        cliArgs.push('--since', since);
+      }
+      if (until) {
+        cliArgs.push('--until', until);
+      }
+      if (callType) {
+        cliArgs.push('--call-type', callType);
+      }
+      const stdout = await runImessageCli(cliArgs);
+      result = {
+        content: [{ type: 'text', text: stdout }]
+      };
+    } else if (effectiveName === 'imessage_send_message') {
+      const dryRun = Boolean(args?.dry_run);
+      const confirmToken = String(args?.confirm_token || '').trim();
+
+      let recipient = readStringArg(toolArgs, ['recipient', 'to']);
+      let message = String(args?.message || '').trim();
+      let attachment = String(args?.attachment || '').trim();
+
+      if (confirmToken) {
+        pruneExpiredConfirmTokens();
+        const pending = pendingConfirmTokens.get(confirmToken);
+        if (!pending) {
+          throw new Error(`Invalid or expired confirm_token: "${confirmToken}". Please run a new dry_run preview or send directly.`);
         }
-        if (chat) {
-          cliArgs.push('--chat', chat);
+        pendingConfirmTokens.delete(confirmToken);
+        recipient = pending.recipient;
+        message = pending.message;
+        attachment = pending.attachment;
+      }
+
+      if (dryRun && !confirmToken) {
+        if (!recipient) throw new Error('Missing required parameter "recipient"');
+        pruneExpiredConfirmTokens();
+        const token = `cf_${crypto.randomBytes(8).toString('hex')}`;
+        pendingConfirmTokens.set(token, { recipient, message, attachment, createdAt: Date.now() });
+
+        let membersOutput = [];
+        try {
+          const stdout = await runImessageCli(['members', recipient, '--json']);
+          membersOutput = JSON.parse(stdout);
+        } catch {}
+
+        const previewObj = {
+          status: "preview",
+          dry_run: true,
+          target_recipient: recipient,
+          message_text: message || null,
+          attachment: attachment || null,
+          participants: membersOutput,
+          confirm_token: token,
+          instructions: `To dispatch this message, re-call ${name} with confirm_token: "${token}" or dry_run: false.`
+        };
+
+        result = {
+          content: [{ type: 'text', text: JSON.stringify(previewObj, null, 2) }]
+        };
+      } else {
+        if (!recipient) {
+          throw new Error('Missing required parameter "recipient"');
         }
-        if (since) {
-          cliArgs.push('--since', since);
-        }
-        if (until) {
-          cliArgs.push('--until', until);
-        }
-        if (callType) {
-          cliArgs.push('--call-type', callType);
-        }
+
+        const cliArgs = ['send', recipient];
+        if (message) cliArgs.push('-m', message);
+        if (attachment) cliArgs.push('-a', attachment);
+
         const stdout = await runImessageCli(cliArgs);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
-      } else if (name === 'imessage_send_message') {
-        const dryRun = Boolean(args?.dry_run);
-        const confirmToken = String(args?.confirm_token || '').trim();
-
-        let recipient = readStringArg(toolArgs, ['recipient', 'to']);
-        let message = String(args?.message || '').trim();
-        let attachment = String(args?.attachment || '').trim();
-
-        if (confirmToken) {
-          pruneExpiredConfirmTokens();
-          const pending = pendingConfirmTokens.get(confirmToken);
-          if (!pending) {
-            throw new Error(`Invalid or expired confirm_token: "${confirmToken}". Please run a new dry_run preview or send directly.`);
-          }
-          pendingConfirmTokens.delete(confirmToken);
-          recipient = pending.recipient;
-          message = pending.message;
-          attachment = pending.attachment;
-        }
-
-        if (dryRun && !confirmToken) {
-          if (!recipient) throw new Error('Missing required parameter "recipient"');
-          pruneExpiredConfirmTokens();
-          const token = `cf_${crypto.randomBytes(8).toString('hex')}`;
-          pendingConfirmTokens.set(token, { recipient, message, attachment, createdAt: Date.now() });
-
-          let membersOutput = [];
-          try {
-            const stdout = await runImessageCli(['members', recipient, '--json']);
-            membersOutput = JSON.parse(stdout);
-          } catch {}
-
-          const previewObj = {
-            status: "preview",
-            dry_run: true,
-            target_recipient: recipient,
-            message_text: message || null,
-            attachment: attachment || null,
-            participants: membersOutput,
-            confirm_token: token,
-            instructions: `To dispatch this message, re-call imessage_send_message with confirm_token: "${token}" or dry_run: false.`
-          };
-
-          result = {
-            content: [{ type: 'text', text: JSON.stringify(previewObj, null, 2) }]
-          };
-        } else {
-          if (!recipient) {
-            throw new Error('Missing required parameter "recipient"');
-          }
-
-          const cliArgs = ['send', recipient];
-          if (message) cliArgs.push('-m', message);
-          if (attachment) cliArgs.push('-a', attachment);
-
-          const stdout = await runImessageCli(cliArgs);
-          result = {
-            content: [{ type: 'text', text: stdout }]
-          };
-        }
-      } else {
-        throw new Error(`Unknown tool: ${name}`);
       }
-
-      logAuditEvent({
-        timestamp: new Date().toISOString(),
-        client_id: (ctx as any)?.user?.sub || 'master-token',
-        tool: name,
-        target: targetParam,
-        dry_run: dryRunParam,
-        status: 'success',
-        duration_ms: Date.now() - startTime
-      });
-      return result;
-    } catch (error: any) {
-      logAuditEvent({
-        timestamp: new Date().toISOString(),
-        client_id: (ctx as any)?.user?.sub || 'master-token',
-        tool: name,
-        target: targetParam,
-        dry_run: dryRunParam,
-        status: 'error',
-        duration_ms: Date.now() - startTime,
-        error_message: error.message || String(error)
-      });
-      console.error(`[MCP Tool Error] ${name}:`, error);
-      return {
-        content: [{ type: 'text', text: `Error executing ${name}: ${error.message || String(error)}` }],
-        isError: true
-      };
+    } else {
+      throw new Error(`Unknown tool: ${name}`);
     }
-  });
 
-  return server;
+    logAuditEvent({
+      timestamp: new Date().toISOString(),
+      client_id: (ctx as any)?.user?.sub || 'master-token',
+      tool: name,
+      target: targetParam,
+      dry_run: dryRunParam,
+      status: 'success',
+      duration_ms: Date.now() - startTime
+    });
+    return result;
+  } catch (error: any) {
+    logAuditEvent({
+      timestamp: new Date().toISOString(),
+      client_id: (ctx as any)?.user?.sub || 'master-token',
+      tool: name,
+      target: targetParam,
+      dry_run: dryRunParam,
+      status: 'error',
+      duration_ms: Date.now() - startTime,
+      error_message: error.message || String(error)
+    });
+    console.error(`[MCP Tool Error] ${name}:`, error);
+    return {
+      content: [{ type: 'text', text: `Error executing ${name}: ${error.message || String(error)}` }],
+      isError: true
+    };
+  }
 }
 
 const app = express();
@@ -1981,6 +2311,18 @@ if (process.env.NODE_ENV !== 'test') {
       console.log(`=======================================================`);
     });
   }
+  // Seed contacts into Unified Contact Identity Graph in background
+  runImessageCli(['contacts', '', '--json'])
+    .then(stdout => {
+      try {
+        const contacts = JSON.parse(stdout);
+        if (Array.isArray(contacts)) {
+          identityGraph.seedContacts(contacts);
+          console.log(`[IdentityGraph] Seeded ${contacts.length} contacts from iMessage`);
+        }
+      } catch (e) {}
+    })
+    .catch(() => {});
 }
 
 export {
