@@ -156,7 +156,7 @@ To connect an AI client (Antigravity, Cursor, Claude Desktop, etc.) to the iMess
 
 ### 1. Native Direct HTTP Transport (Recommended)
 
-Modern MCP clients support direct HTTP / SSE transport definitions with custom headers (Bearer token & Cloudflare Access tokens) without any external bridge process:
+Modern MCP clients support direct HTTP / SSE transport definitions with custom headers (Bearer token & modern protocol version) without any external bridge process:
 
 ```json
 {
@@ -165,8 +165,7 @@ Modern MCP clients support direct HTTP / SSE transport definitions with custom h
       "url": "https://imessage.genericservice.app/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_AUTH_TOKEN",
-        "CF-Access-Client-Id": "YOUR_CLIENT_ID.access",
-        "CF-Access-Client-Secret": "YOUR_CLIENT_SECRET"
+        "MCP-Protocol-Version": "2026-07-28"
       }
     }
   }
