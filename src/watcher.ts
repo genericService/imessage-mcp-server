@@ -128,7 +128,7 @@ export function ruleMatchesEvent(
   return false;
 }
 
-export const WATCHER_USER_AGENT = 'imessage-mcp-server/1.9.0';
+export const WATCHER_USER_AGENT = 'imessage-mcp-server/1.9.1';
 
 /**
  * Header names the watcher controls itself. Custom rule headers may not override them,

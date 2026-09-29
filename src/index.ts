@@ -100,7 +100,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.9.0';
+const SERVER_VERSION = '1.9.1';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -2039,9 +2039,9 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
 
     // 1. Protocol Version Validation (-32022)
     const headerProto = (req.headers['mcp-protocol-version'] || req.headers['Mcp-Protocol-Version']) as string | undefined;
-    const metaProto = (body.params as any)?._meta?.['io.modelcontextprotocol/protocolVersion']
-      || ((body.params as any)?.protocolVersion as string | undefined);
-    const requestedVersion = headerProto || metaProto;
+    const metaProto = (body.params as any)?._meta?.['io.modelcontextprotocol/protocolVersion'] as string | undefined;
+    const clientProto = (body.params as any)?.protocolVersion as string | undefined;
+    const requestedVersion = headerProto || metaProto || clientProto;
 
     if (requestedVersion && !SUPPORTED_SPEC_VERSIONS.includes(requestedVersion)) {
       res.status(400).json({
@@ -2202,6 +2202,10 @@ app.all(['/mcp', '/mcp/*'], authMiddleware, async (req: Request, res: Response) 
 
   try {
     if (isLegacyInitialize) {
+      if (req.headers['mcp-protocol-version'] === '2026-07-28' && !(parsedBody as any)?.params?._meta) {
+        delete req.headers['mcp-protocol-version'];
+        delete req.headers['Mcp-Protocol-Version'];
+      }
       let generatedSessionId: string | undefined;
       const transport = new NodeStreamableHTTPServerTransport({
         sessionIdGenerator: () => {

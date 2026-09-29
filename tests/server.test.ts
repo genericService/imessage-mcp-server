@@ -644,6 +644,31 @@ describe('MCP 2026-07-28 Spec Compliance', () => {
     expect(data.error.message).toContain('Header mismatch');
   });
 
+  it('should accept initialize with modern MCP-Protocol-Version header and legacy body protocolVersion without rejecting', async () => {
+    const res = await fetch(`${testUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'MCP-Protocol-Version': '2026-07-28'
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'init-compat-1',
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'cursor-client', version: '1.0.0' }
+        }
+      })
+    });
+
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"result"');
+  });
+
   it('should reject header mismatch with -32020 when Mcp-Name does not match body params.name', async () => {
     const res = await fetch(`${testUrl}/mcp`, {
       method: 'POST',
