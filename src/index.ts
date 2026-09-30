@@ -6,6 +6,7 @@ import cors from 'cors';
 import https from 'https';
 import http from 'http';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
@@ -92,6 +93,10 @@ export async function runImessageCli(cliArgs: string[]): Promise<string> {
   }
 }
 
+export const cliRunner = {
+  run: (args: string[]) => runImessageCli(args)
+};
+
 
 const PORT = parseInt(process.env.PORT || '8765', 10);
 // Dual-stack: '::' accepts IPv6 + IPv4-mapped (Node default ipv6Only=false).
@@ -100,7 +105,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.9.1';
+const SERVER_VERSION = '1.10.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -149,7 +154,7 @@ iMessage MCP Server Instructions:
 4. Edit History: Call 'imessage_get_edit_history' with a numeric message ROWID to inspect all revisions and rewrites of an edited message.
 5. Editing: Call 'imessage_edit_message' with message_id and new_text. When SIP is enabled on the host Mac, it returns bridge_available: false with suggested_text and fallback advice.
 6. Multimodal Attachments & Images: Call 'imessage_download_image' to download image attachments by message_id or path, converting HEIC photos to JPEG and saving to output_path. Call 'imessage_get_attachment_payload' to get base64 data for any attachment (converts HEIC photos to JPEG and CAF voice notes to playable/transcribable M4A audio with on-device speech-to-text transcripts).
-7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user.
+7. Sending: Call 'imessage_send_message' to send messages. Confirm recipient details and message text before sending on behalf of the user. Attachments support local Mac POSIX file paths, remote HTTPS URLs, and base64 data strings (with dry_run safety preview verification).
 8. Call History: Call 'imessage_get_call_history' to inspect phone and FaceTime call history, or pass 'include_calls: true' on reading tools to merge call records into conversation timelines.
 9. Index Status: Call 'imessage_index_status' to inspect local search index statistics, sync freshness, and lag.
 10. Documentation: Call 'imessage_get_readme' or read resource 'resource://readme' to inspect server configuration and usage.
@@ -596,7 +601,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_send_message',
     description:
-      'Send an outbound iMessage to a recipient or existing group chat thread using AppleScript on macOS. Supports text message body and/or file attachments (images, PDFs, documents, audio/video). Supports dry_run safety previews with confirmation tokens.',
+      'Send an outbound iMessage to a recipient or existing group chat thread using AppleScript or imsg on macOS. Supports text message body and attachments (local Mac POSIX file paths, remote HTTPS URLs, or base64 data). Supports dry_run safety previews with attachment existence, size, and MIME type verification.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -614,11 +619,13 @@ export const TOOLS: Tool[] = [
         },
         attachment: {
           type: 'string',
-          description: 'Optional local POSIX file path of an attachment to send (e.g. "/Users/shared/Pictures/sandworm.jpg").'
+          description:
+            'Optional file attachment to send. Accepts: (1) Local POSIX file path on the Mac (e.g. "/Users/shared/Pictures/sandworm.jpg" or "~/Downloads/flower.jpg"), (2) Remote HTTPS/HTTP URL (e.g. "https://example.com/flower.jpg") which the server automatically fetches to a temporary file, or (3) Base64 encoded file data (Data URI "data:image/jpeg;base64,..." or raw base64 string). In dry_run preview, confirms file existence, size, and MIME type.'
         },
         dry_run: {
           type: 'boolean',
-          description: 'If true, returns a structured safety preview object and confirmation token without sending (default: false).'
+          description:
+            'If true, returns a structured safety preview object and confirmation token without sending (default: false). Verifies that attachments exist and are reachable, and returns attachment size and MIME type.'
         },
         confirm_token: {
           type: 'string',
@@ -837,7 +844,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'send_message',
     description:
-      'Send an outbound iMessage to a recipient or existing chat thread (universal alias for imessage_send_message). Supports text and attachments.',
+      'Send an outbound iMessage to a recipient or existing chat thread (universal alias for imessage_send_message). Supports text and attachments (local POSIX file paths, remote HTTPS URLs, or base64 data).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -847,8 +854,16 @@ export const TOOLS: Tool[] = [
         },
         to: { type: 'string', description: 'Alias of recipient.' },
         message: { type: 'string', description: 'Optional text content of the iMessage to send.' },
-        attachment: { type: 'string', description: 'Optional local POSIX file path of an attachment to send.' },
-        dry_run: { type: 'boolean', description: 'If true, returns a structured safety preview.' },
+        attachment: {
+          type: 'string',
+          description:
+            'Optional file attachment to send. Accepts: (1) Local POSIX file path on the Mac (e.g. "/Users/shared/Pictures/sandworm.jpg" or "~/Downloads/flower.jpg"), (2) Remote HTTPS/HTTP URL (e.g. "https://example.com/flower.jpg") which the server automatically fetches to a temporary file, or (3) Base64 encoded file data (Data URI "data:image/jpeg;base64,..." or raw base64 string). In dry_run preview, confirms file existence, size, and MIME type.'
+        },
+        dry_run: {
+          type: 'boolean',
+          description:
+            'If true, returns a structured safety preview object and confirmation token without sending. Verifies that attachments exist and are reachable, and returns attachment size and MIME type.'
+        },
         confirm_token: { type: 'string', description: 'Confirmation token returned by dry_run.' }
       },
       required: ['recipient']
@@ -966,10 +981,299 @@ export const TOOLS: Tool[] = [
   }
 ];
 
-interface PendingSend {
+export interface ResolvedAttachment {
+  path: string;
+  size: number;
+  mimeType: string;
+  source: 'local' | 'url' | 'base64';
+}
+
+const EXT_TO_MIME: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain',
+  '.m4a': 'audio/mp4',
+  '.mp4': 'video/mp4',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.aac': 'audio/aac',
+  '.caf': 'audio/x-caf'
+};
+
+const MIME_TO_EXT: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'image/heic': '.heic',
+  'image/heif': '.heif',
+  'application/pdf': '.pdf',
+  'text/plain': '.txt',
+  'audio/mp4': '.m4a',
+  'video/mp4': '.mp4',
+  'audio/mpeg': '.mp3',
+  'audio/mp3': '.mp3',
+  'audio/wav': '.wav',
+  'audio/x-wav': '.wav',
+  'audio/aac': '.aac',
+  'audio/x-caf': '.caf'
+};
+
+export function detectMimeFromBuffer(buffer: Buffer): { mime: string; ext: string } | null {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { mime: 'image/jpeg', ext: '.jpg' };
+  }
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return { mime: 'image/png', ext: '.png' };
+  }
+  if (buffer.length >= 4 && buffer.slice(0, 4).toString('ascii') === 'GIF8') {
+    return { mime: 'image/gif', ext: '.gif' };
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer.slice(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.slice(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    return { mime: 'image/webp', ext: '.webp' };
+  }
+  if (buffer.length >= 4 && buffer.slice(0, 4).toString('ascii') === '%PDF') {
+    return { mime: 'application/pdf', ext: '.pdf' };
+  }
+  if (buffer.length >= 8 && buffer.slice(4, 8).toString('ascii') === 'ftyp') {
+    const brand = buffer.slice(8, 12).toString('ascii').toLowerCase();
+    if (brand.startsWith('heic') || brand.startsWith('heix') || brand.startsWith('mif1')) {
+      return { mime: 'image/heic', ext: '.heic' };
+    }
+    return { mime: 'audio/mp4', ext: '.m4a' };
+  }
+  if (buffer.length >= 3 && buffer.slice(0, 3).toString('ascii') === 'ID3') {
+    return { mime: 'audio/mpeg', ext: '.mp3' };
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0) {
+    return { mime: 'audio/mpeg', ext: '.mp3' };
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer.slice(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.slice(8, 12).toString('ascii') === 'WAVE'
+  ) {
+    return { mime: 'audio/wav', ext: '.wav' };
+  }
+  return null;
+}
+
+function getAttachmentTempDir(): string {
+  const dir = path.join(os.tmpdir(), 'imessage-attachments');
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  return dir;
+}
+
+function resolveLocalPath(inputPath: string): ResolvedAttachment {
+  const expanded = inputPath.startsWith('~')
+    ? path.join(os.homedir(), inputPath.slice(1))
+    : inputPath;
+  const resolved = path.resolve(expanded);
+
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Attachment file not found at "${inputPath}"`);
+  }
+
+  const stat = fs.statSync(resolved);
+  if (!stat.isFile()) {
+    throw new Error(`Attachment path "${inputPath}" is not a regular file`);
+  }
+
+  const ext = path.extname(resolved).toLowerCase();
+  let mimeType = EXT_TO_MIME[ext];
+  if (!mimeType) {
+    try {
+      const headerBuf = Buffer.alloc(32);
+      const fd = fs.openSync(resolved, 'r');
+      const bytesRead = fs.readSync(fd, headerBuf, 0, 32, 0);
+      fs.closeSync(fd);
+      const detected = detectMimeFromBuffer(headerBuf.slice(0, bytesRead));
+      mimeType = detected?.mime || 'application/octet-stream';
+    } catch {
+      mimeType = 'application/octet-stream';
+    }
+  }
+
+  return {
+    path: resolved,
+    size: stat.size,
+    mimeType,
+    source: 'local'
+  };
+}
+
+function resolveBase64Attachment(base64Str: string, explicitMime?: string): ResolvedAttachment {
+  const cleaned = base64Str.replace(/\s+/g, '');
+  const buffer = Buffer.from(cleaned, 'base64');
+  if (buffer.length === 0) {
+    throw new Error('Invalid or empty base64 attachment data');
+  }
+
+  const detected = detectMimeFromBuffer(buffer);
+  const mimeType = explicitMime || detected?.mime || 'application/octet-stream';
+  const ext = detected?.ext || MIME_TO_EXT[mimeType] || '.bin';
+
+  const tempDir = getAttachmentTempDir();
+  const filename = `b64_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+  const tempPath = path.join(tempDir, filename);
+  fs.writeFileSync(tempPath, buffer, { mode: 0o600 });
+
+  return {
+    path: tempPath,
+    size: buffer.length,
+    mimeType,
+    source: 'base64'
+  };
+}
+
+export async function resolveAttachment(attachmentInput: unknown): Promise<ResolvedAttachment> {
+  if (!attachmentInput) {
+    throw new Error('No attachment specified');
+  }
+
+  if (typeof attachmentInput === 'object' && attachmentInput !== null) {
+    const obj = attachmentInput as Record<string, unknown>;
+    if (typeof obj.url === 'string') {
+      return await resolveAttachment(obj.url);
+    }
+    if (typeof obj.data === 'string' || typeof obj.base64 === 'string') {
+      const b64 = (obj.data || obj.base64) as string;
+      const mime =
+        typeof obj.mime_type === 'string'
+          ? obj.mime_type
+          : typeof obj.type === 'string'
+            ? obj.type
+            : undefined;
+      return resolveBase64Attachment(b64, mime);
+    }
+    if (typeof obj.path === 'string' || typeof obj.file === 'string') {
+      return await resolveAttachment((obj.path || obj.file) as string);
+    }
+  }
+
+  if (typeof attachmentInput !== 'string') {
+    throw new Error(`Unsupported attachment input type: ${typeof attachmentInput}`);
+  }
+
+  const raw = attachmentInput.trim();
+  if (!raw) {
+    throw new Error('Attachment path or data is empty');
+  }
+
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    let url: URL;
+    try {
+      url = new URL(raw);
+    } catch {
+      throw new Error(`Invalid attachment URL: "${raw}"`);
+    }
+
+    try {
+      const res = await fetch(url.toString(), {
+        signal: AbortSignal.timeout(30000)
+      });
+      if (!res.ok) {
+        throw new Error(`Failed to download attachment from URL "${raw}": HTTP ${res.status} ${res.statusText}`);
+      }
+
+      const arrayBuffer = await res.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      if (buffer.length === 0) {
+        throw new Error(`Downloaded attachment from URL "${raw}" is empty (0 bytes)`);
+      }
+
+      const contentTypeHeader = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      const detected = detectMimeFromBuffer(buffer);
+      const mimeType =
+        contentTypeHeader && contentTypeHeader !== 'application/octet-stream'
+          ? contentTypeHeader
+          : detected?.mime || 'application/octet-stream';
+
+      const urlPathExt = path.extname(url.pathname).toLowerCase();
+      const ext = urlPathExt || detected?.ext || MIME_TO_EXT[mimeType] || '.bin';
+
+      const tempDir = getAttachmentTempDir();
+      const filename = `url_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+      const tempPath = path.join(tempDir, filename);
+      fs.writeFileSync(tempPath, buffer, { mode: 0o600 });
+
+      return {
+        path: tempPath,
+        size: buffer.length,
+        mimeType,
+        source: 'url'
+      };
+    } catch (err: any) {
+      if (err.message && err.message.startsWith('Failed to download attachment')) {
+        throw err;
+      }
+      throw new Error(`Failed to download attachment from URL "${raw}": ${err.message || String(err)}`);
+    }
+  }
+
+  if (raw.startsWith('data:')) {
+    const match = raw.match(/^data:([^;,]+)?(?:;charset=[^;,]+)?(?:;base64)?,(.*)$/is);
+    if (!match) {
+      throw new Error('Malformed data URI for attachment');
+    }
+    const explicitMime = match[1] ? match[1].toLowerCase().trim() : undefined;
+    const base64Data = match[2];
+    return resolveBase64Attachment(base64Data, explicitMime);
+  }
+
+  const isExplicitPath = raw.startsWith('~') || raw.startsWith('/') || raw.startsWith('./') || raw.startsWith('../');
+  if (!isExplicitPath) {
+    const localRel = path.resolve(raw);
+    if (fs.existsSync(localRel)) {
+      return resolveLocalPath(localRel);
+    }
+
+    const cleaned = raw.replace(/\s+/g, '');
+    const isBase64Charset = /^[A-Za-z0-9+/=]+$/.test(cleaned) && cleaned.length >= 8 && cleaned.length % 4 === 0;
+    if (isBase64Charset) {
+      try {
+        const buffer = Buffer.from(cleaned, 'base64');
+        const detected = detectMimeFromBuffer(buffer);
+        if (detected || cleaned.length > 64) {
+          return resolveBase64Attachment(cleaned, detected?.mime);
+        }
+      } catch {
+        // Fall through to local path resolution
+      }
+    }
+  }
+
+  return resolveLocalPath(raw);
+}
+
+export interface PendingSend {
   recipient: string;
   message: string;
   attachment: string;
+  attachmentInfo?: ResolvedAttachment;
   createdAt: number;
 }
 const pendingConfirmTokens = new Map<string, PendingSend>();
@@ -1553,7 +1857,16 @@ export async function executeToolCall(
 
       let recipient = readStringArg(toolArgs, ['recipient', 'to']);
       let message = String(args?.message || '').trim();
-      let attachment = String(args?.attachment || '').trim();
+      const rawAttachment =
+        toolArgs?.attachment ??
+        toolArgs?.attachment_url ??
+        toolArgs?.image_url ??
+        toolArgs?.attachment_data ??
+        toolArgs?.file ??
+        toolArgs?.file_path;
+
+      let attachment = '';
+      let resolvedAttachment: ResolvedAttachment | null = null;
 
       if (confirmToken) {
         pruneExpiredConfirmTokens();
@@ -1565,17 +1878,32 @@ export async function executeToolCall(
         recipient = pending.recipient;
         message = pending.message;
         attachment = pending.attachment;
+        if (pending.attachmentInfo) {
+          resolvedAttachment = pending.attachmentInfo;
+        }
+      } else if (rawAttachment) {
+        resolvedAttachment = await resolveAttachment(rawAttachment);
+        attachment = resolvedAttachment.path;
       }
 
       if (dryRun && !confirmToken) {
         if (!recipient) throw new Error('Missing required parameter "recipient"');
+        if (!message && !attachment) {
+          throw new Error('Missing content to send: provide "message" and/or "attachment"');
+        }
         pruneExpiredConfirmTokens();
         const token = `cf_${crypto.randomBytes(8).toString('hex')}`;
-        pendingConfirmTokens.set(token, { recipient, message, attachment, createdAt: Date.now() });
+        pendingConfirmTokens.set(token, {
+          recipient,
+          message,
+          attachment,
+          attachmentInfo: resolvedAttachment || undefined,
+          createdAt: Date.now()
+        });
 
         let membersOutput = [];
         try {
-          const stdout = await runImessageCli(['members', recipient, '--json']);
+          const stdout = await cliRunner.run(['members', recipient, '--json']);
           membersOutput = JSON.parse(stdout);
         } catch {}
 
@@ -1584,7 +1912,18 @@ export async function executeToolCall(
           dry_run: true,
           target_recipient: recipient,
           message_text: message || null,
-          attachment: attachment || null,
+          attachment: resolvedAttachment ? resolvedAttachment.path : null,
+          attachment_size: resolvedAttachment ? resolvedAttachment.size : null,
+          attachment_type: resolvedAttachment ? resolvedAttachment.mimeType : null,
+          attachment_info: resolvedAttachment
+            ? {
+                path: resolvedAttachment.path,
+                size: resolvedAttachment.size,
+                type: resolvedAttachment.mimeType,
+                mime_type: resolvedAttachment.mimeType,
+                source: resolvedAttachment.source
+              }
+            : null,
           participants: membersOutput,
           confirm_token: token,
           instructions: `To dispatch this message, re-call ${name} with confirm_token: "${token}" or dry_run: false.`
@@ -1597,12 +1936,15 @@ export async function executeToolCall(
         if (!recipient) {
           throw new Error('Missing required parameter "recipient"');
         }
+        if (!message && !attachment) {
+          throw new Error('Missing content to send: provide "message" and/or "attachment"');
+        }
 
         const cliArgs = ['send', recipient];
         if (message) cliArgs.push('-m', message);
         if (attachment) cliArgs.push('-a', attachment);
 
-        const stdout = await runImessageCli(cliArgs);
+        const stdout = await cliRunner.run(cliArgs);
         result = {
           content: [{ type: 'text', text: stdout }]
         };
@@ -1929,7 +2271,7 @@ app.get('/', (_req, res) => {
     <li><code>imessage_get_chat_members</code>: Get members of a group chat.</li>
     <li><code>imessage_get_attachment_payload</code>: Fetch attachment metadata and base64 payload.</li>
     <li><code>imessage_download_image</code>: Download and extract image attachment (converts HEIC to JPEG).</li>
-    <li><code>imessage_send_message</code>: Send an iMessage with text and/or attachments.</li>
+    <li><code>imessage_send_message</code>: Send an iMessage with text and attachments (local Mac POSIX file paths, remote HTTPS URLs, or base64 data, with dry_run safety preview verification).</li>
     <li><code>imessage_get_recent_messages</code>: Preview last N messages, or poll with since_msg_id. chat and chat_id both accept the list ROWID.</li>
     <li><code>imessage_search_group_chats</code>: Find group chats by participant set.</li>
     <li><code>imessage_get_edit_history</code>: Inspect rewrite and edit history of a message by ROWID.</li>

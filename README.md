@@ -275,7 +275,7 @@ Returns:
 | `imessage_get_chat_members` | List members and resolved contact names in group chats | `chat` (string, required) |
 | `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (converts HEIC to JPEG and CAF voice notes to M4A with transcriptions) | `path` (or `message_id`) |
 | `imessage_download_image` | Download and extract an image attachment (converts HEIC to JPEG, optional destination `output_path`) | `message_id` (or `path`), `output_path`, `include_base64` |
-| `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports dry_run preview & confirm_token) | `recipient` (string, required), `message`, `attachment`, `dry_run`, `confirm_token` |
+| `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports local paths, HTTPS URLs, or base64 attachments, dry_run safety preview, and confirm_token) | `recipient` (or `to`, required), `message`, `attachment`, `dry_run`, `confirm_token` |
 | `imessage_edit_message` | Edit a previously sent message by ROWID (subject to 15-minute Apple protocol window and 5-edit limit) | `message_id` (number, required), `text` (string, required) |
 | `imessage_index_status` | Inspect status, row counts, database file size, and sync lag of the local search index | *(none)* |
 | `imessage_get_readme` | Retrieve full server README documentation & usage guide | *(none)* |
@@ -323,6 +323,55 @@ If you wish to log AI agent action executions for security auditing, set `ENABLE
   "dry_run": true,
   "status": "success",
   "duration_ms": 42
+}
+```
+
+---
+
+## Sending messages and attachments
+
+Call `imessage_send_message` (or universal alias `send_message`) with `recipient` (or alias `to`), optional `message`, and optional `attachment`.
+
+### Supported attachment inputs
+
+The server accepts three forms of attachment input:
+
+1. **Local Mac POSIX file path:**
+   Absolute or home-relative paths on the macOS host, such as `/Users/shared/Pictures/flower.jpg` or `~/Downloads/flower.jpg`.
+2. **Remote HTTPS/HTTP URL:**
+   Public or authenticated web URLs, such as `https://example.com/images/flower.jpg`. The server fetches the file directly, saves it to a secure staging directory, and passes the staged file to Messages.
+3. **Base64 encoded data:**
+   File payloads encoded as standard Data URIs (`data:image/jpeg;base64,/9j/4AAQ...`) or raw base64 strings. The server sniffs binary magic bytes to determine file type, writes the buffer to a temporary file, and attaches it.
+
+### Safety preview and attachment validation (`dry_run: true`)
+
+Before sending, clients can pass `dry_run: true` to generate a preview and verification receipt without sending:
+
+- **Existence verification:** Validates that a local file path exists on disk, a remote URL returns HTTP 200, or a base64 string decodes into a valid binary buffer. Non-existent files or 404 URLs return clear errors immediately.
+- **Metadata inspection:** Computes and returns the exact file size (`attachment_size` in bytes) and MIME type (`attachment_type`).
+- **Confirmation token:** Generates a short-lived `confirm_token` (`cf_...`). Re-calling `imessage_send_message` with `confirm_token` authorizes dispatch using the already-verified, staged file without re-uploading or re-downloading.
+
+Example preview response:
+
+```json
+{
+  "status": "preview",
+  "dry_run": true,
+  "target_recipient": "+15550199808",
+  "message_text": "Here is the flower",
+  "attachment": "/var/folders/.../T/imessage-attachments/url_1790726927_a1b2c3d4.jpg",
+  "attachment_size": 245120,
+  "attachment_type": "image/jpeg",
+  "attachment_info": {
+    "path": "/var/folders/.../T/imessage-attachments/url_1790726927_a1b2c3d4.jpg",
+    "size": 245120,
+    "type": "image/jpeg",
+    "mime_type": "image/jpeg",
+    "source": "url"
+  },
+  "participants": [],
+  "confirm_token": "cf_0123456789abcdef",
+  "instructions": "To dispatch this message, re-call imessage_send_message with confirm_token: \"cf_0123456789abcdef\" or dry_run: false."
 }
 ```
 

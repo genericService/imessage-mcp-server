@@ -2863,17 +2863,55 @@ end run"""
         sys.exit(1)
 
 
+def _resolve_cli_attachment(attachment):
+    if not attachment:
+        return None
+    raw = attachment.strip()
+    if raw.startswith(('http://', 'https://')):
+        import urllib.request, urllib.parse, tempfile
+        temp_dir = os.path.join(tempfile.gettempdir(), 'imessage-attachments')
+        os.makedirs(temp_dir, exist_ok=True)
+        url_path = urllib.parse.urlparse(raw).path
+        ext = os.path.splitext(url_path)[1] or '.bin'
+        temp_path = os.path.join(temp_dir, f"cli_url_{int(time.time())}_{os.urandom(4).hex()}{ext}")
+        try:
+            req = urllib.request.Request(raw, headers={'User-Agent': 'imessage-mcp-server'})
+            with urllib.request.urlopen(req, timeout=30) as resp, open(temp_path, 'wb') as out_f:
+                out_f.write(resp.read())
+            return temp_path
+        except Exception as e:
+            print(f"ERROR: Failed to download attachment from URL '{raw}': {e}", file=sys.stderr)
+            sys.exit(1)
+    if raw.startswith('data:'):
+        import tempfile, re
+        m = re.match(r'^data:([^;,]+)?(?:;charset=[^;,]+)?(?:;base64)?,(.*)$', raw, re.DOTALL)
+        if m:
+            try:
+                raw_data = base64.b64decode(m.group(2))
+                mime = (m.group(1) or '').lower()
+                ext = '.jpg' if 'jpeg' in mime or 'jpg' in mime else '.png' if 'png' in mime else '.pdf' if 'pdf' in mime else '.bin'
+                temp_dir = os.path.join(tempfile.gettempdir(), 'imessage-attachments')
+                os.makedirs(temp_dir, exist_ok=True)
+                temp_path = os.path.join(temp_dir, f"cli_b64_{int(time.time())}_{os.urandom(4).hex()}{ext}")
+                with open(temp_path, 'wb') as f:
+                    f.write(raw_data)
+                return temp_path
+            except Exception as e:
+                print(f"ERROR: Failed to decode base64 data URI attachment: {e}", file=sys.stderr)
+                sys.exit(1)
+    attachment_path = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.exists(attachment_path):
+        print(f"ERROR: Attachment file not found at '{attachment_path}'", file=sys.stderr)
+        sys.exit(1)
+    return attachment_path
+
+
 def send_message(args):
     recipient = args.recipient
     message = args.message or ''
     attachment = args.attachment
 
-    attachment_path = None
-    if attachment:
-        attachment_path = os.path.abspath(os.path.expanduser(attachment))
-        if not os.path.exists(attachment_path):
-            print(f"ERROR: Attachment file not found at '{attachment_path}'", file=sys.stderr)
-            sys.exit(1)
+    attachment_path = _resolve_cli_attachment(attachment)
 
     if not message and not attachment_path:
         print("ERROR: Nothing to send: provide --message and/or --attachment", file=sys.stderr)
@@ -3554,7 +3592,7 @@ def main():
     send_parser = subparsers.add_parser("send", help="Send an iMessage")
     send_parser.add_argument("recipient", help="Recipient identifier")
     send_parser.add_argument("--message", "-m", help="Message text body")
-    send_parser.add_argument("--attachment", "-a", help="POSIX path to attachment file")
+    send_parser.add_argument("--attachment", "-a", help="POSIX path, HTTPS URL, or base64 data URI to attachment file")
     send_parser.set_defaults(func=send_message)
 
     edits_parser = subparsers.add_parser("edits", help="View edit and rewrite history for a message")
