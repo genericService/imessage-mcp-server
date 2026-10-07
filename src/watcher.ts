@@ -37,6 +37,12 @@ export interface WebhookPayload {
   count: number;
   since_msg_id_hint: number;
   occurred_at_iso: string;
+  delivered_quietly?: boolean;
+  was_delivered_quietly?: boolean;
+  notifications_silenced?: boolean;
+  silenced_notifications?: boolean;
+  effect?: string | null;
+  effect_type?: 'bubble' | 'screen' | 'unknown' | null;
 }
 
 export interface RawDetectedMessage {
@@ -47,6 +53,12 @@ export interface RawDetectedMessage {
   event: WatchEventType;
   is_from_me: boolean;
   occurred_at_iso: string;
+  delivered_quietly?: boolean;
+  was_delivered_quietly?: boolean;
+  notifications_silenced?: boolean;
+  silenced_notifications?: boolean;
+  effect?: string | null;
+  effect_type?: string | null;
 }
 
 export interface RawReceiptEvent {
@@ -55,6 +67,12 @@ export interface RawReceiptEvent {
   chat_identifiers: string[];
   msg_id: number;
   occurred_at_iso: string;
+  delivered_quietly?: boolean;
+  was_delivered_quietly?: boolean;
+  notifications_silenced?: boolean;
+  silenced_notifications?: boolean;
+  effect?: string | null;
+  effect_type?: string | null;
 }
 
 export interface ChangesCliResult {
@@ -73,6 +91,12 @@ export interface PendingDispatch {
   count: number;
   since_msg_id_hint: number;
   occurred_at_iso: string;
+  delivered_quietly?: boolean;
+  was_delivered_quietly?: boolean;
+  notifications_silenced?: boolean;
+  silenced_notifications?: boolean;
+  effect?: string | null;
+  effect_type?: string | null;
   timer: NodeJS.Timeout;
 }
 
@@ -521,13 +545,27 @@ export class WatcherService {
 
       if (hadNewMessages) {
         for (const msg of result.new_messages) {
-          this.handleEvent(msg.event, msg.chat_id, msg.chat_identifiers, msg.msg_id, msg.occurred_at_iso);
+          this.handleEvent(msg.event, msg.chat_id, msg.chat_identifiers, msg.msg_id, msg.occurred_at_iso, {
+            delivered_quietly: msg.delivered_quietly,
+            was_delivered_quietly: msg.was_delivered_quietly,
+            notifications_silenced: msg.notifications_silenced,
+            silenced_notifications: msg.silenced_notifications,
+            effect: msg.effect,
+            effect_type: msg.effect_type,
+          });
         }
       }
 
       if (hadReceiptEvents) {
         for (const rec of result.receipt_events) {
-          this.handleEvent(rec.event, rec.chat_id, rec.chat_identifiers, rec.msg_id, rec.occurred_at_iso);
+          this.handleEvent(rec.event, rec.chat_id, rec.chat_identifiers, rec.msg_id, rec.occurred_at_iso, {
+            delivered_quietly: rec.delivered_quietly,
+            was_delivered_quietly: rec.was_delivered_quietly,
+            notifications_silenced: rec.notifications_silenced,
+            silenced_notifications: rec.silenced_notifications,
+            effect: rec.effect,
+            effect_type: rec.effect_type,
+          });
         }
       }
 
@@ -577,13 +615,21 @@ export class WatcherService {
     chatId: number,
     chatIdentifiers: string[],
     msgId: number,
-    occurredAtIso: string
+    occurredAtIso: string,
+    meta?: {
+      delivered_quietly?: boolean;
+      was_delivered_quietly?: boolean;
+      notifications_silenced?: boolean;
+      silenced_notifications?: boolean;
+      effect?: string | null;
+      effect_type?: string | null;
+    }
   ): void {
     const rules = this.config.rules;
     for (let ruleIndex = 0; ruleIndex < rules.length; ruleIndex++) {
       const rule = rules[ruleIndex];
       if (ruleMatchesEvent(rule, event, chatId, chatIdentifiers)) {
-        this.queueDispatch(ruleIndex, rule, event, chatId, msgId, occurredAtIso);
+        this.queueDispatch(ruleIndex, rule, event, chatId, msgId, occurredAtIso, meta);
       }
     }
   }
@@ -594,7 +640,15 @@ export class WatcherService {
     event: WatchEventType,
     chatId: number,
     msgId: number,
-    occurredAtIso: string
+    occurredAtIso: string,
+    meta?: {
+      delivered_quietly?: boolean;
+      was_delivered_quietly?: boolean;
+      notifications_silenced?: boolean;
+      silenced_notifications?: boolean;
+      effect?: string | null;
+      effect_type?: string | null;
+    }
   ): void {
     const key = `${ruleIndex}:${chatId}:${event}`;
     const debounceMs = typeof rule.debounce_ms === 'number' ? rule.debounce_ms : 3000;
@@ -604,6 +658,16 @@ export class WatcherService {
       existing.count += 1;
       existing.newest_msg_id = Math.max(existing.newest_msg_id, msgId);
       existing.occurred_at_iso = occurredAtIso;
+      if (meta?.delivered_quietly) {
+        existing.delivered_quietly = true;
+        existing.was_delivered_quietly = true;
+        existing.notifications_silenced = true;
+        existing.silenced_notifications = true;
+      }
+      if (meta?.effect) {
+        existing.effect = meta.effect;
+        existing.effect_type = meta.effect_type;
+      }
     } else {
       const sinceMsgIdHint = Math.max(0, msgId - 1);
       const timer = setTimeout(() => {
@@ -619,6 +683,12 @@ export class WatcherService {
         count: 1,
         since_msg_id_hint: sinceMsgIdHint,
         occurred_at_iso: occurredAtIso,
+        delivered_quietly: meta?.delivered_quietly,
+        was_delivered_quietly: meta?.was_delivered_quietly,
+        notifications_silenced: meta?.notifications_silenced,
+        silenced_notifications: meta?.silenced_notifications,
+        effect: meta?.effect,
+        effect_type: meta?.effect_type,
         timer,
       });
     }
@@ -639,6 +709,16 @@ export class WatcherService {
       count: item.count,
       since_msg_id_hint: item.since_msg_id_hint,
       occurred_at_iso: item.occurred_at_iso,
+      ...(item.delivered_quietly ? {
+        delivered_quietly: true,
+        was_delivered_quietly: true,
+        notifications_silenced: true,
+        silenced_notifications: true
+      } : {}),
+      ...(item.effect ? {
+        effect: item.effect,
+        effect_type: item.effect_type as any
+      } : {})
     };
 
     await deliverWebhook(item.rule.webhook_url, payload, item.rule.secret, 3, item.rule.headers);

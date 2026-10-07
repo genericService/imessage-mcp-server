@@ -111,6 +111,8 @@ function insertDbMessage(
     date_delivered?: number;
     is_read?: number;
     date_read?: number;
+    was_delivered_quietly?: number;
+    expressive_send_style_id?: string;
   }
 ): void {
   const script = `
@@ -121,8 +123,9 @@ c.execute("""
 INSERT INTO message (
     ROWID, guid, text, handle_id, date, is_from_me,
     associated_message_type, associated_message_guid,
-    is_delivered, date_delivered, is_read, date_read
-) VALUES (?, ?, ?, ?, 800000000000000000, ?, ?, ?, ?, ?, ?, ?)
+    is_delivered, date_delivered, is_read, date_read,
+    was_delivered_quietly, expressive_send_style_id
+) VALUES (?, ?, ?, ?, 800000000000000000, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """, (
     ${params.rowid},
     'MSG-GUID-${params.rowid}',
@@ -135,6 +138,8 @@ INSERT INTO message (
     ${params.date_delivered || 0},
     ${params.is_read || 0},
     ${params.date_read || 0},
+    ${params.was_delivered_quietly || 0},
+    ${params.expressive_send_style_id ? `'${params.expressive_send_style_id}'` : 'None'},
 ))
 c.execute("INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (?, ?, 800000000000000000)", (${params.chat_id}, ${params.rowid}))
 conn.commit()
@@ -151,6 +156,7 @@ function updateDbReceipt(
     date_delivered?: number;
     is_read?: number;
     date_read?: number;
+    was_delivered_quietly?: number;
   }
 ): void {
   const sets: string[] = [];
@@ -158,6 +164,7 @@ function updateDbReceipt(
   if (updates.date_delivered !== undefined) sets.push(`date_delivered = ${updates.date_delivered}`);
   if (updates.is_read !== undefined) sets.push(`is_read = ${updates.is_read}`);
   if (updates.date_read !== undefined) sets.push(`date_read = ${updates.date_read}`);
+  if (updates.was_delivered_quietly !== undefined) sets.push(`was_delivered_quietly = ${updates.was_delivered_quietly}`);
 
   const script = `
 import sqlite3, sys
@@ -725,5 +732,62 @@ describe('iMessage Watcher & Webhook Notification System', () => {
 
     // Cursor still advances past skipped system rows
     expect(watcher.getState().last_seen_msg_id).toBe(390);
+  });
+
+  it('enriches delivered webhook events with quiet delivery and send effects', async () => {
+    // Insert Dune-themed outgoing message with lasers effect
+    insertDbMessage(testDbPath, {
+      rowid: 395,
+      chat_id: 7,
+      handle_id: 1,
+      is_from_me: 1,
+      text: 'Long live the fighters',
+      is_delivered: 0,
+      date_delivered: 0,
+      is_read: 0,
+      date_read: 0,
+      expressive_send_style_id: 'com.apple.messages.effect.CKLasersEffect',
+    });
+
+    const config: WatcherConfig = {
+      enabled: true,
+      poll_interval_ms: 10000,
+      state_file: testStatePath,
+      rules: [
+        {
+          webhook_url: `http://127.0.0.1:${webhookPort}/webhook`,
+          chats: [7],
+          events: ['delivered'],
+          debounce_ms: 100,
+        },
+      ],
+    };
+
+    const watcher = new WatcherService(config);
+    await watcher.start();
+
+    receivedWebhooks = [];
+
+    // Simulate transition to delivered quietly (notifications silenced)
+    updateDbReceipt(testDbPath, 395, {
+      is_delivered: 1,
+      date_delivered: 800000002000000000,
+      was_delivered_quietly: 1,
+    });
+    await watcher.checkChanges();
+
+    const webhooks = await waitForWebhooks(1, 1500);
+    await watcher.stop();
+
+    expect(webhooks.length).toBe(1);
+    const payload = webhooks[0].payload;
+    expect(payload.event).toBe('delivered');
+    expect(payload.chat_id).toBe(7);
+    expect(payload.newest_msg_id).toBe(395);
+    expect(payload.delivered_quietly).toBe(true);
+    expect(payload.notifications_silenced).toBe(true);
+    expect(payload.silenced_notifications).toBe(true);
+    expect(payload.effect).toBe('lasers');
+    expect(payload.effect_type).toBe('screen');
   });
 });

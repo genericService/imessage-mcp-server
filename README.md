@@ -21,12 +21,14 @@ It connects your local Mac's iMessage database (`~/Library/Messages/chat.db`), m
 - **Zoned timestamps:** Each message keeps its human `timestamp` and adds `timestamp_iso` in ISO 8601 with the server machine's local UTC offset.
 - **Sender identity:** Outgoing rows use sender `Me` and an empty `handle`. The other party's handle is `participant`, because `chat.db` stores that handle on `is_from_me` rows.
 - **Delivery, Quiet Delivery & Read Receipts:** Surfaces `is_delivered`, `delivered_at`, `delivered_at_iso`, `delivered_quietly`, `was_delivered_quietly`, `notifications_silenced`, `did_notify_recipient`, `is_read`, `read_at`, and `read_at_iso` on message records. `delivered_at` is always populated when `is_delivered` is true (falling back to message timestamp if SQLite omitted a separate delivery date). Quiet delivery indicators reflect recipient Focus or Do Not Disturb status.
-- **Webhook Wakeups & Change Watcher:** Detects changes to `chat.db` and `chat.db-wal` using filesystem events and polling fallback, sending debounced webhook notifications to external bots. Payloads contain strictly event metadata with zero message text or contact names. Includes HMAC-SHA256 signatures and restart state persistence.
+- **Scheduled Messages & CLI Runner:** Schedule outgoing iMessages with exact future ISO timestamps and expressive effects via `imessage_send_message`. Inspect, cancel, and run due scheduled messages via the CLI runner (`bin/imessage schedule list`, `status`, `cancel`, `run-pending`) even if the background Node server is stopped.
+- **Stickers & Media Payload Handling:** Surfaces rich sticker metadata (`is_sticker`, `sticker_pack`, `sticker_description`), synthesizes raw Unicode replacement characters `\ufffc` into human-readable `[sticker: "description"]` labels, and converts HEIC stickers to PNG by default during downloads to preserve alpha transparency.
+- **Webhook Wakeups & Change Watcher:** Detects changes to `chat.db` and `chat.db-wal` using filesystem events and polling fallback, sending debounced webhook notifications to external bots. Payloads contain strictly event metadata with zero message text or contact names. Surfaces quiet delivery flags and expressive send styles. Includes HMAC-SHA256 signatures and restart state persistence.
 - **MCP Resource Subscriptions:** Exposes `resource://messages/recent` with live updates over MCP for clients subscribed to server resources.
 - **Message Editing:** Programmatically edit sent messages within Apple's 15-minute protocol window (up to 5 revisions) via `imessage_edit_message` and `imessage edit`, routing through the IMCore bridge.
 - **Contact Resolution:** Integrates with macOS Contacts database (`AddressBook-v22.abcddb`) to resolve names, phone numbers, and emails.
 - **Voice Note Transcriptions & Audio Processing:** Surfaces Apple on-device speech-to-text transcriptions, audio durations (e.g. `[voice note, 15s: "transcript"]`), and full-text search across voice memo transcripts. Automatically converts proprietary CoreAudio `.caf` files to universal `.m4a` (AAC) via macOS `afconvert` for speech and multimodal AI models.
-- **Multimodal Attachment Reading:** Exposes attachment metadata (MIME type, size, path, duration) and automatically converts `.heic` photos to `.jpg` and `.caf` voice memos to `.m4a`.
+- **Multimodal Attachment Reading:** Exposes attachment metadata (MIME type, size, path, duration) and automatically converts `.heic` photos to `.jpg`, `.heic` stickers to `.png`, and `.caf` voice memos to `.m4a`.
 - **Reliable Attachment Sending:** Sends route through the [imsg](https://github.com/openclaw/imsg) CLI when installed, with a native AppleScript fallback that stages files inside Messages' own attachments directory to avoid "Not Delivered" sandboxing failures. No Accessibility/GUI scripting required.
 - **Group Chat Rosters:** Inspects group conversation member lists and handles.
 - **OAuth 2.0 Auth Server & Bearer Auth:** Embedded authorization server supporting RFC 8414 metadata, Authorization Code flow with PKCE, Client Credentials grant, and RFC 7591 dynamic client registration alongside customizable static Bearer tokens.
@@ -302,7 +304,11 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | `members` | List members and handles in a group chat | `bin/imessage members 1767 --json` |
 | `search-group` | Search group chats by exact participant set | `bin/imessage search-group "paul@caladan.org" "chani@sietch.net"` |
 | `attachment` | Inspect attachment file metadata and base64 payload by path or message ID | `bin/imessage attachment --message-id 198097 --json` |
-| `download-image` | Download/convert image attachment to JPEG, optionally saving to output path | `bin/imessage download-image --message-id 198097 --output-path ~/Downloads/photo.jpg --json` |
+| `download-image` | Download/convert image attachment (HEIC to PNG for stickers, JPEG for photos), optionally saving to output path | `bin/imessage download-image --message-id 198097 --format auto --output-path ~/Downloads/photo.png --json` |
+| `schedule list` | List pending, sent, or canceled scheduled messages | `bin/imessage schedule list --status pending --json` |
+| `schedule status` | Summary stats of scheduled queue with next upcoming message | `bin/imessage schedule status --json` |
+| `schedule cancel` | Cancel a pending scheduled message by ID | `bin/imessage schedule cancel sched_e33c4b78745e45d9 --json` |
+| `schedule run-pending` | Process and send all due scheduled messages | `bin/imessage schedule run-pending --json` |
 | `changes` | Query message ROWIDs and receipt transitions since cursor | `bin/imessage changes --since-id 1200 --json` |
 | `index build` | Build local sidecar search index in batches | `bin/imessage index build --batch-size 5000` |
 | `index status` | Show index row counts, lag, and file size | `bin/imessage index status --json` |

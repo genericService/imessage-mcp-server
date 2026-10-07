@@ -800,6 +800,74 @@ def extract_attachment_user_info(user_info_blob):
     except Exception:
         return {}
 
+def extract_sticker_metadata(user_info, attribution_info, emoji_desc, uti, filename, is_sticker_col, sticker_user_info=None):
+    """
+    Extract is_sticker (bool), sticker_pack (str | None), and sticker_description (str | None).
+    """
+    p_user = extract_attachment_user_info(user_info)
+    p_attr = extract_attachment_user_info(attribution_info)
+    p_stick = extract_attachment_user_info(sticker_user_info) if sticker_user_info else {}
+
+    fn = (filename or "").lower()
+    uti_lower = (uti or "").lower()
+
+    col_flag = bool(is_sticker_col and int(is_sticker_col) > 0)
+    path_flag = bool("stickercache" in fn or "/stickers/" in fn)
+    uti_flag = bool("sticker" in uti_lower)
+
+    plist_flag = bool(
+        p_user.get("is-sticker")
+        or p_user.get("sticker-pack-name")
+        or p_user.get("sticker-pack-bundle-id")
+        or p_attr.get("bundle-id")
+        or p_attr.get("pack-name")
+        or p_attr.get("sticker-pack-name")
+        or p_stick
+    )
+
+    pack = (
+        p_stick.get("sticker-pack-name")
+        or p_stick.get("sticker-pack-bundle-id")
+        or p_stick.get("pack-name")
+        or p_stick.get("bundle-id")
+        or p_attr.get("sticker-pack-name")
+        or p_attr.get("pack-name")
+        or p_attr.get("sticker-pack-bundle-id")
+        or p_attr.get("bundle-id")
+        or p_user.get("sticker-pack-name")
+        or p_user.get("sticker-pack-bundle-id")
+        or p_user.get("pack-name")
+        or p_user.get("bundle-id")
+    )
+    if pack is not None and not isinstance(pack, str):
+        pack = str(pack)
+
+    desc = (
+        emoji_desc
+        or p_stick.get("sticker-description")
+        or p_stick.get("accessibility-label")
+        or p_stick.get("accessibilityLabel")
+        or p_attr.get("accessibility-label")
+        or p_attr.get("accessibilityLabel")
+        or p_attr.get("sticker-description")
+        or p_user.get("sticker-description")
+        or p_user.get("accessibility-label")
+        or p_user.get("accessibilityLabel")
+    )
+    if desc is not None and not isinstance(desc, str):
+        desc = str(desc)
+
+    is_sticker = bool(col_flag or path_flag or uti_flag or plist_flag or pack or desc)
+    return is_sticker, pack, desc
+
+
+def build_sticker_label(description=None, pack=None):
+    """Build a clear label for stickers when synthesizing message text."""
+    if description:
+        return f'[sticker: "{description}"]'
+    return '[sticker]'
+
+
 def fetch_attachments_for_messages(cursor, msg_ids):
     """
     Fetch and enrich all attachments for a list of message IDs.
@@ -807,6 +875,15 @@ def fetch_attachments_for_messages(cursor, msg_ids):
     """
     if not msg_ids:
         return {}
+
+    cursor.execute("PRAGMA table_info(attachment)")
+    att_cols = {r[1] for r in cursor.fetchall()}
+
+    is_sticker_sel = "a.is_sticker" if "is_sticker" in att_cols else "0 AS is_sticker"
+    attr_info_sel = "a.attribution_info" if "attribution_info" in att_cols else "NULL AS attribution_info"
+    emoji_desc_sel = "a.emoji_image_short_description" if "emoji_image_short_description" in att_cols else "NULL AS emoji_image_short_description"
+    sticker_user_info_sel = "a.sticker_user_info" if "sticker_user_info" in att_cols else "NULL AS sticker_user_info"
+
     att_placeholders = ",".join(["?"] * len(msg_ids))
     att_query = f"""
     SELECT 
@@ -816,14 +893,19 @@ def fetch_attachments_for_messages(cursor, msg_ids):
         a.transfer_name,
         a.total_bytes,
         a.user_info,
-        a.uti
+        a.uti,
+        {is_sticker_sel},
+        {attr_info_sel},
+        {emoji_desc_sel},
+        {sticker_user_info_sel}
     FROM message_attachment_join maj
     JOIN attachment a ON maj.attachment_id = a.ROWID
     WHERE maj.message_id IN ({att_placeholders})
     """
     cursor.execute(att_query, msg_ids)
     attachments_map = {}
-    for msg_id, filename, mime_type, transfer_name, total_bytes, user_info, uti in cursor.fetchall():
+    for (msg_id, filename, mime_type, transfer_name, total_bytes, user_info, uti,
+         is_sticker_col, attr_info, emoji_desc, sticker_user_info) in cursor.fetchall():
         if msg_id not in attachments_map:
             attachments_map[msg_id] = []
         
@@ -840,6 +922,11 @@ def fetch_attachments_for_messages(cursor, msg_ids):
             or transcription is not None
         )
         
+        is_sticker, sticker_pack, sticker_description = extract_sticker_metadata(
+            user_info, attr_info, emoji_desc, uti, full_path or transfer_name,
+            is_sticker_col, sticker_user_info
+        )
+
         resolved_mime = mime_type
         if not resolved_mime or resolved_mime == 'application/octet-stream':
             if ext in AUDIO_MIME_MAP:
@@ -872,19 +959,36 @@ def fetch_attachments_for_messages(cursor, msg_ids):
             'duration_formatted': dur_fmt,
             'transcription': transcription,
             'uti': uti,
+            'is_sticker': bool(is_sticker),
+            'sticker_pack': sticker_pack,
+            'sticker_description': sticker_description,
         })
     return attachments_map
 
 def synthesize_message_text(raw_text, attr_body, is_audio_message, att_list):
     """
-    Synthesizes message text, populating voice note transcripts and labels
-    when text is empty or when audio attachments exist.
+    Synthesizes message text, populating voice note transcripts and labels,
+    and synthesizing raw Unicode replacement character \ufffc into readable sticker labels.
     Returns: (text: str, is_audio: bool, transcription: str | None)
     """
     msg_text = raw_text or ""
     if not msg_text or msg_text.strip() == "":
         msg_text = parse_attributed_body(attr_body)
     
+    # Process sticker attachments
+    sticker_atts = [a for a in att_list if a.get('is_sticker')]
+    if sticker_atts:
+        for s in sticker_atts:
+            s_label = build_sticker_label(s.get('sticker_description'), s.get('sticker_pack'))
+            if '\ufffc' in msg_text:
+                msg_text = msg_text.replace('\ufffc', s_label, 1)
+            elif not msg_text or msg_text.strip() == "" or msg_text == "<empty message>":
+                msg_text = s_label
+            else:
+                msg_text = f"{msg_text.strip()} {s_label}".strip()
+        if '\ufffc' in msg_text:
+            msg_text = msg_text.replace('\ufffc', '[sticker]')
+
     audio_atts = [a for a in att_list if a.get('is_audio')]
     is_audio = bool(is_audio_message or audio_atts)
     
@@ -2647,12 +2751,72 @@ def resolve_attachment_for_message(message_id, image_only=False):
     return None, None, f"No image attachment found for message #{message_id}"
 
 
+def resolve_attachment_sticker_info(filepath, message_id=None):
+    """Resolve is_sticker, sticker_pack, sticker_description for an attachment file or message_id."""
+    is_sticker = False
+    sticker_pack = None
+    sticker_desc = None
+    if filepath and ("stickercache" in filepath.lower() or "/stickers/" in filepath.lower()):
+        is_sticker = True
+
+    try:
+        conn = sqlite3.connect(f"file:{get_db_path()}?mode=ro", uri=True)
+        c = conn.cursor()
+        c.execute("PRAGMA table_info(attachment)")
+        att_cols = {r[1] for r in c.fetchall()}
+
+        is_sticker_sel = "a.is_sticker" if "is_sticker" in att_cols else "0 AS is_sticker"
+        attr_info_sel = "a.attribution_info" if "attribution_info" in att_cols else "NULL AS attribution_info"
+        emoji_desc_sel = "a.emoji_image_short_description" if "emoji_image_short_description" in att_cols else "NULL AS emoji_image_short_description"
+        sticker_user_info_sel = "a.sticker_user_info" if "sticker_user_info" in att_cols else "NULL AS sticker_user_info"
+
+        row = None
+        if message_id:
+            c.execute(f"""
+                SELECT a.user_info, {attr_info_sel}, {emoji_desc_sel}, {is_sticker_sel}, a.uti, {sticker_user_info_sel}, a.filename
+                FROM attachment a
+                JOIN message_attachment_join maj ON a.ROWID = maj.attachment_id
+                WHERE maj.message_id = ?
+                ORDER BY a.ROWID ASC LIMIT 1
+            """, (message_id,))
+            row = c.fetchone()
+
+        if not row and filepath:
+            basename = os.path.basename(filepath)
+            normpath = filepath.replace(os.path.expanduser('~'), '~')
+            c.execute(f"""
+                SELECT a.user_info, {attr_info_sel}, {emoji_desc_sel}, {is_sticker_sel}, a.uti, {sticker_user_info_sel}, a.filename
+                FROM attachment a
+                WHERE a.filename = ? OR a.filename = ? OR a.filename LIKE ?
+                ORDER BY (CASE WHEN a.filename = ? OR a.filename = ? THEN 0 ELSE 1 END), a.ROWID DESC LIMIT 1
+            """, (filepath, normpath, f"%{basename}", filepath, normpath))
+            row = c.fetchone()
+
+        if row:
+            u_info, attr_info, emoji_desc, is_stk, uti_val, stk_u_info, a_fn = row
+            stk_flag, pack, desc = extract_sticker_metadata(
+                u_info, attr_info, emoji_desc, uti_val, filepath or a_fn, is_stk, stk_u_info
+            )
+            is_sticker = is_sticker or stk_flag
+            if pack:
+                sticker_pack = pack
+            if desc:
+                sticker_desc = desc
+
+        conn.close()
+    except Exception:
+        pass
+
+    return is_sticker, sticker_pack, sticker_desc
+
+
 def download_image(args):
-    """Download and extract an image attachment with optional format conversion to JPEG."""
+    """Download and extract an image attachment with optional format conversion to JPEG or PNG."""
     filepath = getattr(args, 'path', None)
     message_id = getattr(args, 'message_id', None)
     output_path = getattr(args, 'output_path', None)
     include_base64 = getattr(args, 'include_base64', True)
+    format_arg = getattr(args, 'format', 'auto') or 'auto'
 
     if not filepath and message_id:
         filepath, _, err = resolve_attachment_for_message(message_id, image_only=True)
@@ -2664,7 +2828,10 @@ def download_image(args):
                 "file_path": None,
                 "mime_type": None,
                 "size_bytes": 0,
-                "base64": None
+                "base64": None,
+                "is_sticker": False,
+                "sticker_pack": None,
+                "sticker_description": None
             }
             if getattr(args, 'json', False):
                 print(json.dumps(err_res, indent=2))
@@ -2680,7 +2847,10 @@ def download_image(args):
             "file_path": None,
             "mime_type": None,
             "size_bytes": 0,
-            "base64": None
+            "base64": None,
+            "is_sticker": False,
+            "sticker_pack": None,
+            "sticker_description": None
         }
         if getattr(args, 'json', False):
             print(json.dumps(err_res, indent=2))
@@ -2697,13 +2867,18 @@ def download_image(args):
             "file_path": filepath,
             "mime_type": None,
             "size_bytes": 0,
-            "base64": None
+            "base64": None,
+            "is_sticker": False,
+            "sticker_pack": None,
+            "sticker_description": None
         }
         if getattr(args, 'json', False):
             print(json.dumps(err_res, indent=2))
         else:
             print(f"ERROR: Attachment file not found at '{filepath}'", file=sys.stderr)
         sys.exit(1)
+
+    is_sticker, sticker_pack, sticker_description = resolve_attachment_sticker_info(filepath, message_id)
 
     target_path = filepath
     mime = "application/octet-stream"
@@ -2712,11 +2887,14 @@ def download_image(args):
     file_base = os.path.splitext(os.path.basename(filepath))[0]
 
     if ext in ['.heic', '.heif']:
-        jpg_path = f"/tmp/imessage_conv_{parent_name}_{file_base}.jpg"
-        subprocess.run(['sips', '-s', 'format', 'jpeg', filepath, '--out', jpg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if os.path.exists(jpg_path):
-            target_path = jpg_path
-            mime = "image/jpeg"
+        conv_format = "png" if (is_sticker or format_arg == "png") else "jpeg"
+        conv_ext = "png" if conv_format == "png" else "jpg"
+        conv_mime = "image/png" if conv_format == "png" else "image/jpeg"
+        converted_path = f"/tmp/imessage_conv_{parent_name}_{file_base}.{conv_ext}"
+        subprocess.run(['sips', '-s', 'format', conv_format, filepath, '--out', converted_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(converted_path):
+            target_path = converted_path
+            mime = conv_mime
     elif ext in ['.jpg', '.jpeg']:
         mime = "image/jpeg"
     elif ext == '.png':
@@ -2751,13 +2929,17 @@ def download_image(args):
         "file_path": final_path,
         "mime_type": mime,
         "size_bytes": size_bytes,
-        "base64": b64_str
+        "base64": b64_str,
+        "is_sticker": bool(is_sticker),
+        "sticker_pack": sticker_pack,
+        "sticker_description": sticker_description
     }
 
     if getattr(args, 'json', False):
         print(json.dumps(res, indent=2))
     else:
-        print(f"Image downloaded: {final_path} ({size_bytes} bytes, {mime})")
+        stk_str = " (sticker)" if is_sticker else ""
+        print(f"Image downloaded: {final_path} ({size_bytes} bytes, {mime}){stk_str}")
 
 
 def get_attachment_payload(args):
@@ -2778,6 +2960,8 @@ def get_attachment_payload(args):
         print(f"ERROR: Attachment file not found at '{filepath}'", file=sys.stderr)
         sys.exit(1)
         
+    is_sticker, sticker_pack, sticker_description = resolve_attachment_sticker_info(filepath, message_id)
+
     target_path = filepath
     mime = "application/octet-stream"
     ext = os.path.splitext(filepath)[1].lower()
@@ -2785,11 +2969,14 @@ def get_attachment_payload(args):
     file_base = os.path.splitext(os.path.basename(filepath))[0]
     
     if ext in ['.heic', '.heif']:
-        jpg_path = f"/tmp/imessage_conv_{parent_name}_{file_base}.jpg"
-        subprocess.run(['sips', '-s', 'format', 'jpeg', filepath, '--out', jpg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if os.path.exists(jpg_path):
-            target_path = jpg_path
-            mime = "image/jpeg"
+        conv_format = "png" if is_sticker else "jpeg"
+        conv_ext = "png" if conv_format == "png" else "jpg"
+        conv_mime = "image/png" if conv_format == "png" else "image/jpeg"
+        conv_path = f"/tmp/imessage_conv_{parent_name}_{file_base}.{conv_ext}"
+        subprocess.run(['sips', '-s', 'format', conv_format, filepath, '--out', conv_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(conv_path):
+            target_path = conv_path
+            mime = conv_mime
     elif ext == '.caf':
         m4a_path = f"/tmp/imessage_conv_{parent_name}_{file_base}.m4a"
         afconvert_bin = '/usr/bin/afconvert'
@@ -2861,7 +3048,10 @@ def get_attachment_payload(args):
         'duration_seconds': dur_sec,
         'duration_formatted': dur_fmt,
         'transcription': transcription,
-        'language': language
+        'language': language,
+        'is_sticker': bool(is_sticker),
+        'sticker_pack': sticker_pack,
+        'sticker_description': sticker_description
     }
     
     if args.json:
@@ -3085,6 +3275,148 @@ def send_message(args):
     print(f"imsg unavailable ({detail}), falling back to AppleScript", file=sys.stderr)
     _send_via_applescript(target_ident, recipient, message, attachment_path)
     print(f"Message sent to '{recipient}' ({target_ident}) via AppleScript successfully!")
+
+
+def get_schedule_file():
+    env_path = os.environ.get("IMESSAGE_SCHEDULE_PATH")
+    if env_path:
+        return os.path.abspath(os.path.expanduser(env_path))
+    return os.path.expanduser("~/.imessage-mcp/scheduled.json")
+
+
+def read_scheduled_file():
+    p = get_schedule_file()
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def write_scheduled_file(messages):
+    p = get_schedule_file()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(messages, f, indent=2)
+
+
+def schedule_cli(args):
+    action = getattr(args, "action", None) or "status"
+    messages = read_scheduled_file()
+
+    if action == "list":
+        filter_status = getattr(args, "status", None) or "all"
+        filtered = [m for m in messages if filter_status == "all" or m.get("status") == filter_status]
+        if getattr(args, "json", False):
+            print(json.dumps(filtered, indent=2))
+        else:
+            print(f"SCHEDULED MESSAGES ({len(filtered)} items, filter: {filter_status}):")
+            print(f"{'ID':<24} | {'Status':<10} | {'Scheduled For':<24} | {'Recipient':<25}")
+            print("-" * 90)
+            for m in filtered:
+                print(f"{m.get('id', ''):<24} | {m.get('status', ''):<10} | {m.get('scheduled_for', m.get('target_time', '')):<24} | {m.get('recipient', ''):<25}")
+
+    elif action == "status":
+        pending_list = [m for m in messages if m.get("status") == "pending"]
+        sent_list = [m for m in messages if m.get("status") == "sent"]
+        canceled_list = [m for m in messages if m.get("status") == "canceled"]
+        failed_list = [m for m in messages if m.get("status") == "failed"]
+        sorted_pending = sorted(pending_list, key=lambda x: x.get("target_time", ""))
+        next_item = sorted_pending[0] if sorted_pending else None
+
+        res = {
+            "total": len(messages),
+            "pending": len(pending_list),
+            "sent": len(sent_list),
+            "canceled": len(canceled_list),
+            "failed": len(failed_list),
+            "next_scheduled": {
+                "id": next_item["id"],
+                "recipient": next_item["recipient"],
+                "scheduled_for": next_item.get("scheduled_for", next_item.get("target_time")),
+                "effect": next_item.get("effect"),
+            } if next_item else None
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(res, indent=2))
+        else:
+            print("Scheduled Messages Status:")
+            print(f"  Total:    {res['total']}")
+            print(f"  Pending:  {res['pending']}")
+            print(f"  Sent:     {res['sent']}")
+            print(f"  Canceled: {res['canceled']}")
+            print(f"  Failed:   {res['failed']}")
+            if next_item:
+                print(f"  Next:     {next_item['id']} for {next_item['recipient']} at {next_item.get('scheduled_for')}")
+
+    elif action == "cancel":
+        schedule_id = getattr(args, "id", None)
+        found = False
+        for m in messages:
+            if m.get("id") == schedule_id:
+                m["status"] = "canceled"
+                found = True
+                break
+        if found:
+            write_scheduled_file(messages)
+            res = {"success": True, "canceled": True, "id": schedule_id}
+            if getattr(args, "json", False):
+                print(json.dumps(res, indent=2))
+            else:
+                print(f"Scheduled message {schedule_id} canceled successfully.")
+        else:
+            res = {"success": False, "canceled": False, "error": f"Scheduled message {schedule_id} not found", "id": schedule_id}
+            if getattr(args, "json", False):
+                print(json.dumps(res, indent=2))
+            else:
+                print(f"ERROR: Scheduled message {schedule_id} not found", file=sys.stderr)
+            sys.exit(1)
+
+    elif action in ("run-pending", "run"):
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        now_iso = now_dt.isoformat()
+        dispatched = []
+        for m in messages:
+            if m.get("status") == "pending":
+                target_str = m.get("target_time") or m.get("scheduled_for")
+                try:
+                    target_dt = datetime.datetime.fromisoformat(target_str.replace("Z", "+00:00"))
+                    if target_dt <= now_dt:
+                        try:
+                            class SendArgs:
+                                pass
+                            s_args = SendArgs()
+                            s_args.recipient = m.get("recipient")
+                            s_args.message = m.get("message")
+                            s_args.attachment = m.get("attachment")
+                            s_args.effect = m.get("effect")
+                            send_message(s_args)
+                            m["status"] = "sent"
+                            m["sent_at"] = now_iso
+                            m.pop("error", None)
+                            dispatched.append(m)
+                        except Exception as e:
+                            m["status"] = "failed"
+                            m["error"] = str(e)
+                            dispatched.append(m)
+                except Exception as ex:
+                    m["status"] = "failed"
+                    m["error"] = f"Invalid target_time: {ex}"
+                    dispatched.append(m)
+
+        if dispatched:
+            write_scheduled_file(messages)
+
+        if getattr(args, "json", False):
+            print(json.dumps(dispatched, indent=2))
+        else:
+            print(f"Processed {len(dispatched)} due scheduled messages.")
+            for d in dispatched:
+                print(f"  {d.get('id')}: {d.get('status')} to {d.get('recipient')}")
+
 
 def get_recent_messages(args):
     conn = get_db_connection()
@@ -3516,10 +3848,10 @@ def get_changes(args):
     since_id = args.since_id
     new_messages = []
 
-    if since_id is not None and since_id > 0:
-        def opt_col(column, alias):
-            return f"m.{column} AS {alias}" if column in available else f"NULL AS {alias}"
+    def opt_col(column, alias):
+        return f"m.{column} AS {alias}" if column in available else f"NULL AS {alias}"
 
+    if since_id is not None and since_id > 0:
         cursor.execute(f"""
             SELECT m.ROWID AS msg_id, m.guid AS guid, cmj.chat_id AS chat_id,
                    c.chat_identifier AS chat_identifier, c.display_name AS display_name,
@@ -3531,7 +3863,9 @@ def get_changes(args):
                    {opt_col("attributedBody", "attributed_body")},
                    {opt_col("item_type", "item_type")},
                    {opt_col("group_action_type", "group_action_type")},
-                   {opt_col("cache_has_attachments", "cache_has_attachments")}
+                   {opt_col("cache_has_attachments", "cache_has_attachments")},
+                   {opt_col("was_delivered_quietly", "was_delivered_quietly")},
+                   {opt_col("expressive_send_style_id", "expressive_send_style_id")}
             {MESSAGE_FROM_LOOSE}
             WHERE m.ROWID > ?
             ORDER BY m.ROWID ASC
@@ -3554,7 +3888,8 @@ def get_changes(args):
 
         for r in rows:
             (m_id, guid, chat_id, chat_ident, display_name, is_from_me, assoc_type, assoc_guid, date_ns,
-             text, attr_body, item_type, group_action_type, cache_has_attachments) = r
+             text, attr_body, item_type, group_action_type, cache_has_attachments,
+             was_deliv_quietly, style_id) = r
             event = classify_change_row(
                 assoc_type=assoc_type,
                 is_from_me=is_from_me,
@@ -3570,7 +3905,11 @@ def get_changes(args):
 
             _human, iso = format_apple_ns(date_ns)
             identifiers = build_identifiers(chat_id, chat_ident, display_name)
-            new_messages.append({
+            effect_name, effect_type = (None, None)
+            if style_id:
+                effect_name, effect_type = REVERSE_EFFECT_NAMES.get(style_id, (style_id, "unknown"))
+
+            msg_item = {
                 "msg_id": m_id,
                 "guid": guid,
                 "chat_id": chat_id,
@@ -3578,7 +3917,17 @@ def get_changes(args):
                 "event": event,
                 "is_from_me": bool(is_from_me),
                 "occurred_at_iso": iso or datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            })
+            }
+            if was_deliv_quietly:
+                msg_item["delivered_quietly"] = True
+                msg_item["was_delivered_quietly"] = True
+                msg_item["notifications_silenced"] = True
+                msg_item["silenced_notifications"] = True
+            if effect_name:
+                msg_item["effect"] = effect_name
+                msg_item["effect_type"] = effect_type
+
+            new_messages.append(msg_item)
 
     receipt_events = []
     current_receipt_state = {}
@@ -3597,7 +3946,10 @@ def get_changes(args):
                    {deliv_date_col} AS date_delivered_ns,
                    {read_col} AS is_read,
                    {read_date_col} AS date_read_ns,
-                   m.date AS date_ns
+                   m.date AS date_ns,
+                   {opt_col("was_delivered_quietly", "was_delivered_quietly")},
+                   {opt_col("did_notify_recipient", "did_notify_recipient")},
+                   {opt_col("expressive_send_style_id", "expressive_send_style_id")}
             {MESSAGE_FROM_LOOSE}
             WHERE m.is_from_me = 1
             ORDER BY m.ROWID DESC
@@ -3612,7 +3964,8 @@ def get_changes(args):
                 pass
 
         for r in cursor.fetchall():
-            m_id, chat_id, chat_ident, display_name, is_deliv, date_deliv_ns, is_rd, date_rd_ns, date_ns = r
+            (m_id, chat_id, chat_ident, display_name, is_deliv, date_deliv_ns, is_rd, date_rd_ns, date_ns,
+             was_deliv_quietly, did_notify, style_id) = r
             curr_delivered = bool(is_deliv or (date_deliv_ns and date_deliv_ns > 0))
             curr_read = bool(is_rd or (date_rd_ns and date_rd_ns > 0))
             current_receipt_state[str(m_id)] = {
@@ -3623,25 +3976,53 @@ def get_changes(args):
             if prev_receipt_state and str(m_id) in prev_receipt_state:
                 prev = prev_receipt_state[str(m_id)]
                 identifiers = build_identifiers(chat_id, chat_ident, display_name)
+                effect_name, effect_type = (None, None)
+                if style_id:
+                    effect_name, effect_type = REVERSE_EFFECT_NAMES.get(style_id, (style_id, "unknown"))
 
                 if not prev.get("delivered") and curr_delivered:
                     _h, deliv_iso = format_apple_ns(date_deliv_ns) if date_deliv_ns else format_apple_ns(date_ns)
-                    receipt_events.append({
+                    rec_event = {
                         "event": "delivered",
                         "chat_id": chat_id,
                         "chat_identifiers": identifiers,
                         "msg_id": m_id,
                         "occurred_at_iso": deliv_iso or datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    })
+                    }
+                    if was_deliv_quietly:
+                        rec_event["delivered_quietly"] = True
+                        rec_event["was_delivered_quietly"] = True
+                        rec_event["notifications_silenced"] = True
+                        rec_event["silenced_notifications"] = True
+                    if did_notify:
+                        rec_event["did_notify_recipient"] = True
+                    if effect_name:
+                        rec_event["effect"] = effect_name
+                        rec_event["effect_type"] = effect_type
+
+                    receipt_events.append(rec_event)
+
                 if not prev.get("read") and curr_read:
                     _h, read_iso = format_apple_ns(date_rd_ns) if date_rd_ns else format_apple_ns(date_ns)
-                    receipt_events.append({
+                    rec_event = {
                         "event": "read_receipt",
                         "chat_id": chat_id,
                         "chat_identifiers": identifiers,
                         "msg_id": m_id,
                         "occurred_at_iso": read_iso or datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    })
+                    }
+                    if was_deliv_quietly:
+                        rec_event["delivered_quietly"] = True
+                        rec_event["was_delivered_quietly"] = True
+                        rec_event["notifications_silenced"] = True
+                        rec_event["silenced_notifications"] = True
+                    if did_notify:
+                        rec_event["did_notify_recipient"] = True
+                    if effect_name:
+                        rec_event["effect"] = effect_name
+                        rec_event["effect_type"] = effect_type
+
+                    receipt_events.append(rec_event)
 
     conn.close()
 
@@ -3726,10 +4107,11 @@ def main():
     attachment_parser.add_argument("--json", action="store_true", help="Output JSON with base64 data")
     attachment_parser.set_defaults(func=get_attachment_payload)
 
-    download_image_parser = subparsers.add_parser("download-image", help="Download and extract image attachment (converts HEIC to JPEG)")
+    download_image_parser = subparsers.add_parser("download-image", help="Download and extract image attachment (converts HEIC to PNG for stickers, JPEG for photos)")
     download_image_parser.add_argument("--path", default=None, help="POSIX path to attachment file")
     download_image_parser.add_argument("--message-id", type=int, default=None, help="Message ROWID containing attachment")
     download_image_parser.add_argument("--output-path", default=None, help="Destination POSIX path to write or copy the image")
+    download_image_parser.add_argument("--format", choices=["auto", "jpeg", "jpg", "png"], default="auto", help="Output format for converted images (default: auto; stickers convert to png)")
     download_image_parser.add_argument("--include-base64", action="store_true", default=True, help="Include base64 payload")
     download_image_parser.add_argument("--no-base64", dest="include_base64", action="store_false", help="Omit base64 payload")
     download_image_parser.add_argument("--json", action="store_true", help="Output JSON")
@@ -3739,6 +4121,7 @@ def main():
     download_image_alias.add_argument("--path", default=None, help="POSIX path to attachment file")
     download_image_alias.add_argument("--message-id", type=int, default=None, help="Message ROWID containing attachment")
     download_image_alias.add_argument("--output-path", default=None, help="Destination POSIX path to write or copy the image")
+    download_image_alias.add_argument("--format", choices=["auto", "jpeg", "jpg", "png"], default="auto", help="Output format for converted images (default: auto; stickers convert to png)")
     download_image_alias.add_argument("--include-base64", action="store_true", default=True, help="Include base64 payload")
     download_image_alias.add_argument("--no-base64", dest="include_base64", action="store_false", help="Omit base64 payload")
     download_image_alias.add_argument("--json", action="store_true", help="Output JSON")
@@ -3785,6 +4168,33 @@ def main():
     check_changes_parser.add_argument("--receipt-state", type=str, default=None, help="JSON string of prior outgoing receipt states")
     check_changes_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     check_changes_parser.set_defaults(func=get_changes)
+
+    schedule_parser = subparsers.add_parser("schedule", help="Inspect and manage scheduled messages")
+    schedule_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    schedule_parser.set_defaults(func=schedule_cli, action="status")
+    schedule_sub = schedule_parser.add_subparsers(dest="action")
+
+    sched_list_p = schedule_sub.add_parser("list", help="List scheduled messages")
+    sched_list_p.add_argument("--status", choices=["all", "pending", "sent", "canceled", "failed"], default="all", help="Filter by message status")
+    sched_list_p.add_argument("--json", action="store_true", help="Output results in JSON format")
+    sched_list_p.set_defaults(func=schedule_cli)
+
+    sched_status_p = schedule_sub.add_parser("status", help="Get summary statistics of scheduled messages")
+    sched_status_p.add_argument("--json", action="store_true", help="Output results in JSON format")
+    sched_status_p.set_defaults(func=schedule_cli)
+
+    sched_cancel_p = schedule_sub.add_parser("cancel", help="Cancel a pending scheduled message")
+    sched_cancel_p.add_argument("id", help="Schedule ID to cancel (e.g. sched_...)")
+    sched_cancel_p.add_argument("--json", action="store_true", help="Output results in JSON format")
+    sched_cancel_p.set_defaults(func=schedule_cli)
+
+    sched_run_p = schedule_sub.add_parser("run-pending", help="Run due scheduled messages")
+    sched_run_p.add_argument("--json", action="store_true", help="Output results in JSON format")
+    sched_run_p.set_defaults(func=schedule_cli)
+
+    sched_run_alias = schedule_sub.add_parser("run", help="Alias for run-pending")
+    sched_run_alias.add_argument("--json", action="store_true", help="Output results in JSON format")
+    sched_run_alias.set_defaults(func=schedule_cli)
     
     args = parser.parse_args()
     args.func(args)

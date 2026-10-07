@@ -197,7 +197,10 @@ def build(path):
             transfer_name TEXT,
             total_bytes INTEGER,
             user_info BLOB,
-            uti TEXT
+            uti TEXT,
+            is_sticker INTEGER DEFAULT 0,
+            attribution_info BLOB,
+            emoji_image_short_description TEXT
         );
         CREATE TABLE message_attachment_join (
             message_id INTEGER,

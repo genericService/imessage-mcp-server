@@ -220,6 +220,44 @@ export async function scheduleMessage(
   };
 }
 
+export async function runPendingScheduledMessages(
+  customDispatcher?: MessageDispatcher
+): Promise<ScheduledMessage[]> {
+  const dispatcher = customDispatcher || globalDispatcher;
+  if (!dispatcher) {
+    throw new Error('No dispatcher available to run pending scheduled messages.');
+  }
+
+  const stored = readScheduledMessages();
+  const now = Date.now();
+  const processed: ScheduledMessage[] = [];
+
+  for (const item of stored) {
+    if (item.status === 'pending') {
+      const targetTime = new Date(item.target_time).getTime();
+      if (targetTime <= now) {
+        try {
+          await dispatcher(item);
+          item.status = 'sent';
+          item.sent_at = new Date().toISOString();
+          delete item.error;
+          processed.push(item);
+        } catch (err: any) {
+          item.status = 'failed';
+          item.error = err.message || String(err);
+          processed.push(item);
+        }
+      }
+    }
+  }
+
+  if (processed.length > 0) {
+    writeScheduledMessages(stored);
+  }
+
+  return processed;
+}
+
 export interface AmbientScheduleSummary {
   pending_scheduled_count: number;
   next_scheduled: {

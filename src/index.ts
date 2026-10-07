@@ -125,7 +125,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.12.2';
+const SERVER_VERSION = '1.13.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -529,7 +529,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_download_image',
     description:
-      'Download and extract an image attachment from an iMessage by message ID or file path, delivering the visual image block directly to multimodal agents. Converts HEIC photos to JPEG for multimodal LLMs and optionally copies the image to a custom destination output_path.',
+      'Download and extract an image attachment from an iMessage by message ID or file path, delivering the visual image block directly to multimodal agents. Converts HEIC photos to JPEG, and converts HEIC stickers to PNG by default to preserve alpha transparency. Optionally copies the image to a custom destination output_path.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -550,6 +550,11 @@ export const TOOLS: Tool[] = [
         output_path: {
           type: 'string',
           description: 'Optional destination file path where the extracted/converted image should be saved.'
+        },
+        format: {
+          type: 'string',
+          enum: ['auto', 'png', 'jpeg'],
+          description: 'Optional format conversion for HEIC images. Default "auto" converts stickers to PNG (preserving alpha transparency) and photos to JPEG.'
         },
         include_base64: {
           type: 'boolean',
@@ -575,7 +580,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'download_image',
     description:
-      'Standard alias for imessage_download_image. Download and extract an image attachment from an iMessage by message ID or file path, delivering the visual image block directly to multimodal agents.',
+      'Standard alias for imessage_download_image. Download and extract an image attachment from an iMessage by message ID or file path, delivering the visual image block directly to multimodal agents. Converts HEIC stickers to PNG to preserve transparency.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -596,6 +601,11 @@ export const TOOLS: Tool[] = [
         output_path: {
           type: 'string',
           description: 'Optional destination file path where the extracted/converted image should be saved.'
+        },
+        format: {
+          type: 'string',
+          enum: ['auto', 'png', 'jpeg'],
+          description: 'Optional format conversion for HEIC images. Default "auto" converts stickers to PNG (preserving alpha transparency) and photos to JPEG.'
         },
         include_base64: {
           type: 'boolean',
@@ -1950,6 +1960,7 @@ export async function executeToolCall(
       const filePath = readStringArg(toolArgs, ['path', 'file', 'file_path', 'filePath', 'filepath']);
       const messageId = readIntArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
       const outputPath = readStringArg(toolArgs, ['output_path', 'outputPath', 'destination']);
+      const format = readStringArg(toolArgs, ['format']);
       const includeBase64 = toolArgs?.include_base64 !== false && toolArgs?.includeBase64 !== false;
       const deliverImage = toolArgs?.deliver_image !== false && toolArgs?.deliverImage !== false;
 
@@ -1965,6 +1976,9 @@ export async function executeToolCall(
       }
       if (outputPath) {
         cliArgs.push('--output-path', outputPath);
+      }
+      if (format) {
+        cliArgs.push('--format', format);
       }
       if (!includeBase64 && !deliverImage) {
         cliArgs.push('--no-base64');
