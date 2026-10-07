@@ -46,7 +46,8 @@ import {
   EFFECT_MAP,
   initScheduler,
   clearAllScheduledTimers,
-  ScheduledMessage
+  ScheduledMessage,
+  getAmbientScheduleSummary
 } from './scheduler.js';
 
 const execFileAsync = promisify(execFile);
@@ -124,7 +125,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.12.0';
+const SERVER_VERSION = '1.12.1';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -1682,7 +1683,16 @@ export async function executeToolCall(
       }
       const cliArgs = ['read', chat, '--days', String(days), '--json'];
       appendPresentationArgs(cliArgs, toolArgs);
-      const stdout = await runImessageCli(cliArgs);
+      let stdout = await runImessageCli(cliArgs);
+      if (toolArgs?.with_meta || toolArgs?.withMeta) {
+        try {
+          const parsed = JSON.parse(stdout);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.messages) {
+            parsed.ambient = getAmbientScheduleSummary();
+            stdout = JSON.stringify(parsed, null, 2);
+          }
+        } catch {}
+      }
       result = {
         content: [{ type: 'text', text: stdout }]
       };
@@ -1861,7 +1871,16 @@ export async function executeToolCall(
       }
       const cliArgs = ['recent', chat, '--limit', String(limit), '--json'];
       appendPresentationArgs(cliArgs, toolArgs);
-      const stdout = await runImessageCli(cliArgs);
+      let stdout = await runImessageCli(cliArgs);
+      if (toolArgs?.with_meta || toolArgs?.withMeta) {
+        try {
+          const parsed = JSON.parse(stdout);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.messages) {
+            parsed.ambient = getAmbientScheduleSummary();
+            stdout = JSON.stringify(parsed, null, 2);
+          }
+        } catch {}
+      }
       result = {
         content: [{ type: 'text', text: stdout }]
       };
@@ -2128,7 +2147,8 @@ export async function executeToolCall(
           confirm_token: token,
           instructions: `To dispatch this message, re-call ${name} with confirm_token: "${token}" or dry_run: false.`,
           ...(effect ? { effect, effect_type: normalizedEffect?.type || 'unknown' } : {}),
-          ...(scheduleAt ? { scheduled: true, scheduled_for: scheduleAt } : {})
+          ...(scheduleAt ? { scheduled: true, scheduled_for: scheduleAt } : {}),
+          ambient: getAmbientScheduleSummary()
         };
 
         result = {
@@ -2151,7 +2171,7 @@ export async function executeToolCall(
             schedule_at: scheduleAt
           });
           result = {
-            content: [{ type: 'text', text: JSON.stringify(schedRes, null, 2) }]
+            content: [{ type: 'text', text: JSON.stringify({ ...schedRes, ambient: getAmbientScheduleSummary() }, null, 2) }]
           };
         } else {
           const cliArgs = ['send', recipient];
@@ -2178,7 +2198,7 @@ export async function executeToolCall(
       }
       const cancelRes = await cancelScheduledMessage(scheduleId);
       result = {
-        content: [{ type: 'text', text: JSON.stringify(cancelRes, null, 2) }]
+        content: [{ type: 'text', text: JSON.stringify({ ...cancelRes, ambient: getAmbientScheduleSummary() }, null, 2) }]
       };
     } else {
       throw new Error(`Unknown tool: ${name}`);

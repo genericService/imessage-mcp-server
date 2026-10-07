@@ -398,6 +398,26 @@ Scheduled messages are durably stored in `~/.imessage-mcp/scheduled.json` (or cu
 - **List scheduled messages:** Call `imessage_list_scheduled_messages` (or `list_scheduled_messages`) to view pending, sent, or canceled messages.
 - **Cancel a scheduled message:** Call `imessage_cancel_scheduled_message` (or `cancel_scheduled_message`) with `schedule_id` to disarm its timer and cancel delivery before send.
 
+### Ambient context envelope
+
+Object-returning endpoints (`dry_run` preview, scheduled dispatch confirmations, `imessage_cancel_scheduled_message`, and reads using `with_meta: true`) automatically include an `ambient` block. This informs callers of pending queued tasks without requiring extra tool calls:
+
+```json
+{
+  "ambient": {
+    "pending_scheduled_count": 1,
+    "next_scheduled": {
+      "id": "sched_1790726927_a1b2c3d4",
+      "recipient": "+15550199808",
+      "scheduled_for": "2026-10-07T12:00:00.000Z",
+      "effect": "lasers"
+    }
+  }
+}
+```
+
+Calls returning raw arrays (such as `imessage_list_chats` or plain `imessage_read_messages`) preserve their array structure for backward compatibility.
+
 ---
 
 ## Reading messages

@@ -220,6 +220,37 @@ export async function scheduleMessage(
   };
 }
 
+export interface AmbientScheduleSummary {
+  pending_scheduled_count: number;
+  next_scheduled: {
+    id: string;
+    recipient: string;
+    scheduled_for: string;
+    effect?: string | null;
+  } | null;
+}
+
+export function getAmbientScheduleSummary(): AmbientScheduleSummary {
+  const stored = readScheduledMessages();
+  const pending = stored
+    .filter((m) => m.status === 'pending')
+    .sort((a, b) => new Date(a.target_time).getTime() - new Date(b.target_time).getTime());
+
+  const next = pending.length > 0 ? pending[0] : null;
+
+  return {
+    pending_scheduled_count: pending.length,
+    next_scheduled: next
+      ? {
+          id: next.id,
+          recipient: next.recipient,
+          scheduled_for: next.scheduled_for || next.target_time,
+          effect: next.effect || null
+        }
+      : null
+  };
+}
+
 export async function listScheduledMessages(filterStatus?: string): Promise<ScheduledMessage[]> {
   const stored = readScheduledMessages();
   if (!filterStatus || filterStatus === 'all') {
