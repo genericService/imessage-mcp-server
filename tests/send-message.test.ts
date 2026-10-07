@@ -242,6 +242,47 @@ describe('iMessage Send Message Attachments & Preview (TDD)', () => {
     cliSpy.mockRestore();
   });
 
+  it('accepts structured attachment payload object with base64 data and mime_type', async () => {
+    const pngBase64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    const res = await executeToolCall('imessage_send_message', {
+      recipient: 'Thufir Hawat (+15550199484)',
+      message: 'Mentat report with payload object',
+      attachment: {
+        data: pngBase64,
+        mime_type: 'image/png'
+      },
+      dry_run: true
+    });
+
+    expect(res.isError).toBeFalsy();
+    const data = JSON.parse(res.content[0].type === 'text' ? res.content[0].text : '{}');
+    expect(data.status).toBe('preview');
+    expect(data.attachment_size).toBe(70);
+    expect(data.attachment_type).toBe('image/png');
+    expect(fs.existsSync(data.attachment)).toBe(true);
+    expect(data.attachment_info.source).toBe('base64');
+  });
+
+  it('accepts attachment_data parameter directly for base64 payloads', async () => {
+    const dataUri =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    const res = await executeToolCall('imessage_send_message', {
+      recipient: 'Lady Jessica (+15550199481)',
+      message: 'Bene Gesserit communication via attachment_data',
+      attachment_data: dataUri,
+      dry_run: true
+    });
+
+    expect(res.isError).toBeFalsy();
+    const data = JSON.parse(res.content[0].type === 'text' ? res.content[0].text : '{}');
+    expect(data.status).toBe('preview');
+    expect(data.attachment_size).toBe(70);
+    expect(data.attachment_type).toBe('image/png');
+  });
+
   it('documents effect and schedule_at in send tool input schemas', () => {
     const sendTools = TOOLS.filter((t) => t.name === 'imessage_send_message' || t.name === 'send_message');
     for (const tool of sendTools) {

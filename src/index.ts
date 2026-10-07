@@ -637,9 +637,21 @@ export const TOOLS: Tool[] = [
           description: 'Optional text content of the iMessage to send.'
         },
         attachment: {
-          type: 'string',
+          anyOf: [{ type: 'string' }, { type: 'object' }],
           description:
-            'Optional file attachment to send. Accepts: (1) Local POSIX file path on the Mac (e.g. "/Users/shared/Pictures/sandworm.jpg" or "~/Downloads/flower.jpg"), (2) Remote HTTPS/HTTP URL (e.g. "https://example.com/flower.jpg") which the server automatically fetches to a temporary file, or (3) Base64 encoded file data (Data URI "data:image/jpeg;base64,..." or raw base64 string). In dry_run preview, confirms file existence, size, and MIME type.'
+            'Optional file attachment to send. Accepts: (1) Local POSIX file path on the Mac (e.g. "/Users/shared/Pictures/sandworm.jpg" or "~/Downloads/flower.jpg"), (2) Remote HTTPS/HTTP URL (e.g. "https://example.com/flower.jpg") which the server automatically fetches to a temporary file, (3) Base64 encoded file data (Data URI "data:image/jpeg;base64,..." or raw base64 string), or (4) Structured object payload with data/base64 and mime_type. In dry_run preview, confirms file existence, size, and MIME type.'
+        },
+        attachment_data: {
+          type: 'string',
+          description: 'Alias of attachment for passing direct base64 encoded data payloads or Data URIs.'
+        },
+        attachment_url: {
+          type: 'string',
+          description: 'Alias of attachment for passing remote HTTPS/HTTP image or document URLs.'
+        },
+        image_url: {
+          type: 'string',
+          description: 'Alias of attachment for passing remote HTTPS/HTTP image URLs.'
         },
         dry_run: {
           type: 'boolean',
@@ -938,9 +950,21 @@ export const TOOLS: Tool[] = [
         to: { type: 'string', description: 'Alias of recipient.' },
         message: { type: 'string', description: 'Optional text content of the iMessage to send.' },
         attachment: {
-          type: 'string',
+          anyOf: [{ type: 'string' }, { type: 'object' }],
           description:
-            'Optional file attachment to send. Accepts: (1) Local POSIX file path on the Mac (e.g. "/Users/shared/Pictures/sandworm.jpg" or "~/Downloads/flower.jpg"), (2) Remote HTTPS/HTTP URL (e.g. "https://example.com/flower.jpg") which the server automatically fetches to a temporary file, or (3) Base64 encoded file data (Data URI "data:image/jpeg;base64,..." or raw base64 string). In dry_run preview, confirms file existence, size, and MIME type.'
+            'Optional file attachment to send. Accepts: (1) Local POSIX file path on the Mac (e.g. "/Users/shared/Pictures/sandworm.jpg" or "~/Downloads/flower.jpg"), (2) Remote HTTPS/HTTP URL (e.g. "https://example.com/flower.jpg") which the server automatically fetches to a temporary file, (3) Base64 encoded file data (Data URI "data:image/jpeg;base64,..." or raw base64 string), or (4) Structured object payload with data/base64 and mime_type. In dry_run preview, confirms file existence, size, and MIME type.'
+        },
+        attachment_data: {
+          type: 'string',
+          description: 'Alias of attachment for passing direct base64 encoded data payloads or Data URIs.'
+        },
+        attachment_url: {
+          type: 'string',
+          description: 'Alias of attachment for passing remote HTTPS/HTTP image or document URLs.'
+        },
+        image_url: {
+          type: 'string',
+          description: 'Alias of attachment for passing remote HTTPS/HTTP image URLs.'
         },
         dry_run: {
           type: 'boolean',
