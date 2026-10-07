@@ -366,6 +366,42 @@ describe('delivery and read receipts on message records', () => {
     expect(msg100.is_read).toBe(true);
     expect(typeof msg100.read_at_iso).toBe('string');
   });
+
+  it('always fills in delivered_at and delivered_at_iso when is_delivered is true even if date_delivered is 0', async () => {
+    const data = await cliJson(['recent', '8', '--limit', '20', '--json']);
+    const msg202 = data.find((m: any) => m.msg_id === 202);
+    expect(msg202).toBeDefined();
+    expect(msg202.is_delivered).toBe(true);
+    expect(typeof msg202.delivered_at).toBe('string');
+    expect(typeof msg202.delivered_at_iso).toBe('string');
+    expect(msg202.delivered_at).toBe(msg202.timestamp);
+    expect(msg202.delivered_at_iso).toBe(msg202.timestamp_iso);
+  });
+
+  it('surfaces delivered_quietly, was_delivered_quietly, notifications_silenced, and did_notify_recipient', async () => {
+    const data7 = await cliJson(['recent', '7', '--limit', '20', '--json']);
+    const msg101 = data7.find((m: any) => m.msg_id === 101);
+    expect(msg101).toBeDefined();
+    expect(msg101.delivered_quietly).toBe(false);
+    expect(msg101.was_delivered_quietly).toBe(false);
+    expect(msg101.notifications_silenced).toBe(false);
+    expect(msg101.did_notify_recipient).toBe(false);
+
+    const data8 = await cliJson(['recent', '8', '--limit', '20', '--json']);
+    const msg202 = data8.find((m: any) => m.msg_id === 202);
+    expect(msg202).toBeDefined();
+    expect(msg202.delivered_quietly).toBe(true);
+    expect(msg202.was_delivered_quietly).toBe(true);
+    expect(msg202.notifications_silenced).toBe(true);
+    expect(msg202.did_notify_recipient).toBe(false);
+
+    const msg203 = data8.find((m: any) => m.msg_id === 203);
+    expect(msg203).toBeDefined();
+    expect(msg203.delivered_quietly).toBe(true);
+    expect(msg203.was_delivered_quietly).toBe(true);
+    expect(msg203.notifications_silenced).toBe(true);
+    expect(msg203.did_notify_recipient).toBe(true);
+  });
 });
 
 describe('replies and reply context', () => {

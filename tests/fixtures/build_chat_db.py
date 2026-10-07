@@ -29,6 +29,8 @@ GUID = {
     111: "A1000000-0000-4000-8000-000000000111",
     200: "A1000000-0000-4000-8000-000000000200",
     201: "A1000000-0000-4000-8000-000000000201",
+    202: "A1000000-0000-4000-8000-000000000202",
+    203: "A1000000-0000-4000-8000-000000000203",
 }
 
 SPOTIFY_URL = "https://open.spotify.com/track/spice-melange"
@@ -161,7 +163,9 @@ def build(path):
             is_read INTEGER DEFAULT 0,
             date_read INTEGER DEFAULT 0,
             reply_to_guid TEXT,
-            thread_originator_guid TEXT
+            thread_originator_guid TEXT,
+            was_delivered_quietly INTEGER DEFAULT 0,
+            did_notify_recipient INTEGER DEFAULT 0
         );
         CREATE TABLE chat_message_join (
             chat_id INTEGER,
@@ -225,6 +229,8 @@ def build(path):
         date_read=0,
         reply_to_guid=None,
         thread_originator_guid=None,
+        was_delivered_quietly=0,
+        did_notify_recipient=0,
     ):
         date_ns = apple_ns(offset)
         c.execute(
@@ -235,8 +241,9 @@ def build(path):
                 associated_message_type, associated_message_emoji, balloon_bundle_id,
                 payload_data, cache_has_attachments, item_type,
                 is_delivered, date_delivered, is_read, date_read,
-                reply_to_guid, thread_originator_guid
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                reply_to_guid, thread_originator_guid,
+                was_delivered_quietly, did_notify_recipient
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rowid,
@@ -259,6 +266,8 @@ def build(path):
                 date_read,
                 reply_to_guid,
                 thread_originator_guid,
+                was_delivered_quietly,
+                did_notify_recipient,
             ),
         )
         c.execute(
@@ -361,6 +370,30 @@ def build(path):
     )
     add_message(200, 8, 2, 0, "Unrelated Harkonnen rumor", 20)
     add_message(201, 8, 2, 0, "Look at this sandworm", 21)
+    add_message(
+        202,
+        8,
+        2,
+        1,
+        "Desert power",
+        22,
+        is_delivered=1,
+        date_delivered=0,
+        was_delivered_quietly=1,
+        did_notify_recipient=0,
+    )
+    add_message(
+        203,
+        8,
+        2,
+        1,
+        "Bless the Maker and His water",
+        23,
+        is_delivered=1,
+        date_delivered=0,
+        was_delivered_quietly=1,
+        did_notify_recipient=1,
+    )
 
     c.execute(
         """

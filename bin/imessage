@@ -1227,6 +1227,8 @@ def message_select_list(available):
         field("date_read", "date_read_ns"),
         field("reply_to_guid", "reply_to_guid"),
         field("thread_originator_guid", "thread_originator_guid"),
+        field("was_delivered_quietly", "was_delivered_quietly"),
+        field("did_notify_recipient", "did_notify_recipient"),
     ]
     return ",\n        ".join(parts)
 
@@ -1497,10 +1499,16 @@ def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
     link_preview = extract_link_preview(
         row.get("payload_data"), msg_text, row.get("balloon_bundle_id"), att_list
     )
-    deliv_human, deliv_iso = format_apple_ns(row.get("date_delivered_ns"))
-    read_human, read_iso = format_apple_ns(row.get("date_read_ns"))
     is_delivered = bool(row.get("is_delivered") or (row.get("date_delivered_ns") and row.get("date_delivered_ns") > 0))
     is_read = bool(row.get("is_read") or (row.get("date_read_ns") and row.get("date_read_ns") > 0))
+    if is_delivered:
+        deliv_date_ns = row.get("date_delivered_ns") if (row.get("date_delivered_ns") and row.get("date_delivered_ns") > 0) else row.get("date_ns")
+        deliv_human, deliv_iso = format_apple_ns(deliv_date_ns)
+    else:
+        deliv_human, deliv_iso = "", None
+    read_human, read_iso = format_apple_ns(row.get("date_read_ns"))
+    delivered_quietly = bool(row.get("was_delivered_quietly"))
+    did_notify_recipient = bool(row.get("did_notify_recipient"))
     return {
         "kind": "message",
         "msg_id": row["msg_id"],
@@ -1518,6 +1526,10 @@ def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
         "is_delivered": is_delivered,
         "delivered_at": deliv_human or None,
         "delivered_at_iso": deliv_iso,
+        "delivered_quietly": delivered_quietly,
+        "was_delivered_quietly": delivered_quietly,
+        "notifications_silenced": delivered_quietly,
+        "did_notify_recipient": did_notify_recipient,
         "is_read": is_read,
         "read_at": read_human or None,
         "read_at_iso": read_iso,

@@ -20,7 +20,7 @@ It connects your local Mac's iMessage database (`~/Library/Messages/chat.db`), m
 - **Structured tapbacks:** Love, like, dislike, laugh, emphasize, question, and custom emoji reactions are nested on the target message (or listed separately). They are not returned as "Loved …" text.
 - **Zoned timestamps:** Each message keeps its human `timestamp` and adds `timestamp_iso` in ISO 8601 with the server machine's local UTC offset.
 - **Sender identity:** Outgoing rows use sender `Me` and an empty `handle`. The other party's handle is `participant`, because `chat.db` stores that handle on `is_from_me` rows.
-- **Delivery & Read Receipts:** Surfaces `is_delivered`, `delivered_at`, `delivered_at_iso`, `is_read`, `read_at`, and `read_at_iso` on message records. Read receipts on outgoing rows indicate that the recipient has read receipts enabled.
+- **Delivery, Quiet Delivery & Read Receipts:** Surfaces `is_delivered`, `delivered_at`, `delivered_at_iso`, `delivered_quietly`, `was_delivered_quietly`, `notifications_silenced`, `did_notify_recipient`, `is_read`, `read_at`, and `read_at_iso` on message records. `delivered_at` is always populated when `is_delivered` is true (falling back to message timestamp if SQLite omitted a separate delivery date). Quiet delivery indicators reflect recipient Focus or Do Not Disturb status.
 - **Webhook Wakeups & Change Watcher:** Detects changes to `chat.db` and `chat.db-wal` using filesystem events and polling fallback, sending debounced webhook notifications to external bots. Payloads contain strictly event metadata with zero message text or contact names. Includes HMAC-SHA256 signatures and restart state persistence.
 - **MCP Resource Subscriptions:** Exposes `resource://messages/recent` with live updates over MCP for clients subscribed to server resources.
 - **Message Editing:** Programmatically edit sent messages within Apple's 15-minute protocol window (up to 5 revisions) via `imessage_edit_message` and `imessage edit`, routing through the IMCore bridge.
@@ -403,12 +403,16 @@ Default JSON stays an array of messages. `with_meta: true` wraps it:
 
 Outgoing messages (`is_from_me`) use `sender: "Me"` and `handle: ""`. `participant` is the other handle `chat.db` stored on that row. Incoming messages keep the sender handle in both `handle` and `participant`.
 
-### Delivery and Read Receipts
+### Delivery, Quiet Delivery & Read Receipts
 
-Every message record includes delivery and read receipt indicators:
+Every message record includes delivery, quiet delivery (Focus / Do Not Disturb), and read receipt indicators:
 - `is_delivered` (boolean): `true` when the message has reached Apple delivery networks or the recipient device.
-- `delivered_at` (string | null): Formatted local timestamp of delivery.
+- `delivered_at` (string | null): Formatted local timestamp of delivery. Always populated when `is_delivered` is `true` (falling back to message timestamp if `chat.db` omitted an explicit delivery timestamp).
 - `delivered_at_iso` (string | null): ISO-8601 delivery timestamp with local UTC offset.
+- `delivered_quietly` (boolean): `true` when the message was delivered quietly because the recipient has notifications silenced or Focus / Do Not Disturb active.
+- `was_delivered_quietly` (boolean): Direct alias matching the underlying Apple SQLite column.
+- `notifications_silenced` (boolean): Semantic alias indicating the recipient had notifications silenced at delivery time.
+- `did_notify_recipient` (boolean): `true` if the recipient was alerted anyway (e.g. via "Notify Anyway").
 - `is_read` (boolean): `true` when the recipient has opened or read the message.
 - `read_at` (string | null): Formatted local timestamp when read.
 - `read_at_iso` (string | null): ISO-8601 read timestamp with local UTC offset.
