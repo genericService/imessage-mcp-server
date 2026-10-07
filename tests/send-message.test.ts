@@ -241,4 +241,94 @@ describe('iMessage Send Message Attachments & Preview (TDD)', () => {
 
     cliSpy.mockRestore();
   });
+
+  it('documents effect and schedule_at in send tool input schemas', () => {
+    const sendTools = TOOLS.filter((t) => t.name === 'imessage_send_message' || t.name === 'send_message');
+    for (const tool of sendTools) {
+      expect(tool.inputSchema.properties?.effect).toBeDefined();
+      expect(tool.inputSchema.properties?.schedule_at).toBeDefined();
+    }
+  });
+
+  it('previews message with effect in dry_run mode', async () => {
+    const res = await executeToolCall('imessage_send_message', {
+      recipient: 'Paul Atreides (+15550199808)',
+      message: 'Long live the fighters!',
+      effect: 'lasers',
+      dry_run: true
+    });
+    expect(res.isError).toBeFalsy();
+    const data = JSON.parse(res.content[0].type === 'text' ? res.content[0].text : '{}');
+    expect(data.status).toBe('preview');
+    expect(data.effect).toBe('lasers');
+    expect(data.effect_type).toBe('screen');
+  });
+
+  it('dispatches send with --effect flag passed to CLI', async () => {
+    const cliSpy = vi.spyOn(cliRunner, 'run').mockResolvedValueOnce('Message sent successfully!');
+    const res = await executeToolCall('imessage_send_message', {
+      recipient: 'Paul Atreides (+15550199808)',
+      message: 'Happy birthday from Arrakis',
+      effect: 'balloons',
+      dry_run: false
+    });
+    expect(res.isError).toBeFalsy();
+    expect(cliSpy).toHaveBeenCalledWith([
+      'send',
+      'Paul Atreides (+15550199808)',
+      '-m',
+      'Happy birthday from Arrakis',
+      '--effect',
+      'balloons'
+    ]);
+    cliSpy.mockRestore();
+  });
+
+  it('previews scheduled message with target time in dry_run mode', async () => {
+    const targetTime = new Date(Date.now() + 3600 * 1000).toISOString();
+    const res = await executeToolCall('imessage_send_message', {
+      recipient: 'Chani (+15550199480)',
+      message: 'Meeting at Sietch Tabr',
+      schedule_at: targetTime,
+      dry_run: true
+    });
+    expect(res.isError).toBeFalsy();
+    const data = JSON.parse(res.content[0].type === 'text' ? res.content[0].text : '{}');
+    expect(data.status).toBe('preview');
+    expect(data.scheduled).toBe(true);
+    expect(data.scheduled_for).toBe(targetTime);
+  });
+
+  it('schedules a message for future delivery, lists it, and can cancel it', async () => {
+    const targetTime = new Date(Date.now() + 7200 * 1000).toISOString();
+    const res = await executeToolCall('imessage_send_message', {
+      recipient: 'Stilgar (+15550199485)',
+      message: 'The worm approaches',
+      effect: 'confetti',
+      schedule_at: targetTime,
+      dry_run: false
+    });
+    expect(res.isError).toBeFalsy();
+    const data = JSON.parse(res.content[0].type === 'text' ? res.content[0].text : '{}');
+    expect(data.status).toBe('scheduled');
+    expect(data.scheduled_message_id).toBeDefined();
+    expect(data.effect).toBe('confetti');
+
+    // List scheduled messages
+    const listRes = await executeToolCall('imessage_list_scheduled_messages', {});
+    expect(listRes.isError).toBeFalsy();
+    const listData = JSON.parse(listRes.content[0].type === 'text' ? listRes.content[0].text : '[]');
+    const found = listData.find((m: any) => m.id === data.scheduled_message_id);
+    expect(found).toBeDefined();
+    expect(found.recipient).toBe('Stilgar (+15550199485)');
+    expect(found.effect).toBe('confetti');
+
+    // Cancel scheduled message
+    const cancelRes = await executeToolCall('imessage_cancel_scheduled_message', {
+      schedule_id: data.scheduled_message_id
+    });
+    expect(cancelRes.isError).toBeFalsy();
+    const cancelData = JSON.parse(cancelRes.content[0].type === 'text' ? cancelRes.content[0].text : '{}');
+    expect(cancelData.canceled).toBe(true);
+  });
 });

@@ -1196,6 +1196,47 @@ def message_column_names(cursor):
     return {row[1] for row in cursor.fetchall()}
 
 
+EFFECT_NAMES = {
+    # Bubble effects
+    "slam": "com.apple.MobileSMS.expressivesend.impact",
+    "impact": "com.apple.MobileSMS.expressivesend.impact",
+    "loud": "com.apple.MobileSMS.expressivesend.loud",
+    "gentle": "com.apple.MobileSMS.expressivesend.gentle",
+    "invisible_ink": "com.apple.MobileSMS.expressivesend.invisibleink",
+    "invisibleink": "com.apple.MobileSMS.expressivesend.invisibleink",
+    # Screen effects
+    "echo": "com.apple.messages.effect.CKEchoEffect",
+    "spotlight": "com.apple.messages.effect.CKSpotlightEffect",
+    "balloons": "com.apple.messages.effect.CKHappyBirthdayEffect",
+    "birthday": "com.apple.messages.effect.CKHappyBirthdayEffect",
+    "confetti": "com.apple.messages.effect.CKConfettiEffect",
+    "love": "com.apple.messages.effect.CKHeartEffect",
+    "heart": "com.apple.messages.effect.CKHeartEffect",
+    "lasers": "com.apple.messages.effect.CKLasersEffect",
+    "fireworks": "com.apple.messages.effect.CKFireworksEffect",
+    "shooting_star": "com.apple.messages.effect.CKShootingStarEffect",
+    "shootingstar": "com.apple.messages.effect.CKShootingStarEffect",
+    "celebration": "com.apple.messages.effect.CKSparklesEffect",
+    "sparkles": "com.apple.messages.effect.CKSparklesEffect",
+}
+
+REVERSE_EFFECT_NAMES = {
+    "com.apple.MobileSMS.expressivesend.impact": ("slam", "bubble"),
+    "com.apple.MobileSMS.expressivesend.loud": ("loud", "bubble"),
+    "com.apple.MobileSMS.expressivesend.gentle": ("gentle", "bubble"),
+    "com.apple.MobileSMS.expressivesend.invisibleink": ("invisible_ink", "bubble"),
+    "com.apple.messages.effect.CKEchoEffect": ("echo", "screen"),
+    "com.apple.messages.effect.CKSpotlightEffect": ("spotlight", "screen"),
+    "com.apple.messages.effect.CKHappyBirthdayEffect": ("balloons", "screen"),
+    "com.apple.messages.effect.CKConfettiEffect": ("confetti", "screen"),
+    "com.apple.messages.effect.CKHeartEffect": ("love", "screen"),
+    "com.apple.messages.effect.CKLasersEffect": ("lasers", "screen"),
+    "com.apple.messages.effect.CKFireworksEffect": ("fireworks", "screen"),
+    "com.apple.messages.effect.CKShootingStarEffect": ("shooting_star", "screen"),
+    "com.apple.messages.effect.CKSparklesEffect": ("celebration", "screen"),
+}
+
+
 def message_select_list(available):
     def field(column, alias):
         if column in available:
@@ -1229,6 +1270,16 @@ def message_select_list(available):
         field("thread_originator_guid", "thread_originator_guid"),
         field("was_delivered_quietly", "was_delivered_quietly"),
         field("did_notify_recipient", "did_notify_recipient"),
+        field("expressive_send_style_id", "expressive_send_style_id"),
+        field("time_expressive_send_played", "time_expressive_send_played_ns"),
+        field("schedule_type", "schedule_type"),
+        field("schedule_state", "schedule_state"),
+        field("is_played", "is_played"),
+        field("date_played", "date_played_ns"),
+        field("date_retracted", "date_retracted_ns"),
+        field("is_time_sensitive", "is_time_sensitive"),
+        field("is_kt_verified", "is_kt_verified"),
+        field("sent_or_received_off_grid", "sent_or_received_off_grid"),
     ]
     return ",\n        ".join(parts)
 
@@ -1509,6 +1560,26 @@ def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
     read_human, read_iso = format_apple_ns(row.get("date_read_ns"))
     delivered_quietly = bool(row.get("was_delivered_quietly"))
     did_notify_recipient = bool(row.get("did_notify_recipient"))
+
+    style_id = row.get("expressive_send_style_id")
+    effect_name, effect_type = (None, None)
+    if style_id:
+        effect_name, effect_type = REVERSE_EFFECT_NAMES.get(style_id, (style_id, "unknown"))
+
+    schedule_type = int(row.get("schedule_type") or 0)
+    schedule_state = int(row.get("schedule_state") or 0)
+    is_scheduled = bool(schedule_type > 0 or schedule_state > 0)
+
+    is_played = bool(row.get("is_played") or (row.get("date_played_ns") and row.get("date_played_ns") > 0))
+    played_human, played_iso = format_apple_ns(row.get("date_played_ns")) if is_played else ("", None)
+
+    is_retracted = bool(row.get("date_retracted_ns") and row.get("date_retracted_ns") > 0)
+    retracted_human, retracted_iso = format_apple_ns(row.get("date_retracted_ns")) if is_retracted else ("", None)
+
+    is_time_sensitive = bool(row.get("is_time_sensitive"))
+    is_kt_verified = bool(row.get("is_kt_verified"))
+    off_grid = bool(row.get("sent_or_received_off_grid"))
+
     return {
         "kind": "message",
         "msg_id": row["msg_id"],
@@ -1533,7 +1604,22 @@ def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
         "is_read": is_read,
         "read_at": read_human or None,
         "read_at_iso": read_iso,
+        "effect": effect_name,
+        "effect_type": effect_type,
+        "expressive_send_style_id": style_id,
+        "is_scheduled": is_scheduled,
+        "schedule_type": schedule_type,
+        "schedule_state": schedule_state,
         "is_audio_message": is_audio,
+        "is_played": is_played,
+        "played_at": played_human or None,
+        "played_at_iso": played_iso,
+        "is_retracted": is_retracted,
+        "retracted_at": retracted_human or None,
+        "retracted_at_iso": retracted_iso,
+        "is_time_sensitive": is_time_sensitive,
+        "is_kt_verified": is_kt_verified,
+        "off_grid": off_grid,
         "transcription": transcription,
         "is_edited": is_edited,
         "has_edits": is_edited,
@@ -2784,21 +2870,55 @@ ATTACHMENT_STAGING_DIR = os.path.expanduser("~/Library/Messages/Attachments/imes
 
 
 def _resolve_chat(recipient):
-    """Resolve recipient to (chat_rowid, chat_identifier) via chat.db; falls back to (None, recipient)."""
+    """Resolve recipient to (chat_rowid, chat_identifier, chat_guid) via chat.db; falls back to (None, recipient, None)."""
     try:
         conn = sqlite3.connect(f"file:{get_db_path()}?mode=ro", uri=True)
         c = conn.cursor()
+        cols = {row[1] for row in c.execute("PRAGMA table_info(chat)").fetchall()}
+        has_guid = "guid" in cols
+        select_clause = "ROWID, chat_identifier, guid" if has_guid else "ROWID, chat_identifier, NULL"
         if recipient.isdigit():
-            c.execute("SELECT ROWID, chat_identifier FROM chat WHERE ROWID = ?", (int(recipient),))
+            c.execute(f"SELECT {select_clause} FROM chat WHERE ROWID = ?", (int(recipient),))
         else:
-            c.execute("SELECT ROWID, chat_identifier FROM chat WHERE display_name LIKE ? OR chat_identifier = ?", (f"%{recipient}%", recipient))
+            c.execute(f"SELECT {select_clause} FROM chat WHERE display_name LIKE ? OR chat_identifier = ?", (f"%{recipient}%", recipient))
         row = c.fetchone()
         conn.close()
         if row and row[1]:
-            return row[0], row[1]
+            return row[0], row[1], (row[2] if len(row) > 2 else None)
     except Exception:
         pass
-    return None, recipient
+    return None, recipient, None
+
+
+def _send_via_imsg_rich(chat_guid, recipient, message, attachment_path, effect):
+    """Attempt sending with expressive effect via imsg send-rich. Returns (status, detail)."""
+    imsg_bin = os.environ.get('IMSG_BIN') or shutil.which('imsg') or '/opt/homebrew/bin/imsg'
+    if not os.path.exists(imsg_bin):
+        return 'unavailable', 'imsg CLI not installed'
+
+    effect_arg = effect
+    if effect in REVERSE_EFFECT_NAMES:
+        effect_arg = REVERSE_EFFECT_NAMES[effect][0]
+    if effect_arg == "invisible_ink":
+        effect_arg = "invisibleink"
+
+    target_chat = chat_guid or (f"iMessage;-;{recipient}" if not recipient.startswith("iMessage;") else recipient)
+
+    cmd = [imsg_bin, 'send-rich', '--chat', target_chat, '--effect', effect_arg]
+    if message:
+        cmd += ['--text', message]
+    if attachment_path:
+        cmd += ['--file', attachment_path]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return 'uncertain', 'imsg send-rich timed out after 180s; outcome unknown, not retrying'
+
+    detail = (res.stderr or res.stdout or '').strip()
+    if res.returncode == 0:
+        return 'sent', detail
+    return 'unavailable', detail or f'imsg send-rich exited with code {res.returncode}'
 
 
 def _send_via_imsg(chat_rowid, recipient, message, attachment_path):
@@ -2922,6 +3042,7 @@ def send_message(args):
     recipient = args.recipient
     message = args.message or ''
     attachment = args.attachment
+    effect = getattr(args, "effect", None)
 
     attachment_path = _resolve_cli_attachment(attachment)
 
@@ -2929,7 +3050,17 @@ def send_message(args):
         print("ERROR: Nothing to send: provide --message and/or --attachment", file=sys.stderr)
         sys.exit(1)
 
-    chat_rowid, target_ident = _resolve_chat(recipient)
+    chat_rowid, target_ident, chat_guid = _resolve_chat(recipient)
+
+    if effect:
+        status, detail = _send_via_imsg_rich(chat_guid, target_ident or recipient, message, attachment_path, effect)
+        if status == 'sent':
+            print(f"Message sent to '{recipient}' ({target_ident}) with effect '{effect}' via imsg send-rich successfully!")
+            return
+        if status == 'uncertain':
+            print(f"ERROR: imsg send-rich outcome uncertain, not retrying to avoid double-send: {detail}", file=sys.stderr)
+            sys.exit(1)
+        print(f"imsg send-rich with effect '{effect}' unavailable ({detail}), falling back to standard send without effect", file=sys.stderr)
 
     status, detail = _send_via_imsg(chat_rowid, recipient, message, attachment_path)
     if status == 'sent':
@@ -2939,7 +3070,7 @@ def send_message(args):
         print(f"ERROR: imsg send outcome uncertain, not retrying to avoid double-send: {detail}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"imsg unavailable ({detail}); falling back to AppleScript", file=sys.stderr)
+    print(f"imsg unavailable ({detail}), falling back to AppleScript", file=sys.stderr)
     _send_via_applescript(target_ident, recipient, message, attachment_path)
     print(f"Message sent to '{recipient}' ({target_ident}) via AppleScript successfully!")
 
@@ -3605,6 +3736,7 @@ def main():
     send_parser.add_argument("recipient", help="Recipient identifier")
     send_parser.add_argument("--message", "-m", help="Message text body")
     send_parser.add_argument("--attachment", "-a", help="POSIX path, HTTPS URL, or base64 data URI to attachment file")
+    send_parser.add_argument("--effect", help="Apple expressive send effect style (e.g. balloons, confetti, lasers, slam, loud, gentle, invisible_ink)")
     send_parser.set_defaults(func=send_message)
 
     edits_parser = subparsers.add_parser("edits", help="View edit and rewrite history for a message")

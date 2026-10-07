@@ -402,6 +402,44 @@ describe('delivery and read receipts on message records', () => {
     expect(msg203.notifications_silenced).toBe(true);
     expect(msg203.did_notify_recipient).toBe(true);
   });
+
+  it('surfaces message effects, effect type, and raw expressive_send_style_id', async () => {
+    const data8 = await cliJson(['recent', '8', '--limit', '20', '--json']);
+    const msg204 = data8.find((m: any) => m.msg_id === 204);
+    expect(msg204).toBeDefined();
+    expect(msg204.effect).toBe('lasers');
+    expect(msg204.effect_type).toBe('screen');
+    expect(msg204.expressive_send_style_id).toBe('com.apple.messages.effect.CKLasersEffect');
+    expect(msg204.is_time_sensitive).toBe(true);
+
+    const msg202 = data8.find((m: any) => m.msg_id === 202);
+    expect(msg202.effect).toBeNull();
+    expect(msg202.effect_type).toBeNull();
+    expect(msg202.expressive_send_style_id).toBeNull();
+  });
+
+  it('surfaces schedule status and state on message records', async () => {
+    const data8 = await cliJson(['recent', '8', '--limit', '20', '--json']);
+    const msg205 = data8.find((m: any) => m.msg_id === 205);
+    expect(msg205).toBeDefined();
+    expect(msg205.is_scheduled).toBe(true);
+    expect(msg205.schedule_type).toBe(1);
+    expect(msg205.schedule_state).toBe(1);
+
+    const msg202 = data8.find((m: any) => m.msg_id === 202);
+    expect(msg202.is_scheduled).toBe(false);
+    expect(msg202.schedule_type).toBe(0);
+    expect(msg202.schedule_state).toBe(0);
+  });
+
+  it('surfaces audio played status and timestamp', async () => {
+    const data8 = await cliJson(['recent', '8', '--limit', '20', '--json']);
+    const msg206 = data8.find((m: any) => m.msg_id === 206);
+    expect(msg206).toBeDefined();
+    expect(msg206.is_played).toBe(true);
+    expect(typeof msg206.played_at).toBe('string');
+    expect(typeof msg206.played_at_iso).toBe('string');
+  });
 });
 
 describe('replies and reply context', () => {

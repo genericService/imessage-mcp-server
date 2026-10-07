@@ -37,6 +37,17 @@ import {
   parseWatcherConfig,
 } from './watcher.js';
 import { identityGraph } from './identity_graph.js';
+import {
+  scheduleMessage,
+  listScheduledMessages,
+  cancelScheduledMessage,
+  normalizeEffect,
+  parseScheduleTime,
+  EFFECT_MAP,
+  initScheduler,
+  clearAllScheduledTimers,
+  ScheduledMessage
+} from './scheduler.js';
 
 const execFileAsync = promisify(execFile);
 const PYTHON_BIN = '/usr/bin/python3';
@@ -97,6 +108,14 @@ export const cliRunner = {
   run: (args: string[]) => runImessageCli(args)
 };
 
+initScheduler(async (item: ScheduledMessage) => {
+  const cliArgs = ['send', item.recipient];
+  if (item.message) cliArgs.push('-m', item.message);
+  if (item.attachment) cliArgs.push('-a', item.attachment);
+  if (item.effect) cliArgs.push('--effect', item.effect);
+  return await cliRunner.run(cliArgs);
+});
+
 
 const PORT = parseInt(process.env.PORT || '8765', 10);
 // Dual-stack: '::' accepts IPv6 + IPv4-mapped (Node default ipv6Only=false).
@@ -105,7 +124,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.10.0';
+const SERVER_VERSION = '1.12.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -630,9 +649,73 @@ export const TOOLS: Tool[] = [
         confirm_token: {
           type: 'string',
           description: 'Confirmation token returned by a previous dry_run preview call to authorize dispatch.'
-        }
+        },
+        effect: {
+          type: 'string',
+          description:
+            'Optional Apple expressive send effect style. Bubble effects: "slam", "loud", "gentle", "invisible_ink". Screen effects: "echo", "spotlight", "balloons", "confetti", "love", "lasers", "fireworks", "shooting_star", "celebration".',
+          enum: [
+            'slam',
+            'loud',
+            'gentle',
+            'invisible_ink',
+            'echo',
+            'spotlight',
+            'balloons',
+            'confetti',
+            'love',
+            'lasers',
+            'fireworks',
+            'shooting_star',
+            'celebration'
+          ]
+        },
+        schedule_at: {
+          type: 'string',
+          description:
+            'Optional future ISO timestamp or relative offset (e.g. "2026-10-07T12:00:00Z", "+15m", "+2h", "+1d") to schedule message delivery for later. Aliases: scheduled_at, send_at, delay.'
+        },
+        scheduled_at: { type: 'string', description: 'Alias of schedule_at.' },
+        send_at: { type: 'string', description: 'Alias of schedule_at.' },
+        delay: { type: 'string', description: 'Alias of schedule_at.' }
       },
       required: ['recipient']
+    }
+  },
+  {
+    name: 'imessage_list_scheduled_messages',
+    description:
+      'List all currently pending and recent scheduled iMessages queued for future delivery. Returns scheduled ID, target recipient, scheduled delivery timestamp, effect, and status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['pending', 'sent', 'canceled', 'all'],
+          description: 'Filter scheduled messages by status (default: all).'
+        }
+      }
+    }
+  },
+  {
+    name: 'imessage_cancel_scheduled_message',
+    description:
+      'Cancel a scheduled iMessage before it is sent using its scheduled_message_id.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        schedule_id: {
+          type: 'string',
+          description: 'The unique scheduled message identifier to cancel (e.g. sched_...). Aliases: id, scheduled_message_id.'
+        },
+        id: { type: 'string', description: 'Alias of schedule_id.' },
+        scheduled_message_id: { type: 'string', description: 'Alias of schedule_id.' }
+      },
+      anyOf: [
+        { required: ['schedule_id'] },
+        { required: ['id'] },
+        { required: ['scheduled_message_id'] }
+      ]
     }
   },
   {
@@ -864,9 +947,73 @@ export const TOOLS: Tool[] = [
           description:
             'If true, returns a structured safety preview object and confirmation token without sending. Verifies that attachments exist and are reachable, and returns attachment size and MIME type.'
         },
-        confirm_token: { type: 'string', description: 'Confirmation token returned by dry_run.' }
+        confirm_token: { type: 'string', description: 'Confirmation token returned by dry_run.' },
+        effect: {
+          type: 'string',
+          description:
+            'Optional Apple expressive send effect style. Bubble effects: "slam", "loud", "gentle", "invisible_ink". Screen effects: "echo", "spotlight", "balloons", "confetti", "love", "lasers", "fireworks", "shooting_star", "celebration".',
+          enum: [
+            'slam',
+            'loud',
+            'gentle',
+            'invisible_ink',
+            'echo',
+            'spotlight',
+            'balloons',
+            'confetti',
+            'love',
+            'lasers',
+            'fireworks',
+            'shooting_star',
+            'celebration'
+          ]
+        },
+        schedule_at: {
+          type: 'string',
+          description:
+            'Optional future ISO timestamp or relative offset (e.g. "2026-10-07T12:00:00Z", "+15m", "+2h", "+1d") to schedule message delivery for later. Aliases: scheduled_at, send_at, delay.'
+        },
+        scheduled_at: { type: 'string', description: 'Alias of schedule_at.' },
+        send_at: { type: 'string', description: 'Alias of schedule_at.' },
+        delay: { type: 'string', description: 'Alias of schedule_at.' }
       },
       required: ['recipient']
+    }
+  },
+  {
+    name: 'list_scheduled_messages',
+    description:
+      'Universal alias for imessage_list_scheduled_messages. List all currently pending and recent scheduled iMessages queued for future delivery.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['pending', 'sent', 'canceled', 'all'],
+          description: 'Filter scheduled messages by status (default: all).'
+        }
+      }
+    }
+  },
+  {
+    name: 'cancel_scheduled_message',
+    description:
+      'Universal alias for imessage_cancel_scheduled_message. Cancel a scheduled iMessage before it is sent using its scheduled_message_id.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        schedule_id: {
+          type: 'string',
+          description: 'The unique scheduled message identifier to cancel (e.g. sched_...). Aliases: id, scheduled_message_id.'
+        },
+        id: { type: 'string', description: 'Alias of schedule_id.' },
+        scheduled_message_id: { type: 'string', description: 'Alias of schedule_id.' }
+      },
+      anyOf: [
+        { required: ['schedule_id'] },
+        { required: ['id'] },
+        { required: ['scheduled_message_id'] }
+      ]
     }
   },
   {
@@ -1274,6 +1421,8 @@ export interface PendingSend {
   message: string;
   attachment: string;
   attachmentInfo?: ResolvedAttachment;
+  effect?: string;
+  scheduleAt?: string;
   createdAt: number;
 }
 const pendingConfirmTokens = new Map<string, PendingSend>();
@@ -1451,6 +1600,10 @@ export async function executeToolCall(
     get_recent_messages: 'imessage_get_recent_messages',
     search_messages: 'imessage_search_messages',
     search_contacts: 'imessage_search_contacts',
+    list_scheduled_messages: 'imessage_list_scheduled_messages',
+    list_scheduled: 'imessage_list_scheduled_messages',
+    cancel_scheduled_message: 'imessage_cancel_scheduled_message',
+    cancel_scheduled: 'imessage_cancel_scheduled_message',
   };
   const effectiveName = nameMap[name] || name;
 
@@ -1468,6 +1621,8 @@ export async function executeToolCall(
     targetParam = readStringArg(toolArgs, ['message_id', 'messageId', 'msg_id', 'msgId']);
   } else if (effectiveName === 'imessage_get_call_history' || effectiveName === 'get_last_interaction') {
     targetParam = readStringArg(toolArgs, ['handle', 'contact', 'recipient', 'phone', 'email', 'chat', 'chat_id']);
+  } else if (effectiveName === 'imessage_cancel_scheduled_message') {
+    targetParam = readStringArg(toolArgs, ['schedule_id', 'id', 'scheduled_message_id']);
   }
 
   try {
@@ -1865,6 +2020,17 @@ export async function executeToolCall(
         toolArgs?.file ??
         toolArgs?.file_path;
 
+      const rawEffect = readStringArg(toolArgs, ['effect']);
+      let normalizedEffect = rawEffect ? normalizeEffect(rawEffect) : null;
+      let effect = normalizedEffect ? normalizedEffect.name : undefined;
+
+      const rawScheduleAt = readStringArg(toolArgs, ['schedule_at', 'scheduled_at', 'send_at', 'delay']);
+      let targetScheduleDate: Date | null = null;
+      if (rawScheduleAt) {
+        targetScheduleDate = parseScheduleTime(rawScheduleAt);
+      }
+      let scheduleAt = targetScheduleDate ? targetScheduleDate.toISOString() : undefined;
+
       let attachment = '';
       let resolvedAttachment: ResolvedAttachment | null = null;
 
@@ -1880,6 +2046,14 @@ export async function executeToolCall(
         attachment = pending.attachment;
         if (pending.attachmentInfo) {
           resolvedAttachment = pending.attachmentInfo;
+        }
+        if (pending.effect) {
+          effect = pending.effect;
+          normalizedEffect = normalizeEffect(effect);
+        }
+        if (pending.scheduleAt) {
+          scheduleAt = pending.scheduleAt;
+          targetScheduleDate = new Date(scheduleAt);
         }
       } else if (rawAttachment) {
         resolvedAttachment = await resolveAttachment(rawAttachment);
@@ -1898,6 +2072,8 @@ export async function executeToolCall(
           message,
           attachment,
           attachmentInfo: resolvedAttachment || undefined,
+          effect,
+          scheduleAt,
           createdAt: Date.now()
         });
 
@@ -1926,7 +2102,9 @@ export async function executeToolCall(
             : null,
           participants: membersOutput,
           confirm_token: token,
-          instructions: `To dispatch this message, re-call ${name} with confirm_token: "${token}" or dry_run: false.`
+          instructions: `To dispatch this message, re-call ${name} with confirm_token: "${token}" or dry_run: false.`,
+          ...(effect ? { effect, effect_type: normalizedEffect?.type || 'unknown' } : {}),
+          ...(scheduleAt ? { scheduled: true, scheduled_for: scheduleAt } : {})
         };
 
         result = {
@@ -1940,15 +2118,44 @@ export async function executeToolCall(
           throw new Error('Missing content to send: provide "message" and/or "attachment"');
         }
 
-        const cliArgs = ['send', recipient];
-        if (message) cliArgs.push('-m', message);
-        if (attachment) cliArgs.push('-a', attachment);
+        if (scheduleAt) {
+          const schedRes = await scheduleMessage({
+            recipient,
+            message: message || undefined,
+            attachment: attachment || undefined,
+            effect,
+            schedule_at: scheduleAt
+          });
+          result = {
+            content: [{ type: 'text', text: JSON.stringify(schedRes, null, 2) }]
+          };
+        } else {
+          const cliArgs = ['send', recipient];
+          if (message) cliArgs.push('-m', message);
+          if (attachment) cliArgs.push('-a', attachment);
+          if (effect) cliArgs.push('--effect', effect);
 
-        const stdout = await cliRunner.run(cliArgs);
-        result = {
-          content: [{ type: 'text', text: stdout }]
-        };
+          const stdout = await cliRunner.run(cliArgs);
+          result = {
+            content: [{ type: 'text', text: stdout }]
+          };
+        }
       }
+    } else if (effectiveName === 'imessage_list_scheduled_messages') {
+      const status = readStringArg(toolArgs, ['status']);
+      const list = await listScheduledMessages(status);
+      result = {
+        content: [{ type: 'text', text: JSON.stringify(list, null, 2) }]
+      };
+    } else if (effectiveName === 'imessage_cancel_scheduled_message') {
+      const scheduleId = readStringArg(toolArgs, ['schedule_id', 'id', 'scheduled_message_id']);
+      if (!scheduleId) {
+        throw new Error('Missing required parameter "schedule_id"');
+      }
+      const cancelRes = await cancelScheduledMessage(scheduleId);
+      result = {
+        content: [{ type: 'text', text: JSON.stringify(cancelRes, null, 2) }]
+      };
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }

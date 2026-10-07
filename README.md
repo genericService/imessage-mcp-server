@@ -275,7 +275,9 @@ Returns:
 | `imessage_get_chat_members` | List members and resolved contact names in group chats | `chat` (string, required) |
 | `imessage_get_attachment_payload` | Fetch attachment metadata and base64 payload (converts HEIC to JPEG and CAF voice notes to M4A with transcriptions) | `path` (or `message_id`) |
 | `imessage_download_image` | Download and extract an image attachment (converts HEIC to JPEG, optional destination `output_path`) | `message_id` (or `path`), `output_path`, `include_base64` |
-| `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports local paths, HTTPS URLs, or base64 attachments, dry_run safety preview, and confirm_token) | `recipient` (or `to`, required), `message`, `attachment`, `dry_run`, `confirm_token` |
+| `imessage_send_message` | Send iMessage to contact, group chat thread, or chat ROWID (supports local paths, HTTPS URLs, base64 attachments, expressive send effects, send scheduling, dry_run safety preview, and confirm_token) | `recipient` (or `to`, required), `message`, `attachment`, `effect`, `schedule_at`, `dry_run`, `confirm_token` |
+| `imessage_list_scheduled_messages` | List pending and recent scheduled iMessages queued for future delivery | `status` (`pending`, `sent`, `canceled`, `all`) |
+| `imessage_cancel_scheduled_message` | Cancel a scheduled message before dispatch | `schedule_id` (string, required) |
 | `imessage_edit_message` | Edit a previously sent message by ROWID (subject to 15-minute Apple protocol window and 5-edit limit) | `message_id` (number, required), `text` (string, required) |
 | `imessage_index_status` | Inspect status, row counts, database file size, and sync lag of the local search index | *(none)* |
 | `imessage_get_readme` | Retrieve full server README documentation & usage guide | *(none)* |
@@ -295,7 +297,7 @@ The underlying Python engine can be executed directly as a standalone CLI for lo
 | `search` | Search message history by keyword or phrase | `bin/imessage search "Arrakis" --limit 20 --order relevance --since-msg-id 1200` |
 | `edits` | Inspect complete rewrite and revision history for a message | `bin/imessage edits 198097 --json` |
 | `edit` | Edit a previously sent outgoing message | `bin/imessage edit 198097 --text "Paul Atreides revised" --json` |
-| `send` | Send message or attachment to contact or chat ID | `bin/imessage send "+15550199808" --message "Hello" --dry-run` |
+| `send` | Send message, attachment, or expressive effect to contact or chat ID | `bin/imessage send "+15550199808" --message "Happy Birthday!" --effect balloons` |
 | `contacts` | Search AddressBook contacts by name, email, or phone | `bin/imessage contacts "Paul Atreides" --json` |
 | `members` | List members and handles in a group chat | `bin/imessage members 1767 --json` |
 | `search-group` | Search group chats by exact participant set | `bin/imessage search-group "paul@caladan.org" "chani@sietch.net"` |
@@ -374,6 +376,27 @@ Example preview response:
   "instructions": "To dispatch this message, re-call imessage_send_message with confirm_token: \"cf_0123456789abcdef\" or dry_run: false."
 }
 ```
+
+### Expressive send effects
+
+Outbound messages can include native Apple message effects via the `effect` parameter:
+
+- **Bubble effects:** `slam` (or `impact`), `loud`, `gentle`, `invisible_ink`
+- **Screen effects:** `echo`, `spotlight`, `balloons` (or `birthday`), `confetti`, `love` (or `heart`), `lasers`, `fireworks`, `shooting_star`, `celebration` (or `sparkles`)
+
+When sending with `dry_run: true`, the safety preview inspects and validates the effect, displaying both the canonical effect name and its classification (`bubble` or `screen`). When dispatching with SIP disabled and the `imsg launch` IMCore bridge active, effects are sent natively. If SIP is enabled on the host Mac, the server falls back to standard message delivery so the message is always delivered reliably.
+
+### Message scheduling
+
+Schedule outbound messages for future delivery using the `schedule_at` parameter (with aliases `scheduled_at`, `send_at`, or `delay`):
+
+- **ISO 8601 timestamps:** e.g. `"2026-10-07T12:00:00Z"`
+- **Relative offsets:** e.g. `"+15m"`, `"+1h"`, `"2 hours"`, `"+1d"`
+
+Scheduled messages are durably stored in `~/.imessage-mcp/scheduled.json` (or custom path configured via `IMESSAGE_SCHEDULE_PATH`) and dispatched when their delivery timer expires.
+
+- **List scheduled messages:** Call `imessage_list_scheduled_messages` (or `list_scheduled_messages`) to view pending, sent, or canceled messages.
+- **Cancel a scheduled message:** Call `imessage_cancel_scheduled_message` (or `cancel_scheduled_message`) with `schedule_id` to disarm its timer and cancel delivery before send.
 
 ---
 

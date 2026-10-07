@@ -31,6 +31,9 @@ GUID = {
     201: "A1000000-0000-4000-8000-000000000201",
     202: "A1000000-0000-4000-8000-000000000202",
     203: "A1000000-0000-4000-8000-000000000203",
+    204: "A1000000-0000-4000-8000-000000000204",
+    205: "A1000000-0000-4000-8000-000000000205",
+    206: "A1000000-0000-4000-8000-000000000206",
 }
 
 SPOTIFY_URL = "https://open.spotify.com/track/spice-melange"
@@ -165,7 +168,17 @@ def build(path):
             reply_to_guid TEXT,
             thread_originator_guid TEXT,
             was_delivered_quietly INTEGER DEFAULT 0,
-            did_notify_recipient INTEGER DEFAULT 0
+            did_notify_recipient INTEGER DEFAULT 0,
+            expressive_send_style_id TEXT,
+            time_expressive_send_played INTEGER,
+            schedule_type INTEGER DEFAULT 0,
+            schedule_state INTEGER DEFAULT 0,
+            is_played INTEGER DEFAULT 0,
+            date_played INTEGER DEFAULT 0,
+            date_retracted INTEGER DEFAULT 0,
+            is_time_sensitive INTEGER DEFAULT 0,
+            is_kt_verified INTEGER DEFAULT 0,
+            sent_or_received_off_grid INTEGER DEFAULT 0
         );
         CREATE TABLE chat_message_join (
             chat_id INTEGER,
@@ -231,6 +244,17 @@ def build(path):
         thread_originator_guid=None,
         was_delivered_quietly=0,
         did_notify_recipient=0,
+        expressive_send_style_id=None,
+        time_expressive_send_played=0,
+        schedule_type=0,
+        schedule_state=0,
+        is_audio_message=0,
+        is_played=0,
+        date_played=0,
+        date_retracted=0,
+        is_time_sensitive=0,
+        is_kt_verified=0,
+        sent_or_received_off_grid=0,
     ):
         date_ns = apple_ns(offset)
         c.execute(
@@ -242,8 +266,12 @@ def build(path):
                 payload_data, cache_has_attachments, item_type,
                 is_delivered, date_delivered, is_read, date_read,
                 reply_to_guid, thread_originator_guid,
-                was_delivered_quietly, did_notify_recipient
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                was_delivered_quietly, did_notify_recipient,
+                expressive_send_style_id, time_expressive_send_played,
+                schedule_type, schedule_state,
+                is_played, date_played, date_retracted,
+                is_time_sensitive, is_kt_verified, sent_or_received_off_grid
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rowid,
@@ -253,6 +281,7 @@ def build(path):
                 date_ns,
                 date_edited,
                 is_from_me,
+                is_audio_message,
                 summary,
                 assoc_guid,
                 assoc_type,
@@ -268,6 +297,16 @@ def build(path):
                 thread_originator_guid,
                 was_delivered_quietly,
                 did_notify_recipient,
+                expressive_send_style_id,
+                time_expressive_send_played,
+                schedule_type,
+                schedule_state,
+                is_played,
+                date_played,
+                date_retracted,
+                is_time_sensitive,
+                is_kt_verified,
+                sent_or_received_off_grid,
             ),
         )
         c.execute(
@@ -393,6 +432,41 @@ def build(path):
         date_delivered=0,
         was_delivered_quietly=1,
         did_notify_recipient=1,
+    )
+    add_message(
+        204,
+        8,
+        2,
+        1,
+        "Shai-Hulud approaches with lasers",
+        24,
+        is_delivered=1,
+        date_delivered=apple_ns(24),
+        expressive_send_style_id="com.apple.messages.effect.CKLasersEffect",
+        is_time_sensitive=1,
+    )
+    add_message(
+        205,
+        8,
+        2,
+        1,
+        "Send later across the dunes",
+        25,
+        is_delivered=0,
+        date_delivered=0,
+        schedule_type=1,
+        schedule_state=1,
+    )
+    add_message(
+        206,
+        8,
+        2,
+        0,
+        "Played voice memo",
+        26,
+        is_audio_message=1,
+        is_played=1,
+        date_played=apple_ns(26),
     )
 
     c.execute(
