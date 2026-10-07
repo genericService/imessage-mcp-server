@@ -455,6 +455,8 @@ Every message record includes delivery, quiet delivery (Focus / Do Not Disturb),
 - `delivered_quietly` (boolean): `true` when the message was delivered quietly because the recipient has notifications silenced or Focus / Do Not Disturb active.
 - `was_delivered_quietly` (boolean): Direct alias matching the underlying Apple SQLite column.
 - `notifications_silenced` (boolean): Semantic alias indicating the recipient had notifications silenced at delivery time.
+- `silenced_notifications` (boolean): Direct alias of notifications_silenced.
+- `has_notifications_silenced` (boolean): Direct alias of notifications_silenced.
 - `did_notify_recipient` (boolean): `true` if the recipient was alerted anyway (e.g. via "Notify Anyway").
 - `is_read` (boolean): `true` when the recipient has opened or read the message.
 - `read_at` (string | null): Formatted local timestamp when read.

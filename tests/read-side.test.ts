@@ -385,6 +385,7 @@ describe('delivery and read receipts on message records', () => {
     expect(msg101.delivered_quietly).toBe(false);
     expect(msg101.was_delivered_quietly).toBe(false);
     expect(msg101.notifications_silenced).toBe(false);
+    expect(msg101.silenced_notifications).toBe(false);
     expect(msg101.did_notify_recipient).toBe(false);
 
     const data8 = await cliJson(['recent', '8', '--limit', '20', '--json']);
@@ -393,6 +394,7 @@ describe('delivery and read receipts on message records', () => {
     expect(msg202.delivered_quietly).toBe(true);
     expect(msg202.was_delivered_quietly).toBe(true);
     expect(msg202.notifications_silenced).toBe(true);
+    expect(msg202.silenced_notifications).toBe(true);
     expect(msg202.did_notify_recipient).toBe(false);
 
     const msg203 = data8.find((m: any) => m.msg_id === 203);
@@ -400,6 +402,7 @@ describe('delivery and read receipts on message records', () => {
     expect(msg203.delivered_quietly).toBe(true);
     expect(msg203.was_delivered_quietly).toBe(true);
     expect(msg203.notifications_silenced).toBe(true);
+    expect(msg203.silenced_notifications).toBe(true);
     expect(msg203.did_notify_recipient).toBe(true);
   });
 

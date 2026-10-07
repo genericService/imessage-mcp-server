@@ -1600,6 +1600,8 @@ def base_message_fields(row, cmap, prefer_contact_name, attachments_map):
         "delivered_quietly": delivered_quietly,
         "was_delivered_quietly": delivered_quietly,
         "notifications_silenced": delivered_quietly,
+        "silenced_notifications": delivered_quietly,
+        "has_notifications_silenced": delivered_quietly,
         "did_notify_recipient": did_notify_recipient,
         "is_read": is_read,
         "read_at": read_human or None,
@@ -1874,8 +1876,18 @@ def format_item_line(item, prefix_chat=False):
             reply_prefix = f"[Replying to {r_sender}: \"{snippet}\"] "
         else:
             reply_prefix = f"[Replying to {r_sender}] "
+    status_suffix = ""
+    if item.get("is_from_me"):
+        if item.get("is_read"):
+            read_str = f" at {item['read_at']}" if item.get("read_at") else ""
+            status_suffix = f" [Read{read_str}]"
+        elif item.get("delivered_quietly") or item.get("notifications_silenced"):
+            status_suffix = " [Delivered quietly / Notifications silenced]"
+        elif item.get("is_delivered"):
+            deliv_str = f" at {item['delivered_at']}" if item.get("delivered_at") else ""
+            status_suffix = f" [Delivered{deliv_str}]"
     chat_bit = f" [{item['chat']}]" if prefix_chat else ""
-    return f"[{item['timestamp']}]{edit_marker}{chat_bit} {item['sender']}: {reply_prefix}{msg_text}"
+    return f"[{item['timestamp']}]{edit_marker}{chat_bit} {item['sender']}: {reply_prefix}{msg_text}{status_suffix}"
 
 
 def reaction_predicate(available):
