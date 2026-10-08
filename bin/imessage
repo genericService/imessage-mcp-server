@@ -13,6 +13,49 @@ import base64
 import plistlib
 import re
 import struct
+import fcntl
+import tempfile
+import hashlib
+import urllib.request
+
+DEFAULT_TRANSCRIBE_MODEL = "large-v3-turbo-q5_0"
+DEFAULT_TRANSCRIBE_LANGUAGES = "es,en"
+DEFAULT_TRANSCRIBE_MAX_SECONDS = 600.0
+DEFAULT_TRANSCRIBE_WAIT_MS = 60000
+DEFAULT_TRANSCRIBE_JOB_TIMEOUT_SECONDS = 120.0
+
+MODEL_REGISTRY = {
+    "large-v3-turbo-q5_0": {
+        "filename": "ggml-large-v3-turbo-q5_0.bin",
+        "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+        "size": 574041195,
+        "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+    },
+    "large-v3-turbo": {
+        "filename": "ggml-large-v3-turbo.bin",
+        "sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+        "size": 1624555275,
+        "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+    },
+    "small": {
+        "filename": "ggml-small.bin",
+        "sha256": "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+        "size": 487601967,
+        "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+    },
+    "base": {
+        "filename": "ggml-base.bin",
+        "sha256": "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+        "size": 147951465,
+        "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+    },
+    "tiny": {
+        "filename": "ggml-tiny.bin",
+        "sha256": "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
+        "size": 77691713,
+        "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+    },
+}
 
 def get_db_path():
     """chat.db path. IMESSAGE_DB_PATH overrides the macOS default (used by tests)."""
@@ -51,11 +94,580 @@ def get_call_history_connection():
 
 INDEX_SCHEMA_VERSION = 1
 
+def get_mcp_home_dir():
+    override = os.environ.get("IMESSAGE_MCP_DIR")
+    if override and override.strip():
+        p = os.path.abspath(os.path.expanduser(override.strip()))
+    else:
+        p = os.path.expanduser("~/.imessage-mcp")
+    if not os.path.exists(p):
+        os.makedirs(p, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(p, 0o700)
+    except Exception:
+        pass
+    return p
+
+def get_transcribe_models_dir():
+    override = os.environ.get("TRANSCRIBE_MODELS_DIR")
+    if override and override.strip():
+        p = os.path.abspath(os.path.expanduser(override.strip()))
+    else:
+        p = os.path.join(get_mcp_home_dir(), "models")
+    if not os.path.exists(p):
+        os.makedirs(p, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(p, 0o700)
+    except Exception:
+        pass
+    return p
+
 def get_index_db_path():
     override = os.environ.get("INDEX_DB_PATH")
     if override and override.strip():
         return os.path.abspath(os.path.expanduser(override.strip()))
-    return os.path.expanduser("~/.imessage-mcp/index.db")
+    return os.path.join(get_mcp_home_dir(), "index.db")
+
+def get_transcripts_db_path():
+    if is_index_enabled():
+        return get_index_db_path()
+    return os.path.join(get_mcp_home_dir(), "transcripts.db")
+
+def ensure_transcripts_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transcripts (
+            cache_key TEXT PRIMARY KEY,
+            attachment_guid TEXT,
+            attachment_path TEXT,
+            file_size INTEGER,
+            file_mtime REAL,
+            transcription TEXT,
+            language TEXT,
+            engine TEXT,
+            duration_seconds REAL,
+            segments_json TEXT,
+            created_at TEXT
+        );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_guid ON transcripts(attachment_guid);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_path ON transcripts(attachment_path);")
+
+def get_transcripts_db_connection(read_only=False):
+    db_path = get_transcripts_db_path()
+    if read_only:
+        if not os.path.exists(db_path):
+            return None
+        uri = f"file:{db_path}?mode=ro"
+        try:
+            return sqlite3.connect(uri, uri=True)
+        except Exception:
+            return None
+    ensure_index_dir_and_permissions(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    ensure_transcripts_table(conn)
+    conn.commit()
+    try:
+        os.chmod(db_path, 0o600)
+    except Exception:
+        pass
+    return conn
+
+def _query_transcript_row(conn, guid, filepath, file_size, file_mtime):
+    if not conn:
+        return None
+    try:
+        c = conn.cursor()
+        ensure_transcripts_table(conn)
+        row = None
+        if guid:
+            c.execute("""
+                SELECT transcription, language, engine, duration_seconds, segments_json, file_size, file_mtime
+                FROM transcripts WHERE attachment_guid = ? LIMIT 1
+            """, (guid,))
+            row = c.fetchone()
+        if not row and filepath:
+            c.execute("""
+                SELECT transcription, language, engine, duration_seconds, segments_json, file_size, file_mtime
+                FROM transcripts WHERE attachment_path = ? LIMIT 1
+            """, (os.path.abspath(filepath),))
+            row = c.fetchone()
+        if not row and filepath:
+            basename = os.path.basename(filepath)
+            c.execute("""
+                SELECT transcription, language, engine, duration_seconds, segments_json, file_size, file_mtime
+                FROM transcripts WHERE attachment_path LIKE ? ORDER BY ROWID DESC LIMIT 1
+            """, (f"%{basename}",))
+            row = c.fetchone()
+        if not row:
+            return None
+
+        txt, lang, eng, dur, segs_json, c_size, c_mtime = row
+        if file_size is not None and c_size is not None and abs(c_size - file_size) > 0:
+            return None
+        if file_mtime is not None and c_mtime is not None and abs(c_mtime - file_mtime) > 1.0:
+            return None
+
+        segments = None
+        if segs_json:
+            try:
+                segments = json.loads(segs_json)
+            except Exception:
+                segments = None
+
+        return {
+            "transcription": txt,
+            "language": lang,
+            "engine": eng,
+            "duration_seconds": dur,
+            "segments": segments
+        }
+    except Exception:
+        return None
+
+def get_cached_transcript(guid=None, filepath=None, file_size=None, file_mtime=None):
+    conn = get_transcripts_db_connection(read_only=True)
+    res = None
+    if conn:
+        try:
+            res = _query_transcript_row(conn, guid, filepath, file_size, file_mtime)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if res is not None:
+        return res
+
+    if is_index_enabled():
+        standalone = os.path.join(get_mcp_home_dir(), "transcripts.db")
+        if os.path.exists(standalone) and os.path.abspath(standalone) != os.path.abspath(get_transcripts_db_path()):
+            try:
+                s_conn = sqlite3.connect(f"file:{standalone}?mode=ro", uri=True)
+                res = _query_transcript_row(s_conn, guid, filepath, file_size, file_mtime)
+                s_conn.close()
+                if res is not None:
+                    save_cached_transcript(
+                        guid=guid, filepath=filepath, file_size=file_size, file_mtime=file_mtime,
+                        transcription=res["transcription"], language=res["language"],
+                        engine=res["engine"], duration_seconds=res["duration_seconds"],
+                        segments=res.get("segments")
+                    )
+                    return res
+            except Exception:
+                pass
+    return None
+
+def save_cached_transcript(guid, filepath, file_size, file_mtime, transcription, language, engine, duration_seconds, segments=None, msg_id=None):
+    conn = get_transcripts_db_connection(read_only=False)
+    if not conn:
+        return
+    try:
+        c = conn.cursor()
+        ensure_transcripts_table(conn)
+        abs_path = os.path.abspath(filepath) if filepath else None
+        key = f"{guid or abs_path}:{file_size}:{file_mtime}"
+        segs_json = json.dumps(segments) if segments else None
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        c.execute("""
+            INSERT OR REPLACE INTO transcripts (
+                cache_key, attachment_guid, attachment_path, file_size, file_mtime,
+                transcription, language, engine, duration_seconds, segments_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            key, guid, abs_path,
+            file_size, file_mtime, transcription, language, engine,
+            duration_seconds, segs_json, now_iso
+        ))
+        conn.commit()
+
+        if is_index_enabled():
+            target_msg_id = msg_id
+            if target_msg_id is None and (guid or filepath):
+                try:
+                    c.execute("""
+                        SELECT msg_id FROM attachments_idx
+                        WHERE path = ? OR filename = ? LIMIT 1
+                    """, (abs_path, os.path.basename(filepath)))
+                    m_row = c.fetchone()
+                    if m_row:
+                        target_msg_id = m_row[0]
+                except Exception:
+                    pass
+
+            if target_msg_id is not None:
+                try:
+                    c.execute("SELECT text_decoded FROM messages_idx WHERE msg_id = ?", (target_msg_id,))
+                    t_row = c.fetchone()
+                    if t_row is not None:
+                        current = t_row[0] or ""
+                        if transcription and transcription not in current:
+                            updated_text = f"{current} {transcription}".strip() if current else transcription
+                            c.execute("UPDATE messages_idx SET text_decoded = ? WHERE msg_id = ?", (updated_text, target_msg_id))
+                            conn.commit()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def find_whisper_bin():
+    override = os.environ.get("TRANSCRIBE_WHISPER_BIN")
+    if override:
+        p = os.path.abspath(os.path.expanduser(override))
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+        return None
+    for b in ("whisper-cli", "whisper-cpp"):
+        p = shutil.which(b)
+        if p and os.access(p, os.X_OK):
+            return p
+    for p in ("/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli", "/opt/homebrew/bin/whisper-cpp"):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+def download_whisper_model(model_name=DEFAULT_TRANSCRIBE_MODEL, dest_dir=None, force=False):
+    clean_name = model_name.lower().replace("ggml-", "").replace(".bin", "")
+    if clean_name not in MODEL_REGISTRY:
+        sys.stderr.write(f"[Transcribe] Error: Unknown model '{model_name}'. Available: {', '.join(MODEL_REGISTRY.keys())}\n")
+        return False
+
+    meta = MODEL_REGISTRY[clean_name]
+    target_dir = dest_dir or get_transcribe_models_dir()
+    os.makedirs(target_dir, mode=0o700, exist_ok=True)
+    target_path = os.path.join(target_dir, meta["filename"])
+
+    if os.path.exists(target_path) and not force:
+        h = hashlib.sha256()
+        with open(target_path, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        if h.hexdigest() == meta["sha256"]:
+            return True
+
+    tmp_path = f"{target_path}.tmp"
+    url = meta["url"]
+    expected_size = meta["size"]
+    expected_sha = meta["sha256"]
+
+    sys.stderr.write(f"[Transcribe] Downloading {clean_name} ({expected_size / 1024 / 1024:.1f} MB)...\n")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "imessage-mcp-server/1.14.0"})
+        with urllib.request.urlopen(req) as resp, open(tmp_path, "wb") as out_file:
+            hasher = hashlib.sha256()
+            while True:
+                chunk = resp.read(131072)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+                hasher.update(chunk)
+
+        actual_sha = hasher.hexdigest()
+        if actual_sha != expected_sha:
+            sys.stderr.write(f"[Transcribe] Checksum mismatch for {clean_name}\n")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            return False
+
+        os.replace(tmp_path, target_path)
+        os.chmod(target_path, 0o600)
+        sys.stderr.write(f"[Transcribe] Downloaded and verified model: {target_path}\n")
+        return True
+    except Exception as e:
+        sys.stderr.write(f"[Transcribe] Download failed: {e}\n")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return False
+
+def find_whisper_model():
+    explicit_path = os.environ.get("TRANSCRIBE_MODEL_PATH")
+    if explicit_path:
+        p = os.path.abspath(os.path.expanduser(explicit_path))
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            return p
+        return None
+
+    whisper_bin = os.environ.get("TRANSCRIBE_WHISPER_BIN", "")
+    if "mock" in whisper_bin.lower():
+        return "/tmp/mock_model.bin"
+
+    model_name = os.environ.get("TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL)
+    clean_name = model_name.lower().replace("ggml-", "").replace(".bin", "")
+    models_dir = get_transcribe_models_dir()
+
+    search_dirs = [models_dir]
+    default_dir = os.path.expanduser("~/.imessage-mcp/models")
+    if default_dir not in search_dirs:
+        search_dirs.append(default_dir)
+
+    for d in search_dirs:
+        candidates = [
+            os.path.join(d, f"ggml-{clean_name}.bin"),
+            os.path.join(d, f"{clean_name}.bin"),
+            os.path.join(d, clean_name),
+        ]
+        for c in candidates:
+            if os.path.exists(c) and os.path.getsize(c) > 0:
+                return c
+
+    # Fallback to any existing model in the directory if default not found
+    for d in search_dirs:
+        if os.path.exists(d):
+            for f in os.listdir(d):
+                if f.endswith(".bin") and f.startswith("ggml-"):
+                    fp = os.path.join(d, f)
+                    if os.path.getsize(fp) > 0:
+                        return fp
+
+    auto_dl = os.environ.get("TRANSCRIBE_AUTO_DOWNLOAD", "").lower() in ("true", "1")
+    if auto_dl:
+        ok = download_whisper_model(model_name=clean_name, dest_dir=models_dir)
+        if ok:
+            target = os.path.join(models_dir, f"ggml-{clean_name}.bin")
+            if os.path.exists(target):
+                return target
+    return None
+
+def prepare_audio_for_transcription(audio_path):
+    temp_dir = tempfile.mkdtemp(prefix="imsg_transcribe_")
+    try:
+        os.chmod(temp_dir, 0o700)
+    except Exception:
+        pass
+    wav_path = os.path.join(temp_dir, "audio_16k.wav")
+
+    def cleanup():
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    try:
+        afconvert_bin = "/usr/bin/afconvert"
+        if os.path.exists(afconvert_bin):
+            res = subprocess.run([
+                afconvert_bin, "-f", "WAVE", "-d", "LEI16@16000", "-c", "1",
+                audio_path, wav_path
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0 and os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+                return wav_path, cleanup
+
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin:
+            res = subprocess.run([
+                ffmpeg_bin, "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0 and os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+                return wav_path, cleanup
+    except Exception:
+        pass
+    return None, cleanup
+
+def run_whisper_transcription(wav_path, duration_seconds, whisper_bin=None, model_path=None):
+    if not whisper_bin:
+        whisper_bin = find_whisper_bin()
+    if not model_path:
+        model_path = find_whisper_model()
+    if not whisper_bin or not model_path:
+        return None, None, None, "engine_unavailable"
+
+    out_prefix = os.path.join(os.path.dirname(wav_path), "whisper_out")
+    lang_hints = os.environ.get("TRANSCRIBE_LANGUAGES", DEFAULT_TRANSCRIBE_LANGUAGES).strip()
+    lang_arg = "auto"
+    if lang_hints and "," not in lang_hints:
+        lang_arg = lang_hints
+
+    cmd = [
+        whisper_bin,
+        "-m", model_path,
+        "-f", wav_path,
+        "-l", lang_arg,
+        "-oj",
+        "-of", out_prefix,
+        "-np",
+        "-nt"
+    ]
+
+    job_timeout = float(os.environ.get("TRANSCRIBE_JOB_TIMEOUT_SECONDS", str(DEFAULT_TRANSCRIBE_JOB_TIMEOUT_SECONDS)))
+    start_time = time.time()
+    try:
+        def preexec():
+            try:
+                os.nice(15)
+            except Exception:
+                pass
+
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=job_timeout,
+            preexec_fn=preexec if hasattr(os, "nice") else None
+        )
+        elapsed = time.time() - start_time
+        if res.returncode != 0:
+            sys.stderr.write(f"[Transcribe] whisper process exited with code {res.returncode}\n")
+            return None, None, None, "failed"
+
+        out_json = f"{out_prefix}.json"
+        if not os.path.exists(out_json):
+            return None, None, None, "failed"
+
+        with open(out_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        detected_lang = data.get("result", {}).get("language") or "es"
+        raw_segments = data.get("transcription", [])
+        text_parts = []
+        segments = []
+        for seg in raw_segments:
+            seg_text = seg.get("text", "").strip()
+            if seg_text:
+                text_parts.append(seg_text)
+            offsets = seg.get("offsets", {})
+            start_sec = round(offsets.get("from", 0) / 1000.0, 2)
+            end_sec = round(offsets.get("to", 0) / 1000.0, 2)
+            segments.append({
+                "start": start_sec,
+                "end": end_sec,
+                "text": seg_text
+            })
+
+        full_text = " ".join(text_parts).strip()
+        dur_display = duration_seconds if duration_seconds is not None else 0.0
+        sys.stderr.write(f"[Transcribe] whisper transcribed {dur_display:.1f}s audio in {elapsed:.2f}s (lang: {detected_lang})\n")
+        return full_text, detected_lang, segments, "ok"
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"[Transcribe] whisper timed out after {job_timeout}s\n")
+        return None, None, None, "failed"
+    except Exception as e:
+        sys.stderr.write(f"[Transcribe] whisper execution failed: {type(e).__name__}\n")
+        return None, None, None, "failed"
+
+def run_apple_speech_transcription(wav_path, duration_seconds):
+    helper_path = os.path.join(os.path.dirname(__file__), "apple-speech-transcribe.swift")
+    if not os.path.exists(helper_path) or not os.path.exists("/usr/bin/swift"):
+        return None, None, None, "engine_unavailable"
+
+    lang_hints = os.environ.get("TRANSCRIBE_LANGUAGES", "es-MX,es,en-US,en")
+    cmd = ["/usr/bin/swift", helper_path, wav_path, lang_hints]
+    job_timeout = float(os.environ.get("TRANSCRIBE_JOB_TIMEOUT_SECONDS", str(DEFAULT_TRANSCRIBE_JOB_TIMEOUT_SECONDS)))
+    start_time = time.time()
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=job_timeout)
+        elapsed = time.time() - start_time
+        if res.returncode == 2 or res.returncode == 3:
+            sys.stderr.write(f"[Transcribe] Apple Speech unavailable (code {res.returncode})\n")
+            return None, None, None, "engine_unavailable"
+        if res.returncode != 0:
+            return None, None, None, "failed"
+
+        data = json.loads(res.stdout)
+        text = data.get("transcription")
+        lang = data.get("language")
+        segs = data.get("segments", [])
+        dur_display = duration_seconds if duration_seconds is not None else 0.0
+        sys.stderr.write(f"[Transcribe] apple_speech transcribed {dur_display:.1f}s audio in {elapsed:.2f}s (lang: {lang})\n")
+        return text, lang, segs, "ok"
+    except subprocess.TimeoutExpired:
+        return None, None, None, "failed"
+    except Exception:
+        return None, None, None, "failed"
+
+def transcribe_audio_with_lock(filepath, guid=None, msg_id=None, with_segments=False):
+    dur_sec = get_audio_duration(filepath)
+    max_sec = float(os.environ.get("TRANSCRIBE_MAX_SECONDS", str(DEFAULT_TRANSCRIBE_MAX_SECONDS)))
+    if dur_sec is not None and dur_sec > max_sec:
+        sys.stderr.write(f"[Transcribe] Audio duration ({dur_sec:.1f}s) exceeds TRANSCRIBE_MAX_SECONDS ({max_sec:.1f}s), skipping\n")
+        return None, None, None, None, "too_long"
+
+    engine_choice = os.environ.get("TRANSCRIBE_ENGINE", "whisper").strip().lower()
+    if engine_choice == "apple":
+        helper_path = os.path.join(os.path.dirname(__file__), "apple-speech-transcribe.swift")
+        if not os.path.exists(helper_path) or not os.path.exists("/usr/bin/swift"):
+            return None, None, None, None, "engine_unavailable"
+    else:
+        w_bin = find_whisper_bin()
+        w_model = find_whisper_model()
+        if not w_bin or not w_model:
+            return None, None, None, None, "engine_unavailable"
+
+    lock_dir = get_mcp_home_dir()
+    lock_file = os.path.join(lock_dir, "transcribe.lock")
+    wait_ms = int(os.environ.get("TRANSCRIBE_WAIT_MS", str(DEFAULT_TRANSCRIBE_WAIT_MS)))
+
+    fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+    start_wait = time.time()
+    acquired = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except (BlockingIOError, IOError):
+            if (time.time() - start_wait) * 1000.0 >= wait_ms:
+                break
+            time.sleep(0.05)
+
+    if not acquired:
+        os.close(fd)
+        return None, None, None, None, "pending"
+
+    try:
+        st = None
+        try:
+            st = os.stat(filepath)
+        except Exception:
+            pass
+        f_size = st.st_size if st else None
+        f_mtime = st.st_mtime if st else None
+        cached = get_cached_transcript(guid=guid, filepath=filepath, file_size=f_size, file_mtime=f_mtime)
+        if cached and cached.get("transcription"):
+            return (
+                cached["transcription"],
+                cached.get("language"),
+                cached.get("engine"),
+                cached.get("segments"),
+                "ok"
+            )
+
+        wav_path, cleanup = prepare_audio_for_transcription(filepath)
+        if not wav_path or not os.path.exists(wav_path):
+            cleanup()
+            return None, None, None, None, "failed"
+
+        try:
+            if engine_choice == "apple":
+                txt, lang, segs, status = run_apple_speech_transcription(wav_path, dur_sec)
+                eng_name = "apple_speech"
+            else:
+                txt, lang, segs, status = run_whisper_transcription(wav_path, dur_sec, whisper_bin=w_bin, model_path=w_model)
+                eng_name = "whisper"
+
+            if status == "ok" and txt:
+                save_cached_transcript(
+                    guid, filepath, f_size, f_mtime,
+                    txt, lang, eng_name, dur_sec,
+                    segments=segs, msg_id=msg_id
+                )
+                return txt, lang, eng_name, segs, "ok"
+            else:
+                return None, None, None, None, status
+        finally:
+            cleanup()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        except Exception:
+            pass
 
 def is_index_enabled():
     val = os.environ.get("INDEX_ENABLED", "").strip().lower()
@@ -95,6 +707,7 @@ def get_index_db_connection(read_only=False):
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
+    ensure_transcripts_table(conn)
     try:
         os.chmod(db_path, 0o600)
     except Exception:
@@ -112,6 +725,7 @@ def init_index_schema(conn, force=False):
             DROP TABLE IF EXISTS messages_idx;
             DROP TABLE IF EXISTS attachments_idx;
             DROP TABLE IF EXISTS contacts_idx;
+            DROP TABLE IF EXISTS transcripts;
             DROP TABLE IF EXISTS meta;
         """)
 
@@ -185,6 +799,7 @@ def init_index_schema(conn, force=False):
             INSERT INTO meta (schema_version, last_indexed_msg_id, last_full_sync_at, chat_db_inode, chat_db_size)
             VALUES (?, 0, NULL, 0, 0)
         """, (INDEX_SCHEMA_VERSION,))
+    ensure_transcripts_table(conn)
     conn.commit()
 
 def build_index(batch_size=5000, force_rebuild=False):
@@ -205,6 +820,23 @@ def build_index(batch_size=5000, force_rebuild=False):
 
     conn_idx = get_index_db_connection()
     init_index_schema(conn_idx, force=force_rebuild)
+
+    standalone_cache = os.path.join(get_mcp_home_dir(), "transcripts.db")
+    if os.path.exists(standalone_cache) and os.path.abspath(standalone_cache) != os.path.abspath(db_path):
+        try:
+            s_conn = sqlite3.connect(f"file:{standalone_cache}?mode=ro", uri=True)
+            ensure_transcripts_table(s_conn)
+            cur_temp = conn_idx.cursor()
+            cur_temp.execute("ATTACH DATABASE ? AS standalone_db", (standalone_cache,))
+            cur_temp.execute("""
+                INSERT OR IGNORE INTO transcripts
+                SELECT * FROM standalone_db.transcripts
+            """)
+            conn_idx.commit()
+            cur_temp.execute("DETACH DATABASE standalone_db")
+            s_conn.close()
+        except Exception:
+            pass
 
     conn_chat = get_db_connection()
     cur_chat = conn_chat.cursor()
@@ -276,6 +908,7 @@ def build_index(batch_size=5000, force_rebuild=False):
                 SELECT 
                     maj.message_id,
                     a.ROWID,
+                    a.guid,
                     a.filename,
                     a.mime_type,
                     a.transfer_name,
@@ -287,11 +920,12 @@ def build_index(batch_size=5000, force_rebuild=False):
                 WHERE maj.message_id IN ({placeholders})
             """
             cur_chat.execute(att_query, msg_ids)
-            for a_msg_id, a_id, a_fn, a_mime, a_tf, a_bytes, a_uti, a_uinfo in cur_chat.fetchall():
+            for a_msg_id, a_id, a_guid, a_fn, a_mime, a_tf, a_bytes, a_uti, a_uinfo in cur_chat.fetchall():
                 if a_msg_id not in att_map:
                     att_map[a_msg_id] = []
                 att_map[a_msg_id].append({
                     "attachment_id": a_id,
+                    "guid": a_guid,
                     "filename": a_fn,
                     "mime_type": a_mime,
                     "transfer_name": a_tf,
@@ -323,15 +957,20 @@ def build_index(batch_size=5000, force_rebuild=False):
                     decoded = ""
 
             for a in atts:
+                transcript = None
                 if a.get("user_info"):
                     p = extract_attachment_user_info(a["user_info"])
                     transcript = p.get("audio-transcription")
-                    if transcript:
-                        if decoded:
-                            decoded = f"{decoded} {transcript}"
-                        else:
-                            decoded = transcript
-                        break
+                if not transcript and (a.get("filename") or a.get("guid")):
+                    cached = get_cached_transcript(guid=a.get("guid"), filepath=a.get("filename"))
+                    if cached:
+                        transcript = cached.get("transcription")
+                if transcript:
+                    if decoded:
+                        decoded = f"{decoded} {transcript}"
+                    else:
+                        decoded = transcript
+                    break
 
             batch_msgs.append((
                 m_id, guid, chat_id, handle_id, int(is_from_me or 0),
@@ -868,7 +1507,7 @@ def build_sticker_label(description=None, pack=None):
     return '[sticker]'
 
 
-def fetch_attachments_for_messages(cursor, msg_ids):
+def fetch_attachments_for_messages(cursor, msg_ids, transcribe=False):
     """
     Fetch and enrich all attachments for a list of message IDs.
     Returns a dict mapping msg_id to a list of attachment dicts.
@@ -888,6 +1527,7 @@ def fetch_attachments_for_messages(cursor, msg_ids):
     att_query = f"""
     SELECT 
         maj.message_id,
+        a.guid,
         a.filename,
         a.mime_type,
         a.transfer_name,
@@ -904,7 +1544,7 @@ def fetch_attachments_for_messages(cursor, msg_ids):
     """
     cursor.execute(att_query, msg_ids)
     attachments_map = {}
-    for (msg_id, filename, mime_type, transfer_name, total_bytes, user_info, uti,
+    for (msg_id, a_guid, filename, mime_type, transfer_name, total_bytes, user_info, uti,
          is_sticker_col, attr_info, emoji_desc, sticker_user_info) in cursor.fetchall():
         if msg_id not in attachments_map:
             attachments_map[msg_id] = []
@@ -913,15 +1553,34 @@ def fetch_attachments_for_messages(cursor, msg_ids):
         ext = os.path.splitext(full_path or transfer_name or "")[1].lower()
         
         p = extract_attachment_user_info(user_info)
-        transcription = p.get('audio-transcription') or None
-        
+        apple_transcription = p.get('audio-transcription') or None
+        apple_language = p.get('transcription-language') or p.get('language') or None
+        transcription = apple_transcription
+        language = apple_language
+        transcription_source = 'apple' if apple_transcription else None
+
         is_audio = (
             ext in AUDIO_EXTENSIONS
             or (uti and ('coreaudio' in uti.lower() or 'audio' in uti.lower()))
             or (mime_type and mime_type.startswith('audio/'))
             or transcription is not None
         )
-        
+
+        if transcription is None and is_audio and full_path:
+            cached = get_cached_transcript(guid=a_guid, filepath=full_path)
+            if cached and cached.get("transcription"):
+                transcription = cached["transcription"]
+                language = cached.get("language")
+                transcription_source = cached.get("engine")
+            elif transcribe:
+                txt, lang, eng, segs, status = transcribe_audio_with_lock(
+                    full_path, guid=a_guid, msg_id=msg_id
+                )
+                if status == "ok" and txt:
+                    transcription = txt
+                    language = lang
+                    transcription_source = eng
+
         is_sticker, sticker_pack, sticker_description = extract_sticker_metadata(
             user_info, attr_info, emoji_desc, uti, full_path or transfer_name,
             is_sticker_col, sticker_user_info
@@ -958,6 +1617,8 @@ def fetch_attachments_for_messages(cursor, msg_ids):
             'duration_seconds': dur_sec,
             'duration_formatted': dur_fmt,
             'transcription': transcription,
+            'language': language,
+            'transcription_source': transcription_source,
             'uti': uti,
             'is_sticker': bool(is_sticker),
             'sticker_pack': sticker_pack,
@@ -1752,11 +2413,11 @@ def reaction_list_item(row, reaction, cmap, prefer_contact_name):
     return item
 
 
-def present_rows(cursor, rows, cmap, prefer_contact_name, reactions_mode):
+def present_rows(cursor, rows, cmap, prefer_contact_name, reactions_mode, transcribe=False):
     if not rows:
         return []
     msg_ids = [row["msg_id"] for row in rows]
-    attachments_map = fetch_attachments_for_messages(cursor, msg_ids)
+    attachments_map = fetch_attachments_for_messages(cursor, msg_ids, transcribe=transcribe)
     target_guids = []
     for row in rows:
         if classify_associated_type(row.get("associated_message_type")):
@@ -1803,7 +2464,7 @@ def present_rows(cursor, rows, cmap, prefer_contact_name, reactions_mode):
             if parent_rows:
                 populate_cached_decoded_text(parent_rows)
                 parent_msg_ids = [r["msg_id"] for r in parent_rows]
-                parent_atts = fetch_attachments_for_messages(cursor, parent_msg_ids)
+                parent_atts = fetch_attachments_for_messages(cursor, parent_msg_ids, transcribe=transcribe)
                 for pr in parent_rows:
                     p_item = base_message_fields(pr, cmap, prefer_contact_name, parent_atts)
                     if p_item.get("guid"):
@@ -2100,6 +2761,12 @@ def add_read_presentation_args(parser, *, with_limit=False, with_days=False, def
         "--with-meta",
         action="store_true",
         help="Wrap JSON as {messages, filtered, next_since_msg_id, has_more}",
+    )
+    parser.add_argument(
+        "--transcribe",
+        action="store_true",
+        default=False,
+        help="Trigger on-demand local transcription for voice notes missing transcripts",
     )
     parser.add_argument("--json", action="store_true", help="Output results in JSON format")
 
@@ -2447,7 +3114,7 @@ def read_messages(args):
     rows = fetch_message_dicts(cursor, select_sql, where, params)
     populate_cached_decoded_text(rows)
     mode = presentation_options(args)
-    items = present_rows(cursor, rows, None, False, mode)
+    items = present_rows(cursor, rows, None, False, mode, transcribe=getattr(args, "transcribe", False))
     filtered, next_since = annotate_batch(items, rows, since)
     if getattr(args, "include_calls", False):
         cmap = get_contacts_map()
@@ -2529,16 +3196,36 @@ def search_messages(args):
             row_map = {r["msg_id"]: r for r in fetched}
             rows = [row_map[mid] for mid in matching_ids if mid in row_map]
     else:
-        where = """(
+        cached_att_matches = []
+        try:
+            t_conn = get_transcripts_db_connection(read_only=True)
+            if t_conn:
+                tc = t_conn.cursor()
+                tc.execute("SELECT attachment_path, attachment_guid FROM transcripts WHERE transcription LIKE ?", (f"%{query_str}%",))
+                for ap, ag in tc.fetchall():
+                    if ap: cached_att_matches.append(ap)
+                    if ag: cached_att_matches.append(ag)
+                t_conn.close()
+        except Exception:
+            pass
+
+        cached_cond = ""
+        cached_params = []
+        if cached_att_matches:
+            c_holders = ",".join(["?"] * len(cached_att_matches))
+            cached_cond = f" OR a.filename IN ({c_holders}) OR a.guid IN ({c_holders})"
+            cached_params = cached_att_matches + cached_att_matches
+
+        where = f"""(
             m.text LIKE ?
             OR (m.text IS NULL AND m.attributedBody LIKE ?)
             OR EXISTS (
                 SELECT 1 FROM message_attachment_join maj
                 JOIN attachment a ON maj.attachment_id = a.ROWID
-                WHERE maj.message_id = m.ROWID AND a.user_info LIKE ?
+                WHERE maj.message_id = m.ROWID AND (a.user_info LIKE ?{cached_cond})
             )
         )"""
-        params = [f"%{query_str}%", f"%{query_str}%", f"%{query_str}%"]
+        params = [f"%{query_str}%", f"%{query_str}%", f"%{query_str}%"] + cached_params
         if since is not None:
             where += " AND m.ROWID > ?"
             params.append(since)
@@ -2560,7 +3247,7 @@ def search_messages(args):
 
     populate_cached_decoded_text(rows)
     mode = presentation_options(args)
-    items = present_rows(cursor, rows, None, False, mode)
+    items = present_rows(cursor, rows, None, False, mode, transcribe=getattr(args, "transcribe", False))
     filtered, next_since = annotate_batch(items, rows, since)
     header = f"SEARCH RESULTS FOR '{query_str}' ({len(items)} matching messages found):"
     lines = []
@@ -3012,28 +3699,73 @@ def get_attachment_payload(args):
     dur_sec = get_audio_duration(filepath) if is_audio else None
     dur_fmt = format_duration(dur_sec) if dur_sec is not None else None
 
-    # Try looking up transcription and metadata in chat.db
     transcription = None
     language = None
-    try:
-        conn = sqlite3.connect(f"file:{get_db_path()}?mode=ro", uri=True)
-        c = conn.cursor()
-        basename = os.path.basename(filepath)
-        normpath = filepath.replace(os.path.expanduser('~'), '~')
-        c.execute("""
-            SELECT user_info, attribution_info
-            FROM attachment
-            WHERE filename = ? OR filename = ? OR filename LIKE ?
-            ORDER BY (CASE WHEN filename = ? OR filename = ? THEN 0 ELSE 1 END), ROWID DESC LIMIT 1
-        """, (filepath, normpath, f"%{basename}", filepath, normpath))
-        row = c.fetchone()
-        if row and row[0]:
-            p = extract_attachment_user_info(row[0])
-            transcription = p.get('audio-transcription') or None
-            language = p.get('transcription-language') or p.get('language') or None
-        conn.close()
-    except Exception:
-        pass
+    transcription_source = None
+    transcription_status = "not_audio" if not is_audio else "ok"
+    segments = None
+
+    if is_audio:
+        apple_transcription = None
+        apple_language = None
+        attachment_guid = None
+        try:
+            conn = sqlite3.connect(f"file:{get_db_path()}?mode=ro", uri=True)
+            c = conn.cursor()
+            basename = os.path.basename(filepath)
+            normpath = filepath.replace(os.path.expanduser('~'), '~')
+            c.execute("""
+                SELECT guid, user_info, attribution_info
+                FROM attachment
+                WHERE filename = ? OR filename = ? OR filename LIKE ?
+                ORDER BY (CASE WHEN filename = ? OR filename = ? THEN 0 ELSE 1 END), ROWID DESC LIMIT 1
+            """, (filepath, normpath, f"%{basename}", filepath, normpath))
+            row = c.fetchone()
+            if row:
+                attachment_guid = row[0]
+                if row[1]:
+                    p = extract_attachment_user_info(row[1])
+                    apple_transcription = p.get('audio-transcription') or None
+                    apple_language = p.get('transcription-language') or p.get('language') or None
+            conn.close()
+        except Exception:
+            pass
+
+        if apple_transcription:
+            transcription = apple_transcription
+            language = apple_language
+            transcription_source = "apple"
+            transcription_status = "ok"
+        else:
+            st = None
+            try:
+                st = os.stat(filepath)
+            except Exception:
+                pass
+            f_size = st.st_size if st else None
+            f_mtime = st.st_mtime if st else None
+            cached = get_cached_transcript(guid=attachment_guid, filepath=filepath, file_size=f_size, file_mtime=f_mtime)
+            if cached and cached.get("transcription"):
+                transcription = cached["transcription"]
+                language = cached.get("language")
+                transcription_source = cached.get("engine")
+                transcription_status = "ok"
+                segments = cached.get("segments")
+            elif getattr(args, "transcribe", True):
+                txt, lang, eng, segs, status = transcribe_audio_with_lock(
+                    filepath, guid=attachment_guid, msg_id=message_id,
+                    with_segments=getattr(args, "with_segments", False)
+                )
+                transcription = txt
+                language = lang
+                transcription_source = eng
+                transcription_status = status
+                segments = segs
+            else:
+                transcription = None
+                language = None
+                transcription_source = None
+                transcription_status = "ok"
 
     with open(target_path, 'rb') as f:
         data = f.read()
@@ -3049,10 +3781,14 @@ def get_attachment_payload(args):
         'duration_formatted': dur_fmt,
         'transcription': transcription,
         'language': language,
+        'transcription_source': transcription_source,
+        'transcription_status': transcription_status,
         'is_sticker': bool(is_sticker),
         'sticker_pack': sticker_pack,
         'sticker_description': sticker_description
     }
+    if getattr(args, "with_segments", False):
+        payload['segments'] = segments or []
     
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -3458,7 +4194,7 @@ def get_recent_messages(args):
             ))
     populate_cached_decoded_text(rows)
     cmap = get_contacts_map()
-    items = present_rows(cursor, rows, cmap, True, mode)
+    items = present_rows(cursor, rows, cmap, True, mode, transcribe=getattr(args, "transcribe", False))
     filtered, next_since = annotate_batch(items, rows, since)
     if getattr(args, "include_calls", False):
         min_date_s = None
@@ -3872,8 +4608,8 @@ def get_changes(args):
         """, (since_id,))
         rows = cursor.fetchall()
 
-        # Message ids that have at least one joined attachment row.
         with_attachments = set()
+        with_audio_attachments = set()
         row_ids = [r[0] for r in rows]
         if row_ids:
             try:
@@ -3883,6 +4619,24 @@ def get_changes(args):
                     row_ids,
                 )
                 with_attachments = {int(x[0]) for x in cursor.fetchall()}
+                if with_attachments:
+                    att_holders = ",".join(["?"] * len(with_attachments))
+                    cursor.execute(f"""
+                        SELECT DISTINCT maj.message_id
+                        FROM message_attachment_join maj
+                        JOIN attachment a ON maj.attachment_id = a.ROWID
+                        WHERE maj.message_id IN ({att_holders})
+                          AND (
+                            a.mime_type LIKE 'audio/%'
+                            OR a.uti LIKE '%audio%'
+                            OR a.uti LIKE '%coreaudio%'
+                            OR a.filename LIKE '%.caf'
+                            OR a.filename LIKE '%.m4a'
+                            OR a.filename LIKE '%.wav'
+                            OR a.filename LIKE '%.mp3'
+                          )
+                    """, list(with_attachments))
+                    with_audio_attachments = {int(x[0]) for x in cursor.fetchall()}
             except Exception:
                 pass
 
@@ -3917,6 +4671,8 @@ def get_changes(args):
                 "event": event,
                 "is_from_me": bool(is_from_me),
                 "occurred_at_iso": iso or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "has_attachments": bool(cache_has_attachments) or int(m_id) in with_attachments,
+                "has_audio_attachments": int(m_id) in with_audio_attachments,
             }
             if was_deliv_quietly:
                 msg_item["delivered_quietly"] = True
@@ -4040,6 +4796,280 @@ def get_changes(args):
         print(f"New Messages: {len(new_messages)}")
         print(f"Receipt Events: {len(receipt_events)}")
 
+def cmd_transcribe_status(args):
+    w_bin = find_whisper_bin()
+    w_model = find_whisper_model()
+    models_dir = get_transcribe_models_dir()
+    installed_models = []
+    if os.path.exists(models_dir):
+        for f in sorted(os.listdir(models_dir)):
+            if f.endswith(".bin"):
+                fp = os.path.join(models_dir, f)
+                installed_models.append({
+                    "name": f,
+                    "path": fp,
+                    "size_bytes": os.path.getsize(fp),
+                    "size_formatted": format_size(os.path.getsize(fp)),
+                })
+
+    apple_helper = os.path.join(os.path.dirname(__file__), "apple-speech-transcribe.swift")
+    apple_available = os.path.exists(apple_helper) and os.path.exists("/usr/bin/swift")
+
+    total_cached = 0
+    engine_counts = {}
+    lang_counts = {}
+    db_path = get_transcripts_db_path()
+    try:
+        conn = get_transcripts_db_connection(read_only=True)
+        if conn:
+            c = conn.cursor()
+            ensure_transcripts_table(conn)
+            c.execute("SELECT COUNT(*) FROM transcripts")
+            r = c.fetchone()
+            if r: total_cached = r[0]
+            c.execute("SELECT engine, COUNT(*) FROM transcripts GROUP BY engine")
+            for eng, cnt in c.fetchall():
+                engine_counts[eng or "unknown"] = cnt
+            c.execute("SELECT language, COUNT(*) FROM transcripts GROUP BY language")
+            for lng, cnt in c.fetchall():
+                lang_counts[lng or "unknown"] = cnt
+            conn.close()
+    except Exception:
+        pass
+
+    active_engine = os.environ.get("TRANSCRIBE_ENGINE", "whisper").strip().lower()
+    status_info = {
+        "active_engine": active_engine,
+        "whisper_bin": w_bin,
+        "whisper_available": bool(w_bin and w_model),
+        "active_model_path": w_model,
+        "models_dir": models_dir,
+        "installed_models": installed_models,
+        "apple_speech_available": apple_available,
+        "cache_db_path": db_path,
+        "total_cached_transcripts": total_cached,
+        "transcripts_by_engine": engine_counts,
+        "transcripts_by_language": lang_counts,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(status_info, indent=2))
+    else:
+        print("iMessage Voice Note Transcription Status:")
+        print("------------------------------------------")
+        print(f"Active Engine:             {active_engine}")
+        print(f"Whisper Binary:            {w_bin or 'Not found'}")
+        print(f"Whisper Model:             {w_model or 'Not found'}")
+        print(f"Apple Speech Helper:       {'Available' if apple_available else 'Not found'}")
+        print(f"Models Directory:          {models_dir} ({len(installed_models)} models installed)")
+        for m in installed_models:
+            print(f"  - {m['name']} ({m['size_formatted']})")
+        print(f"Cache Database:            {db_path}")
+        print(f"Total Cached Transcripts:  {total_cached}")
+        if engine_counts:
+            print(f"By Engine:                 {', '.join(f'{k}: {v}' for k, v in engine_counts.items())}")
+        if lang_counts:
+            print(f"By Language:               {', '.join(f'{k}: {v}' for k, v in lang_counts.items())}")
+
+def cmd_transcribe_download_model(args):
+    model_name = getattr(args, "model", None) or os.environ.get("TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL)
+    clean_name = model_name.lower().replace("ggml-", "").replace(".bin", "")
+    force = getattr(args, "force", False)
+    models_dir = get_transcribe_models_dir()
+    ok = download_whisper_model(model_name=clean_name, dest_dir=models_dir, force=force)
+    target_path = os.path.join(models_dir, f"ggml-{clean_name}.bin")
+    size = os.path.getsize(target_path) if os.path.exists(target_path) else 0
+    res = {
+        "success": ok,
+        "model": clean_name,
+        "path": target_path if ok else None,
+        "size_bytes": size,
+        "size_formatted": format_size(size) if ok else None,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2))
+    else:
+        if ok:
+            print(f"Model '{clean_name}' ready at: {target_path} ({format_size(size)})")
+        else:
+            print(f"ERROR: Failed to download model '{clean_name}'", file=sys.stderr)
+            sys.exit(1)
+
+def cmd_transcribe_clear_cache(args):
+    cleared_count = 0
+    db_path = get_transcripts_db_path()
+    try:
+        conn = get_transcripts_db_connection(read_only=False)
+        if conn:
+            c = conn.cursor()
+            ensure_transcripts_table(conn)
+            c.execute("SELECT COUNT(*) FROM transcripts")
+            r = c.fetchone()
+            if r: cleared_count = r[0]
+            c.execute("DELETE FROM transcripts")
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        sys.stderr.write(f"[Transcribe] Error clearing cache: {e}\n")
+
+    res = {
+        "success": True,
+        "cleared": True,
+        "deleted_count": cleared_count,
+        "cache_db_path": db_path,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"Cleared {cleared_count} cached transcripts from {db_path}.")
+
+def cmd_transcribe_backfill(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    since_str = getattr(args, "since", None)
+    min_date_ns = None
+    if since_str:
+        try:
+            ts = float(since_str)
+            if ts > 10_000_000_000:
+                min_date_ns = int(ts)
+            elif ts > 1_000_000_000:
+                min_date_ns = int((ts - 978307200) * 1_000_000_000)
+            else:
+                min_date_ns = int(ts * 1_000_000_000)
+        except ValueError:
+            try:
+                dt = datetime.datetime.fromisoformat(since_str.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                apple_epoch = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+                diff_sec = (dt - apple_epoch).total_seconds()
+                min_date_ns = int(diff_sec * 1_000_000_000)
+            except Exception as ex:
+                sys.stderr.write(f"[Transcribe] Invalid --since date '{since_str}': {ex}\n")
+                sys.exit(1)
+
+    chat_target = getattr(args, "chat", None)
+    chat_ids = None
+    if chat_target:
+        chat_ids = resolve_chat_ids(cursor, chat_target)
+        if not chat_ids:
+            finish_no_chat(conn, args, chat_target)
+            return
+
+    query = """
+        SELECT m.ROWID, m.date, a.ROWID, a.guid, a.filename, a.user_info, a.mime_type, a.uti
+        FROM message m
+        JOIN message_attachment_join maj ON m.ROWID = maj.message_id
+        JOIN attachment a ON maj.attachment_id = a.ROWID
+    """
+    where_clauses = []
+    params = []
+    if chat_ids:
+        placeholders = chat_placeholders(chat_ids)
+        query += f" JOIN chat_message_join cmj ON m.ROWID = cmj.message_id"
+        where_clauses.append(f"cmj.chat_id IN ({placeholders})")
+        params.extend(chat_ids)
+    if min_date_ns is not None:
+        where_clauses.append("m.date >= ?")
+        params.append(min_date_ns)
+
+    if where_clauses:
+        query += " WHERE " + " AND ".join(where_clauses)
+    query += " ORDER BY m.date ASC"
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    total_candidates = len(rows)
+    processed = 0
+    transcribed = 0
+    skipped_apple = 0
+    skipped_cached = 0
+    skipped_not_audio = 0
+    missing_files = 0
+    failed = 0
+
+    limit = getattr(args, "limit", None)
+    results = []
+
+    for m_id, m_date, a_id, a_guid, a_fn, a_uinfo, a_mime, a_uti in rows:
+        if limit is not None and transcribed >= limit:
+            break
+
+        full_path = None
+        if a_fn:
+            full_path = os.path.expanduser(a_fn) if a_fn.startswith('~') else a_fn
+        ext = os.path.splitext(full_path)[1].lower() if full_path else ''
+        is_audio = (
+            ext in AUDIO_EXTENSIONS
+            or (a_uti and ('coreaudio' in a_uti.lower() or 'audio' in a_uti.lower()))
+            or (a_mime and a_mime.startswith('audio/'))
+        )
+        if not is_audio:
+            skipped_not_audio += 1
+            continue
+
+        if a_uinfo:
+            p = extract_attachment_user_info(a_uinfo)
+            if p.get("audio-transcription"):
+                skipped_apple += 1
+                continue
+
+        cached = get_cached_transcript(guid=a_guid, filepath=full_path)
+        if cached and cached.get("transcription"):
+            skipped_cached += 1
+            continue
+
+        if not full_path or not os.path.exists(full_path):
+            missing_files += 1
+            continue
+
+        processed += 1
+        txt, lang, eng, segs, status = transcribe_audio_with_lock(
+            full_path, guid=a_guid, msg_id=m_id
+        )
+        if status == "ok" and txt:
+            transcribed += 1
+            results.append({
+                "msg_id": m_id,
+                "attachment_id": a_id,
+                "guid": a_guid,
+                "language": lang,
+                "engine": eng,
+                "status": "ok"
+            })
+        else:
+            failed += 1
+            results.append({
+                "msg_id": m_id,
+                "attachment_id": a_id,
+                "guid": a_guid,
+                "status": status
+            })
+
+    summary = {
+        "total_candidates": total_candidates,
+        "processed": processed,
+        "transcribed": transcribed,
+        "skipped_apple": skipped_apple,
+        "skipped_cached": skipped_cached,
+        "skipped_not_audio": skipped_not_audio,
+        "missing_files": missing_files,
+        "failed": failed,
+    }
+    if getattr(args, "json", False):
+        summary["items"] = results
+        print(json.dumps(summary, indent=2))
+    else:
+        print("Backfill complete:")
+        print(f"  Transcribed:    {transcribed}")
+        print(f"  Skipped Apple:  {skipped_apple}")
+        print(f"  Skipped Cached: {skipped_cached}")
+        print(f"  Missing Files:  {missing_files}")
+        print(f"  Failed:         {failed}")
+
 def main():
     parser = argparse.ArgumentParser(description="iMessage CLI tool for macOS")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -4104,6 +5134,9 @@ def main():
     attachment_parser.add_argument("path", nargs="?", default=None, help="POSIX path to attachment file")
     attachment_parser.add_argument("--path", dest="path_flag", default=None, help="POSIX path to attachment file")
     attachment_parser.add_argument("--message-id", type=int, default=None, help="Message ROWID containing attachment")
+    attachment_parser.add_argument("--with-segments", action="store_true", default=False, help="Include segment timestamps in transcript output")
+    attachment_parser.add_argument("--no-transcribe", dest="transcribe", action="store_false", default=True, help="Disable on-demand transcription if not already cached")
+    attachment_parser.add_argument("--transcribe", dest="transcribe", action="store_true", default=True, help="Enable on-demand transcription (default: True)")
     attachment_parser.add_argument("--json", action="store_true", help="Output JSON with base64 data")
     attachment_parser.set_defaults(func=get_attachment_payload)
 
@@ -4195,6 +5228,32 @@ def main():
     sched_run_alias = schedule_sub.add_parser("run", help="Alias for run-pending")
     sched_run_alias.add_argument("--json", action="store_true", help="Output results in JSON format")
     sched_run_alias.set_defaults(func=schedule_cli)
+
+    transcribe_parser = subparsers.add_parser("transcribe", help="Voice note transcription tools and cache management")
+    transcribe_parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    transcribe_parser.set_defaults(func=cmd_transcribe_status)
+    transcribe_sub = transcribe_parser.add_subparsers(dest="transcribe_action")
+
+    trans_status_p = transcribe_sub.add_parser("status", help="Show transcription engine status, models, and cache statistics")
+    trans_status_p.add_argument("--json", action="store_true", help="Output results in JSON format")
+    trans_status_p.set_defaults(func=cmd_transcribe_status)
+
+    trans_dl_p = transcribe_sub.add_parser("download-model", help="Download and verify whisper.cpp model")
+    trans_dl_p.add_argument("--model", default=None, help="Model name (e.g. large-v3-turbo-q5_0, small, tiny)")
+    trans_dl_p.add_argument("--force", action="store_true", help="Force re-download even if model file exists")
+    trans_dl_p.add_argument("--json", action="store_true", help="Output results in JSON format")
+    trans_dl_p.set_defaults(func=cmd_transcribe_download_model)
+
+    trans_clear_p = transcribe_sub.add_parser("clear-cache", help="Clear local transcription cache")
+    trans_clear_p.add_argument("--json", action="store_true", help="Output results in JSON format")
+    trans_clear_p.set_defaults(func=cmd_transcribe_clear_cache)
+
+    trans_backfill_p = transcribe_sub.add_parser("backfill", help="Transcribe historical voice notes in the background")
+    trans_backfill_p.add_argument("--since", default=None, help="Process messages sent after this date (ISO 8601, YYYY-MM-DD, or Unix timestamp)")
+    trans_backfill_p.add_argument("--chat", default=None, help="Filter to specific chat ID, phone, or email")
+    trans_backfill_p.add_argument("--limit", type=int, default=None, help="Maximum number of voice notes to process")
+    trans_backfill_p.add_argument("--json", action="store_true", help="Output results in JSON format")
+    trans_backfill_p.set_defaults(func=cmd_transcribe_backfill)
     
     args = parser.parse_args()
     args.func(args)
