@@ -125,7 +125,7 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.13.0';
+const SERVER_VERSION = '1.14.0';
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -285,6 +285,9 @@ function appendPresentationArgs(cli: string[], args: Record<string, unknown> | u
   if (readBoolArg(args, ['with_meta', 'withMeta', 'summary'])) {
     cli.push('--with-meta');
   }
+  if (readBoolArg(args, ['transcribe'])) {
+    cli.push('--transcribe');
+  }
 }
 
 const MISSING_CHAT =
@@ -371,7 +374,12 @@ const readWindowProperties = {
       'When true, wrap JSON as {messages, filtered, next_since_msg_id, has_more}. filtered counts omitted rows by kind (reaction). Advance a poll with next_since_msg_id. Aliases: withMeta, summary.'
   },
   withMeta: { type: 'boolean', description: 'Alias of with_meta.' },
-  summary: { type: 'boolean', description: 'Alias of with_meta.' }
+  summary: { type: 'boolean', description: 'Alias of with_meta.' },
+  transcribe: {
+    type: 'boolean',
+    description:
+      'When true, trigger on-demand local transcription for any voice notes in the retrieved messages that lack transcripts (default false).'
+  }
 };
 
 /**
@@ -491,7 +499,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'imessage_get_attachment_payload',
     description:
-      'Fetch metadata and base64 payload for an attachment file (converts HEIC photos to JPEG and CAF audio voice notes to M4A for multimodal LLMs, delivering visual image blocks to agents, duration, and on-device speech-to-text transcriptions). Accepts either path or message_id.',
+      'Fetch metadata and base64 payload for an attachment file (converts HEIC photos to JPEG and CAF audio voice notes to M4A for multimodal LLMs, delivering visual image blocks to agents, duration, and on-device speech-to-text transcriptions with whisper.cpp/Apple Speech, populating transcription, language, transcription_source, transcription_status, and optional segments). Accepts either path or message_id.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -512,6 +520,18 @@ export const TOOLS: Tool[] = [
         deliver_image: {
           type: 'boolean',
           description: 'If the attachment is an image, whether to deliver the visual image block directly to the agent (default true).'
+        },
+        with_segments: {
+          type: 'boolean',
+          description: 'Whether to include granular word/phrase segments with timestamps for transcribed voice notes (default false).'
+        },
+        withSegments: {
+          type: 'boolean',
+          description: 'Alias of with_segments.'
+        },
+        transcribe: {
+          type: 'boolean',
+          description: 'Whether to trigger on-demand local transcription if no transcript is cached yet (default true). Set to false to return cached results only.'
         }
       },
       anyOf: [
@@ -1930,6 +1950,12 @@ export async function executeToolCall(
       }
       if (messageId !== undefined) {
         cliArgs.push('--message-id', String(messageId));
+      }
+      if (readBoolArg(toolArgs, ['with_segments', 'withSegments'])) {
+        cliArgs.push('--with-segments');
+      }
+      if (toolArgs?.transcribe === false) {
+        cliArgs.push('--no-transcribe');
       }
       const stdout = await runImessageCli(cliArgs);
       let parsed: any;

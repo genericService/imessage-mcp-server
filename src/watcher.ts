@@ -59,6 +59,8 @@ export interface RawDetectedMessage {
   silenced_notifications?: boolean;
   effect?: string | null;
   effect_type?: string | null;
+  has_attachments?: boolean;
+  has_audio_attachments?: boolean;
 }
 
 export interface RawReceiptEvent {
@@ -152,7 +154,7 @@ export function ruleMatchesEvent(
   return false;
 }
 
-export const WATCHER_USER_AGENT = 'imessage-mcp-server/1.10.0';
+export const WATCHER_USER_AGENT = 'imessage-mcp-server/1.14.0';
 
 /**
  * Header names the watcher controls itself. Custom rule headers may not override them,
@@ -545,6 +547,16 @@ export class WatcherService {
 
       if (hadNewMessages) {
         for (const msg of result.new_messages) {
+          if (
+            process.env.TRANSCRIBE_ON_ARRIVAL === 'true' &&
+            !msg.is_from_me &&
+            (msg.has_audio_attachments || msg.has_attachments)
+          ) {
+            runImessageCli(['attachment', '--message-id', String(msg.msg_id), '--json'])
+              .catch((err) => {
+                console.warn(`[Watcher] Background transcription on arrival failed for msg #${msg.msg_id}: ${err.message}`);
+              });
+          }
           this.handleEvent(msg.event, msg.chat_id, msg.chat_identifiers, msg.msg_id, msg.occurred_at_iso, {
             delivered_quietly: msg.delivered_quietly,
             was_delivered_quietly: msg.was_delivered_quietly,

@@ -569,6 +569,135 @@ Clients connected over MCP can also subscribe to `resource://messages/recent`. W
 
 ---
 
+## On-Device Voice Note Transcription
+
+The server provides fully on-device transcription for iMessage voice notes (`.caf`, `.m4a`, `.wav`). Whenever Apple's native transcript in `attachment.user_info` is missing (common on incoming notes and Spanish speech), the server transcribes the audio locally using `whisper.cpp` with Apple Silicon Metal acceleration, or optionally through macOS Speech framework.
+
+All processing runs 100% locally on your Mac. Audio and transcript text never leave the host machine, and no paid or cloud APIs are required.
+
+### Key Capabilities
+
+- **Zero-Cloud Privacy:** All audio conversions and neural model inferences run strictly on-device. Audio files are converted to 16 kHz mono WAV inside private temporary directories with `0700` permissions and removed immediately after processing. Transcripts and audio contents are never printed to server logs.
+- **Apple Precedence:** If Messages.app already transcribed the audio note into `attachment.user_info`, the server returns Apple's transcript directly (`transcription_source: "apple"`). The local engine runs only when Apple's transcript is missing.
+- **Multilingual Support:** Auto-detects spoken languages with a priority hint list (`TRANSCRIBE_LANGUAGES`, default `"es,en"`). Returns standardized BCP-47 language codes (such as `"es"` or `"en"`).
+- **Persistent Cache:** Transcriptions are saved in `~/.imessage-mcp/transcripts.db` (or `~/.imessage-mcp/index.db` when `INDEX_ENABLED=true`), keyed by attachment GUID, file size, and modification time. Each audio clip is transcribed only once.
+- **Diacritic-Insensitive Search:** When `INDEX_ENABLED=true`, cached transcripts feed into the SQLite FTS5 search index with diacritic folding (`remove_diacritics 2`), so searching for "manana" matches "mañana".
+- **Serial Execution & Low Priority:** Runs with single-job concurrency (`fcntl` file locking) and process renicing (`os.nice(10)`) to ensure the host MacBook Air remains cool, quiet, and responsive.
+
+### Engine Setup & Installation
+
+#### 1. Install whisper.cpp (Recommended Engine)
+
+Install the standalone `whisper-cli` tool via Homebrew:
+
+```bash
+brew install whisper-cpp
+```
+
+This installs `whisper-cli` with native Apple Silicon Metal acceleration enabled.
+
+#### 2. Download Model Weights
+
+Models are stored under `~/.imessage-mcp/models/`. You can download and verify models using the provided helper script:
+
+```bash
+# Download the default high-accuracy multilingual model (547 MB, Q5_0 quantized)
+./bin/download-transcribe-model large-v3-turbo-q5_0
+
+# Or download via the imessage CLI
+./bin/imessage transcribe download-model --model large-v3-turbo-q5_0
+```
+
+Available model targets:
+- **`large-v3-turbo-q5_0`** (default, ~547 MB): Recommended for Apple Silicon. Exceptional accuracy on Spanish (including Mexican Spanish) and English, running in under 5 seconds for typical clips.
+- **`small`** (~466 MB): Balanced multilingual model with lower memory footprint.
+- **`tiny`** (~74 MB): Ultra-fast, lightweight option for constrained setups.
+
+To prevent unexpected network activity, model files are never downloaded automatically at request time unless `TRANSCRIBE_AUTO_DOWNLOAD=true` is set.
+
+#### 3. Optional Apple Speech Engine Fallback
+
+If you prefer macOS native speech recognition without downloading Whisper model files, configure `TRANSCRIBE_ENGINE=apple`. This routes transcription to Apple's `SFSpeechRecognizer` with `requiresOnDeviceRecognition = true` via a Swift helper.
+
+> [!NOTE]
+> Running the Apple Speech engine requires macOS Speech Recognition permission (TCC) granted to the Terminal or parent process. Furthermore, non-English recognition (such as `es-MX`) requires on-device dictation assets installed in **System Settings → Keyboard → Dictation**.
+
+### Performance & Resource Expectations (M-Series MacBook Air)
+
+Tested on an Apple M2 MacBook Air (8 GB RAM):
+
+| Metric | `large-v3-turbo-q5_0` | `tiny` |
+| :--- | :--- | :--- |
+| **Disk Footprint** | 547 MB | 74 MB |
+| **Peak RAM Usage** | ~1.2 GB | ~250 MB |
+| **Transcription Speed** | ~1.5x - 2x real-time (2.8s clip in ~4.5s on first cold run, ~1.8s warm) | ~10x real-time (2.8s clip in ~0.3s) |
+| **Spanish Word Accuracy** | Near perfect (handles slang, accents, and punctuation) | Basic comprehension |
+
+### Tool Response Format
+
+Calling `imessage_get_attachment_payload` returns enriched transcription fields:
+
+```json
+{
+  "filename": "/Users/matthias/Library/Messages/Attachments/.../Audio Message.caf",
+  "mime_type": "audio/mp4",
+  "is_audio": true,
+  "duration_seconds": 15.2,
+  "duration_formatted": "15s",
+  "transcription": "Hola, te veo mañana para la reunión.",
+  "language": "es",
+  "transcription_source": "whisper",
+  "transcription_status": "ok",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 2.4,
+      "text": "Hola, te veo mañana para la reunión."
+    }
+  ]
+}
+```
+
+`transcription_status` values:
+- `"ok"`: Transcription completed successfully or loaded from cache.
+- `"not_audio"`: The requested attachment is not an audio file.
+- `"engine_unavailable"`: Neither `whisper-cli` nor the Apple Speech engine is installed.
+- `"too_long"`: Audio duration exceeds `TRANSCRIBE_MAX_SECONDS` (default 600s).
+- `"pending"`: Transcription queue wait timeout expired (`TRANSCRIBE_WAIT_MS`), indicating the engine is busy with another job.
+- `"failed"`: Audio conversion or engine execution encountered an error.
+
+### CLI Management Commands
+
+```bash
+# Check engine status, installed models, and cached transcript count
+./bin/imessage transcribe status
+
+# Download a specific model
+./bin/imessage transcribe download-model --model small
+
+# Backfill older voice notes from message history
+./bin/imessage transcribe backfill --since 2026-01-01 --chat 46
+
+# Clear cached transcripts
+./bin/imessage transcribe clear-cache
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `TRANSCRIBE_ENGINE` | `whisper` | Active transcription engine (`whisper` or `apple`). |
+| `TRANSCRIBE_MODEL` | `large-v3-turbo-q5_0` | Default Whisper model name to load from `~/.imessage-mcp/models/`. |
+| `TRANSCRIBE_MODEL_PATH` | _(auto-resolved)_ | Explicit filesystem path to a `.bin` Whisper model file. |
+| `TRANSCRIBE_LANGUAGES` | `es,en` | Comma-separated language hint preference list for whisper auto-detection. |
+| `TRANSCRIBE_MAX_SECONDS` | `600` | Maximum audio duration in seconds accepted for transcription. |
+| `TRANSCRIBE_WAIT_MS` | `60000` | Maximum milliseconds to wait for the serial queue lock before returning status `"pending"`. |
+| `TRANSCRIBE_JOB_TIMEOUT_SECONDS` | `120` | Subprocess execution timeout in seconds for transcription tasks. |
+| `TRANSCRIBE_AUTO_DOWNLOAD` | `false` | When `true`, automatically downloads missing Whisper models on first request. |
+| `TRANSCRIBE_ON_ARRIVAL` | `false` | When `true`, the background watcher queues transcription for incoming voice notes as soon as they arrive. |
+
+---
+
 ## Local Search & Metadata Index (Optional Sidecar)
 
 The server includes an optional local SQLite sidecar index designed to accelerate full-text searches and repeat reads across large message histories without duplicating the message database or attachment files.

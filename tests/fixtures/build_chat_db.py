@@ -34,6 +34,8 @@ GUID = {
     204: "A1000000-0000-4000-8000-000000000204",
     205: "A1000000-0000-4000-8000-000000000205",
     206: "A1000000-0000-4000-8000-000000000206",
+    207: "A1000000-0000-4000-8000-000000000207",
+    208: "A1000000-0000-4000-8000-000000000208",
 }
 
 SPOTIFY_URL = "https://open.spotify.com/track/spice-melange"
@@ -499,6 +501,60 @@ def build(path):
         ),
     )
     c.execute("INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (201, 2)")
+
+    add_message(
+        207,
+        8,
+        2,
+        0,
+        "",
+        27,
+        is_audio_message=1,
+    )
+    add_message(
+        208,
+        8,
+        2,
+        0,
+        "",
+        28,
+        is_audio_message=1,
+    )
+
+    voice_fixture_path = os.path.join(os.path.dirname(__file__), "sample_voice.caf")
+    voice_size = os.path.getsize(voice_fixture_path) if os.path.exists(voice_fixture_path) else 8191
+    apple_user_info = plistlib.dumps({
+        'audio-transcription': 'Apple says hello from Caladan',
+        'transcription-language': 'en'
+    }, fmt=plistlib.FMT_BINARY)
+    c.execute(
+        """
+        INSERT INTO attachment (ROWID, guid, filename, mime_type, transfer_name, total_bytes, uti, user_info)
+        VALUES (3, ?, ?, 'audio/x-caf', 'sample_voice.caf', ?, 'com.apple.coreaudio-format', ?)
+        """,
+        (
+            "ATT-VOICE-APPLE-1",
+            voice_fixture_path,
+            voice_size,
+            apple_user_info,
+        ),
+    )
+    c.execute("INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (207, 3)")
+
+    spanish_fixture_path = os.path.join(os.path.dirname(__file__), "spanish_sample.caf")
+    spanish_size = os.path.getsize(spanish_fixture_path) if os.path.exists(spanish_fixture_path) else 15271
+    c.execute(
+        """
+        INSERT INTO attachment (ROWID, guid, filename, mime_type, transfer_name, total_bytes, uti, user_info)
+        VALUES (4, ?, ?, 'audio/x-caf', 'spanish_sample.caf', ?, 'com.apple.coreaudio-format', NULL)
+        """,
+        (
+            "ATT-VOICE-SPANISH-1",
+            spanish_fixture_path,
+            spanish_size,
+        ),
+    )
+    c.execute("INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (208, 4)")
     conn.commit()
     conn.close()
 
