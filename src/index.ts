@@ -125,7 +125,19 @@ const HOST = process.env.HOST || '::';
 const AUTH_TOKEN = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 const PUBLIC_DOMAIN = process.env.PUBLIC_DOMAIN || 'imessage.genericservice.app';
-const SERVER_VERSION = '1.14.0';
+
+export function readServerVersion(customPkgPath?: string): string {
+  try {
+    const pkgPath = customPkgPath || path.resolve(__dir, '../package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    if (pkg && typeof pkg.version === 'string' && pkg.version.trim()) {
+      return pkg.version.trim();
+    }
+  } catch {}
+  return '1.15.0';
+}
+
+export const SERVER_VERSION = readServerVersion();
 const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
 const LEGACY_BEARER_TOKENS = new Set(
   (process.env.LEGACY_BEARER_TOKENS || '')
@@ -133,6 +145,104 @@ const LEGACY_BEARER_TOKENS = new Set(
     .map((t) => t.trim())
     .filter(Boolean)
 );
+
+/**
+ * Resolves a contact display name to its primary iMessage/phone/email handle
+ * via the Unified Contact Identity Graph when a plain display name is passed.
+ * Preserves numeric chat ROWIDs, explicit chat identifiers, emails, phone numbers,
+ * and already-formatted "Name (+1555...)" strings.
+ */
+export function resolveHandleViaIdentityGraph(input: string, graph = identityGraph): string {
+  if (!input || !input.trim()) return input;
+  const trimmed = input.trim();
+  if (
+    /^\d+$/.test(trimmed) ||
+    /^chat\d+/i.test(trimmed) ||
+    trimmed.startsWith('iMessage;') ||
+    trimmed.includes('@') ||
+    /^\+?[\d\s\-().]{7,}$/.test(trimmed) ||
+    /\([^)]+\)/.test(trimmed)
+  ) {
+    return trimmed;
+  }
+
+  const record = graph.resolveContact(trimmed);
+  if (!record || !Array.isArray(record.identities) || record.identities.length === 0) {
+    return trimmed;
+  }
+
+  const imessagePhone = record.identities.find(
+    (i) => i.platform === 'imessage' && i.identifierType === 'phone' && i.identifierValue
+  );
+  if (imessagePhone) return imessagePhone.identifierValue;
+
+  const imessageEmail = record.identities.find(
+    (i) => i.platform === 'imessage' && i.identifierType === 'email' && i.identifierValue
+  );
+  if (imessageEmail) return imessageEmail.identifierValue;
+
+  const imessageAny = record.identities.find(
+    (i) => i.platform === 'imessage' && i.identifierValue
+  );
+  if (imessageAny) return imessageAny.identifierValue;
+
+  const anyPhone = record.identities.find(
+    (i) => i.identifierType === 'phone' && i.identifierValue
+  );
+  if (anyPhone) return anyPhone.identifierValue;
+
+  const anyEmail = record.identities.find(
+    (i) => i.identifierType === 'email' && i.identifierValue
+  );
+  if (anyEmail) return anyEmail.identifierValue;
+
+  return trimmed;
+}
+
+/**
+ * Computes non-blocking health telemetry for chat.db, local FTS index, and Identity Graph.
+ */
+export function getHealthTelemetry(): {
+  chatDbAccessible: boolean;
+  ftsIndexReady: boolean;
+  identityGraphExists: boolean;
+} {
+  let chatDbAccessible = false;
+  try {
+    const chatDbPath = process.env.IMESSAGE_DB_PATH
+      ? path.resolve(process.env.IMESSAGE_DB_PATH)
+      : path.join(os.homedir(), 'Library', 'Messages', 'chat.db');
+    chatDbAccessible = fs.existsSync(chatDbPath);
+  } catch {
+    chatDbAccessible = false;
+  }
+
+  let ftsIndexReady = false;
+  try {
+    const mcpDir = process.env.IMESSAGE_MCP_DIR
+      ? path.resolve(process.env.IMESSAGE_MCP_DIR)
+      : path.join(os.homedir(), '.imessage-mcp');
+    const indexDbPath = process.env.INDEX_DB_PATH
+      ? path.resolve(process.env.INDEX_DB_PATH)
+      : path.join(mcpDir, 'index.db');
+    ftsIndexReady = fs.existsSync(indexDbPath) && fs.statSync(indexDbPath).size > 0;
+  } catch {
+    ftsIndexReady = false;
+  }
+
+  let identityGraphExists = false;
+  try {
+    identityGraphExists = fs.existsSync(identityGraph.dbPath);
+  } catch {
+    identityGraphExists = false;
+  }
+
+  return {
+    chatDbAccessible,
+    ftsIndexReady,
+    identityGraphExists
+  };
+}
 
 /**
  * 2026-07-28 Model Context Protocol Specification Version
@@ -1706,14 +1816,15 @@ export async function executeToolCall(
         content: [{ type: 'text', text: stdout }]
       };
     } else if (effectiveName === 'imessage_read_messages') {
-      const chat = readChatArg(toolArgs);
+      const rawChat = readChatArg(toolArgs);
       const days = clampInt(readIntArg(toolArgs, ['days', 'lookback_days', 'lookbackDays']), 14, 1, 365);
-      if (!chat) {
+      if (!rawChat) {
         throw new Error(MISSING_CHAT);
       }
+      const chat = resolveHandleViaIdentityGraph(rawChat);
       const cliArgs = ['read', chat, '--days', String(days), '--json'];
       appendPresentationArgs(cliArgs, toolArgs);
-      let stdout = await runImessageCli(cliArgs);
+      let stdout = await cliRunner.run(cliArgs);
       if (toolArgs?.with_meta || toolArgs?.withMeta) {
         try {
           const parsed = JSON.parse(stdout);
@@ -1742,7 +1853,7 @@ export async function executeToolCall(
         cliArgs.push('--order', order);
       }
       if (chat) {
-        cliArgs.push('--chat', chat);
+        cliArgs.push('--chat', resolveHandleViaIdentityGraph(chat));
       }
       appendPresentationArgs(cliArgs, toolArgs);
       const stdout = await runImessageCli(cliArgs);
@@ -1779,17 +1890,10 @@ export async function executeToolCall(
     } else if (effectiveName === 'get_last_interaction') {
       let chat = readChatArg(toolArgs);
       const contact = readStringArg(toolArgs, ['contact', 'name', 'recipient', 'handle', 'phone', 'email']);
-      if (!chat && contact) {
-        const idRecord = identityGraph.resolveContact(contact);
-        if (idRecord) {
-          const phoneIdent = idRecord.identities.find(i => i.platform === 'imessage' || i.identifierType === 'phone');
-          if (phoneIdent) {
-            chat = phoneIdent.identifierValue;
-          }
-        }
-        if (!chat) {
-          chat = contact;
-        }
+      if (chat) {
+        chat = resolveHandleViaIdentityGraph(chat);
+      } else if (contact) {
+        chat = resolveHandleViaIdentityGraph(contact);
       }
       if (!chat) {
         throw new Error('Either chat (chat_id) or contact must be provided');
@@ -1797,7 +1901,7 @@ export async function executeToolCall(
 
       const cliArgs = ['recent', chat, '--limit', '5', '--json'];
       appendPresentationArgs(cliArgs, toolArgs);
-      const stdout = await runImessageCli(cliArgs);
+      const stdout = await cliRunner.run(cliArgs);
       let msgs: any[] = [];
       try {
         const parsed = JSON.parse(stdout);
@@ -1826,7 +1930,7 @@ export async function executeToolCall(
         throw new Error('Missing required parameter "message_id"');
       }
 
-      const cliArgs = ['read', chat || '1', '--days', '365', '--json'];
+      const cliArgs = ['read', chat ? resolveHandleViaIdentityGraph(chat) : '1', '--days', '365', '--json'];
       appendPresentationArgs(cliArgs, toolArgs);
       const stdout = await runImessageCli(cliArgs);
       let msgs: any[] = [];
@@ -1886,9 +1990,11 @@ export async function executeToolCall(
     } else if (effectiveName === 'imessage_get_recent_messages') {
       let chat = readChatArg(toolArgs);
       const limit = clampInt(readIntArg(toolArgs, ['limit', 'count', 'max']), 5, 1, 50);
-      if (!chat) {
+      if (chat) {
+        chat = resolveHandleViaIdentityGraph(chat);
+      } else {
         try {
-          const listStdout = await runImessageCli(['list', '--limit', '1', '--json']);
+          const listStdout = await cliRunner.run(['list', '--limit', '1', '--json']);
           const listParsed = JSON.parse(listStdout);
           const chats = Array.isArray(listParsed) ? listParsed : (listParsed.chats || []);
           if (chats.length > 0) {
@@ -1901,7 +2007,7 @@ export async function executeToolCall(
       }
       const cliArgs = ['recent', chat, '--limit', String(limit), '--json'];
       appendPresentationArgs(cliArgs, toolArgs);
-      let stdout = await runImessageCli(cliArgs);
+      let stdout = await cliRunner.run(cliArgs);
       if (toolArgs?.with_meta || toolArgs?.withMeta) {
         try {
           const parsed = JSON.parse(stdout);
@@ -1933,7 +2039,7 @@ export async function executeToolCall(
       if (!chat) {
         throw new Error(MISSING_CHAT);
       }
-      const stdout = await runImessageCli(['members', chat, '--json']);
+      const stdout = await runImessageCli(['members', resolveHandleViaIdentityGraph(chat), '--json']);
       result = {
         content: [{ type: 'text', text: stdout }]
       };
@@ -2093,7 +2199,8 @@ export async function executeToolCall(
       const dryRun = Boolean(args?.dry_run);
       const confirmToken = String(args?.confirm_token || '').trim();
 
-      let recipient = readStringArg(toolArgs, ['recipient', 'to']);
+      const rawRecipient = readStringArg(toolArgs, ['recipient', 'to']);
+      let recipient = rawRecipient ? resolveHandleViaIdentityGraph(rawRecipient) : '';
       let message = String(args?.message || '').trim();
       const rawAttachment =
         toolArgs?.attachment ??
@@ -2520,7 +2627,7 @@ app.get('/', (_req, res) => {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>iMessage MCP Server</title>
+  <title>iMessage MCP Server v${SERVER_VERSION}</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0a0a0a; color: #f5f0eb; padding: 2rem; max-width: 900px; margin: 0 auto; line-height: 1.6; }
     h1 { color: #d4a843; border-bottom: 1px solid #333; padding-bottom: 0.5rem; }
@@ -2532,7 +2639,7 @@ app.get('/', (_req, res) => {
   </style>
 </head>
 <body>
-  <h1>iMessage MCP Server</h1>
+  <h1>iMessage MCP Server <span class="badge">v${SERVER_VERSION}</span></h1>
   <p>Model Context Protocol (MCP) Server for macOS iMessage integration over HTTP and SSE.</p>
   
   <h2>Available Transports & Endpoints</h2>
@@ -2553,6 +2660,18 @@ app.get('/', (_req, res) => {
     <em>Structured API discovery metadata and tool schemas.</em>
   </div>
 
+  <h2>Client Configuration</h2>
+  <pre><code>{
+  "mcpServers": {
+    "imessage": {
+      "url": "${publicBase}/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_AUTH_TOKEN"
+      }
+    }
+  }
+}</code></pre>
+
   <h2>Available Tools</h2>
   <ul>
     <li><code>imessage_list_chats</code>: List recent conversations, display names, and handles.</li>
@@ -2570,6 +2689,10 @@ app.get('/', (_req, res) => {
     <li><code>imessage_get_call_history</code>: Retrieve phone and FaceTime call history.</li>
     <li><code>imessage_index_status</code>: Inspect local search index statistics, sync freshness, and lag.</li>
     <li><code>imessage_get_readme</code>: Full server README and setup guide.</li>
+    <li><code>resolve_contact</code>: Resolve a contact across platforms via the Unified Contact Identity Graph.</li>
+    <li><code>link_contact_identity</code>: Link a platform identity to a contact in the Unified Contact Identity Graph.</li>
+    <li><code>get_last_interaction</code>: Get the most recent direct message interaction with a contact or chat.</li>
+    <li><code>get_message_context</code>: Get surrounding context around a specific message ROWID.</li>
   </ul>
 </body>
 </html>
@@ -2580,6 +2703,7 @@ app.get('/', (_req, res) => {
  * Health check endpoint.
  */
 app.get('/health', (_req, res) => {
+  const telemetry = getHealthTelemetry();
   res.json({
     status: 'ok',
     server: 'imessage-mcp-server',
@@ -2589,6 +2713,7 @@ app.get('/health', (_req, res) => {
     activeSseSessions: sseSessions.size,
     activeHttpSessions: httpSessions.size,
     imessageSshFda: IMESSAGE_SSH_FDA,
+    ...telemetry,
     transports: ['sse', 'streamable-http']
   });
 });

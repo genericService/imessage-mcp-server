@@ -31,11 +31,16 @@ export interface ContactRecord {
 export class IdentityGraph {
   public dbPath: string;
   private db: DatabaseSync;
+  private cache = new Map<string, { record: ContactRecord | null; expiresAt: number }>();
+  private cacheHits = 0;
+  private cacheMisses = 0;
+  private readonly cacheTtlMs: number;
 
-  constructor(customPath?: string) {
+  constructor(customPath?: string, cacheTtlMs = 5000) {
     this.dbPath =
       customPath ||
       path.join(os.homedir(), '.local', 'share', 'comms', 'identity_graph.db');
+    this.cacheTtlMs = cacheTtlMs;
 
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
@@ -48,6 +53,8 @@ export class IdentityGraph {
 
   private initSchema(): void {
     this.db.exec('PRAGMA journal_mode = WAL;');
+    this.db.exec('PRAGMA busy_timeout = 5000;');
+    this.db.exec('PRAGMA synchronous = NORMAL;');
     this.db.exec('PRAGMA foreign_keys = ON;');
 
     this.db.exec(`
@@ -76,13 +83,42 @@ export class IdentityGraph {
 
       CREATE INDEX IF NOT EXISTS idx_identities_val ON identities (identifier_value);
       CREATE INDEX IF NOT EXISTS idx_identities_contact ON identities (contact_id);
+      CREATE INDEX IF NOT EXISTS idx_identities_platform_val ON identities (platform, identifier_value);
+      CREATE INDEX IF NOT EXISTS idx_identities_contact_platform ON identities (contact_id, platform);
+      CREATE INDEX IF NOT EXISTS idx_identities_type_val ON identities (identifier_type, identifier_value);
       CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts (display_name);
     `);
+  }
+
+  public clearCache(): void {
+    this.cache.clear();
+    this.cacheHits = 0;
+    this.cacheMisses = 0;
+  }
+
+  public getCacheStats(): { hits: number; misses: number; size: number } {
+    return {
+      hits: this.cacheHits,
+      misses: this.cacheMisses,
+      size: this.cache.size,
+    };
   }
 
   public resolveContact(nameOrQuery: string): ContactRecord | null {
     if (!nameOrQuery || !nameOrQuery.trim()) return null;
     const q = nameOrQuery.trim();
+    const cacheKey = q.toLowerCase();
+    const now = Date.now();
+
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      this.cacheHits++;
+      return cached.record
+        ? { ...cached.record, identities: cached.record.identities.map((i) => ({ ...i })) }
+        : null;
+    }
+
+    this.cacheMisses++;
 
     // 1. Direct match by identifier_value (phone, email, username, jid)
     const idRow = this.db
@@ -120,13 +156,29 @@ export class IdentityGraph {
       contactId = phoneRow?.contact_id;
     }
 
-    if (!contactId) return null;
+    if (!contactId) {
+      this.cache.set(cacheKey, { record: null, expiresAt: now + this.cacheTtlMs });
+      return null;
+    }
 
+    const result = this.fetchContactRecordById(contactId);
+    if (!result) {
+      this.cache.set(cacheKey, { record: null, expiresAt: now + this.cacheTtlMs });
+      return null;
+    }
+
+    this.cache.set(cacheKey, { record: result, expiresAt: now + this.cacheTtlMs });
+    return { ...result, identities: result.identities.map((i) => ({ ...i })) };
+  }
+
+  private fetchContactRecordById(contactId: string): ContactRecord | null {
     const contact = this.db
       .prepare('SELECT * FROM contacts WHERE id = ?')
       .get(contactId) as Record<string, unknown> | undefined;
 
-    if (!contact) return null;
+    if (!contact) {
+      return null;
+    }
 
     const identities = (this.db
       .prepare('SELECT * FROM identities WHERE contact_id = ?')
@@ -207,7 +259,8 @@ export class IdentityGraph {
       )
       .run(contactId, plat, idType, trimmedIdent, nowIso);
 
-    return this.resolveContact(trimmedName)!;
+    this.clearCache();
+    return this.fetchContactRecordById(contactId)!;
   }
 
   public seedContacts(
@@ -227,10 +280,12 @@ export class IdentityGraph {
         seeded++;
       }
     }
+    this.clearCache();
     return seeded;
   }
 
   public close(): void {
+    this.clearCache();
     this.db.close();
   }
 }

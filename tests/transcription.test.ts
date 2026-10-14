@@ -200,7 +200,7 @@ describe('On-Device Voice Note Transcription', () => {
 
   it('formats voice note label with cached transcription in read and search tools', async () => {
     // Message 208 was cached in previous test with "Hola, te veo mañana para la reunión."
-    const messages = await cliJson(['read', '8', '--json']);
+    const messages = await cliJson(['read', '8', '--days', '365', '--json']);
     const msg208 = messages.find((m: any) => m.msg_id === 208);
     expect(msg208).toBeDefined();
     expect(msg208.text).toContain('[voice note');

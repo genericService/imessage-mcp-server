@@ -154,7 +154,18 @@ export function ruleMatchesEvent(
   return false;
 }
 
-export const WATCHER_USER_AGENT = 'imessage-mcp-server/1.14.0';
+const WATCHER_PKG_VERSION: string = (() => {
+  try {
+    const pkgPath = path.resolve(process.cwd(), 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    if (pkg && typeof pkg.version === 'string' && pkg.version.trim()) {
+      return pkg.version.trim();
+    }
+  } catch {}
+  return '1.15.0';
+})();
+
+export const WATCHER_USER_AGENT = `imessage-mcp-server/${WATCHER_PKG_VERSION}`;
 
 /**
  * Header names the watcher controls itself. Custom rule headers may not override them,

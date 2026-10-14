@@ -122,17 +122,19 @@ describe('iMessage Local Sidecar Index', () => {
     expect(status.file_size_bytes).toBeGreaterThan(0);
   });
 
+  const nowAppleNs = Math.floor((Date.now() / 1000 - 978307200) * 1_000_000_000);
+
   it('indexes new rows incrementally', async () => {
     // Insert new message directly into chat.db
     await runSqlite(
       FIXTURE_DB,
       `INSERT INTO message (ROWID, guid, text, handle_id, date, is_from_me)
-       VALUES (999, 'GUID-999', 'Spice harvester sighting on Dune', 1, 812200000000000000, 0)`
+       VALUES (999, 'GUID-999', 'Spice harvester sighting on Dune', 1, ${nowAppleNs}, 0)`
     );
     await runSqlite(
       FIXTURE_DB,
       `INSERT INTO chat_message_join (chat_id, message_id, message_date)
-       VALUES (7, 999, 812200000000000000)`
+       VALUES (7, 999, ${nowAppleNs})`
     );
 
     // Verify lag detected before sync
@@ -155,7 +157,7 @@ describe('iMessage Local Sidecar Index', () => {
   it('refreshes edited messages on recheck without changing other data', async () => {
     await runSqlite(
       FIXTURE_DB,
-      `UPDATE message SET text = 'Updated spice harvester sighting on Arrakis', date_edited = 800000050000000000
+      `UPDATE message SET text = 'Updated spice harvester sighting on Arrakis', date_edited = ${nowAppleNs + 50_000_000_000}
        WHERE ROWID = 999`
     );
 
@@ -190,8 +192,8 @@ import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 c = conn.cursor()
 body = b"streamtyped\\x81\\xe8\\x03\\x84\\x01@\\x84\\x84\\x84\\x12NSAttributedString\\x00\\x84\\x84\\x08NSObject\\x00\\x85\\x92\\x84\\x84\\x84\\x08NSString\\x01\\x94\\x84\\x01+\\x12MuadDib of Arrakis\\x86"
-c.execute("INSERT INTO message (ROWID, guid, text, attributedBody, handle_id, date, is_from_me) VALUES (1001, 'GUID-1001', NULL, ?, 1, 812200000000000000, 0)", (body,))
-c.execute("INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (7, 1001, 812200000000000000)")
+c.execute("INSERT INTO message (ROWID, guid, text, attributedBody, handle_id, date, is_from_me) VALUES (1001, 'GUID-1001', NULL, ?, 1, ${nowAppleNs}, 0)", (body,))
+c.execute("INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (7, 1001, ${nowAppleNs})")
 conn.commit()
 conn.close()
 `;
@@ -209,12 +211,12 @@ conn.close()
     await runSqlite(
       FIXTURE_DB,
       `INSERT INTO message (ROWID, guid, text, handle_id, date, is_from_me)
-       VALUES (1002, 'GUID-1002', 'El señor Paul Atreides está en el desierto', 1, 812200000000000000, 0)`
+       VALUES (1002, 'GUID-1002', 'El señor Paul Atreides está en el desierto', 1, ${nowAppleNs}, 0)`
     );
     await runSqlite(
       FIXTURE_DB,
       `INSERT INTO chat_message_join (chat_id, message_id, message_date)
-       VALUES (7, 1002, 812200000000000000)`
+       VALUES (7, 1002, ${nowAppleNs})`
     );
 
     await cli(['index', 'sync'], { INDEX_ENABLED: 'true' });

@@ -70,7 +70,9 @@ def get_db_connection():
         print(f"ERROR: iMessage database not found at {db_path}", file=sys.stderr)
         sys.exit(1)
     try:
-        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        return conn
     except Exception as e:
         print(f"ERROR: Could not open database in read-only mode: {e}", file=sys.stderr)
         sys.exit(1)
@@ -87,7 +89,8 @@ def get_call_history_connection():
     if not os.path.exists(db_path):
         return None, f"Call history database not found at {db_path}. Ensure Full Disk Access is granted or iPhone call syncing is enabled."
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn, None
     except Exception as e:
         return None, f"Could not open call history database in read-only mode ({e}). Check Full Disk Access permissions."
@@ -159,12 +162,15 @@ def get_transcripts_db_connection(read_only=False):
             return None
         uri = f"file:{db_path}?mode=ro"
         try:
-            return sqlite3.connect(uri, uri=True)
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            conn.execute("PRAGMA busy_timeout = 5000")
+            return conn
         except Exception:
             return None
     ensure_index_dir_and_permissions(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5.0)
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA synchronous = NORMAL")
     ensure_transcripts_table(conn)
     conn.commit()
@@ -702,10 +708,13 @@ def get_index_db_connection(read_only=False):
         if not os.path.exists(db_path):
             return None
         uri = f"file:{db_path}?mode=ro"
-        return sqlite3.connect(uri, uri=True)
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        return conn
     ensure_index_dir_and_permissions(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5.0)
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA synchronous = NORMAL")
     ensure_transcripts_table(conn)
     try:
@@ -745,6 +754,7 @@ def init_index_schema(conn, force=False):
         CREATE INDEX IF NOT EXISTS idx_messages_idx_chat_id ON messages_idx(chat_id);
         CREATE INDEX IF NOT EXISTS idx_messages_idx_date_unix ON messages_idx(date_unix);
         CREATE INDEX IF NOT EXISTS idx_messages_idx_date ON messages_idx(date);
+        CREATE INDEX IF NOT EXISTS idx_messages_idx_chat_date ON messages_idx(chat_id, date DESC);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             text_decoded,
@@ -783,6 +793,7 @@ def init_index_schema(conn, force=False):
             handle TEXT PRIMARY KEY,
             display_name TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_contacts_idx_name ON contacts_idx(display_name);
 
         CREATE TABLE IF NOT EXISTS meta (
             schema_version INTEGER,
@@ -1684,25 +1695,45 @@ def normalize_handle(val):
         clean = clean[1:]
     return clean.lower()
 
+_CONTACTS_MAP_CACHE = {
+    "data": None,
+    "expires_at": 0.0,
+    "cache_key": None,
+}
+
 def get_contacts_map():
+    now = time.time()
+    cache_key = (is_index_enabled(), get_index_db_path() if is_index_enabled() else "")
+    if (
+        _CONTACTS_MAP_CACHE["data"] is not None
+        and _CONTACTS_MAP_CACHE["cache_key"] == cache_key
+        and now < _CONTACTS_MAP_CACHE["expires_at"]
+    ):
+        return _CONTACTS_MAP_CACHE["data"]
+
     if is_index_enabled():
         db_path = get_index_db_path()
         if os.path.exists(db_path):
             try:
-                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+                conn.execute("PRAGMA busy_timeout = 5000")
                 c = conn.cursor()
                 c.execute("SELECT handle, display_name FROM contacts_idx")
                 rows = c.fetchall()
                 conn.close()
                 if rows:
-                    return {r[0]: r[1] for r in rows}
+                    cmap = {r[0]: r[1] for r in rows}
+                    _CONTACTS_MAP_CACHE["data"] = cmap
+                    _CONTACTS_MAP_CACHE["expires_at"] = now + 5.0
+                    _CONTACTS_MAP_CACHE["cache_key"] = cache_key
+                    return cmap
             except Exception:
                 pass
     ab_paths = glob.glob(os.path.expanduser('~/Library/Application Support/AddressBook/**/*.abcddb'), recursive=True)
     cmap = {}
     for p in ab_paths:
         try:
-            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5.0)
             c = conn.cursor()
             sql = """
             SELECT 
@@ -1723,6 +1754,9 @@ def get_contacts_map():
             conn.close()
         except Exception:
             pass
+    _CONTACTS_MAP_CACHE["data"] = cmap
+    _CONTACTS_MAP_CACHE["expires_at"] = now + 5.0
+    _CONTACTS_MAP_CACHE["cache_key"] = cache_key
     return cmap
 
 def list_chats(args):
