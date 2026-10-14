@@ -134,7 +134,7 @@ export function readServerVersion(customPkgPath?: string): string {
       return pkg.version.trim();
     }
   } catch {}
-  return '1.15.0';
+  return '1.15.1';
 }
 
 export const SERVER_VERSION = readServerVersion();
@@ -2543,6 +2543,86 @@ setInterval(() => {
 }, 60000);
 
 /**
+ * Resolves the active configured master bearer token, allowing runtime env overrides
+ * and detecting when authentication is explicitly empty/unconfigured.
+ */
+function getConfiguredAuthToken(): string {
+  if (process.env.BEARER_TOKEN !== undefined) {
+    return process.env.BEARER_TOKEN.trim();
+  }
+  if (process.env.AUTH_TOKEN !== undefined) {
+    return process.env.AUTH_TOKEN.trim();
+  }
+  return AUTH_TOKEN;
+}
+
+/**
+ * Extracts a bearer/API token from Authorization header, x-api-key header, or ?token query param.
+ */
+function extractRequestToken(req: Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (authHeader && /^Bearer\s+/i.test(authHeader)) {
+    return authHeader.replace(/^Bearer\s+/i, '').trim();
+  }
+  const apiKey = req.headers['x-api-key'];
+  if (typeof apiKey === 'string' && apiKey.trim()) {
+    return apiKey.trim();
+  }
+  if (req.query.token && typeof req.query.token === 'string' && req.query.token.trim()) {
+    return req.query.token.trim();
+  }
+  return null;
+}
+
+/**
+ * Checks whether a request carries valid authentication (or if AUTH_TOKEN is empty/unconfigured).
+ * Populates req.user when a valid token or JWT is verified.
+ */
+function isRequestAuthenticated(req: Request): boolean {
+  const configuredToken = getConfiguredAuthToken();
+  if (!configuredToken) {
+    return true;
+  }
+
+  const token = extractRequestToken(req);
+  if (!token) {
+    return false;
+  }
+
+  // 1. Static Master Bearer token check
+  if (secretsEqual(token, configuredToken) || secretsEqual(token, AUTH_TOKEN)) {
+    (req as any).user = { sub: 'master-token', scope: 'imessage:all' };
+    return true;
+  }
+
+  // 2. Client Registry secret token check (e.g. ubuntu-remote)
+  const registry = getClientRegistry();
+  for (const [clientId, clientSecret] of registry.entries()) {
+    if (secretsEqual(token, clientSecret)) {
+      (req as any).user = { sub: clientId, scope: 'imessage:all' };
+      return true;
+    }
+  }
+
+  // 3. Legacy transition tokens (env-configurable)
+  for (const legacyToken of LEGACY_BEARER_TOKENS) {
+    if (secretsEqual(token, legacyToken)) {
+      (req as any).user = { sub: 'legacy-client', scope: 'imessage:all' };
+      return true;
+    }
+  }
+
+  // 4. OAuth 2.0 JWT verification
+  const jwtPayload = verifyJwt(token);
+  if (jwtPayload) {
+    (req as any).user = jwtPayload;
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Enhanced Middleware for Bearer Token & OAuth JWT Authentication
  */
 function authMiddleware(req: Request, res: Response, next: NextFunction): void {
@@ -2550,7 +2630,7 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
     return next();
   }
   if (
-    ['/', '/health', '/discover'].includes(req.path)
+    ['/', '/health'].includes(req.path)
     || req.path.startsWith('/.well-known/')
     || req.path.includes('/.well-known/')
     || req.path.startsWith('/oauth/')
@@ -2558,15 +2638,11 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
     return next();
   }
 
-  const authHeader = req.headers.authorization;
-  let token: string | null = null;
-
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.substring(7);
-  } else if (req.query.token && typeof req.query.token === 'string') {
-    token = req.query.token;
+  if (isRequestAuthenticated(req)) {
+    return next();
   }
 
+  const token = extractRequestToken(req);
   if (!token) {
     recordAuthFailure(req);
     if (isRateLimited(req)) {
@@ -2578,51 +2654,48 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
     return;
   }
 
-  // 1. Static Master Bearer token check (backward compatibility)
-  if (secretsEqual(token, AUTH_TOKEN)) {
-    (req as any).user = { sub: 'master-token', scope: 'imessage:all' };
-    return next();
-  }
-
-  // 2. Client Registry secret token check (e.g. ubuntu-remote)
-  const registry = getClientRegistry();
-  for (const [clientId, clientSecret] of registry.entries()) {
-    if (secretsEqual(token, clientSecret)) {
-      (req as any).user = { sub: clientId, scope: 'imessage:all' };
-      return next();
-    }
-  }
-
-  // Legacy transition tokens (env-configurable; avoids hardcoded secrets in source)
-  for (const legacyToken of LEGACY_BEARER_TOKENS) {
-    if (secretsEqual(token, legacyToken)) {
-      (req as any).user = { sub: 'legacy-client', scope: 'imessage:all' };
-      return next();
-    }
-  }
-
-  // 3. OAuth 2.0 JWT verification
-  const jwtPayload = verifyJwt(token);
-  if (jwtPayload) {
-    (req as any).user = jwtPayload;
-    return next();
-  }
-
   recordAuthFailure(req);
   if (isRateLimited(req)) {
     res.status(429).json({ error: 'Too Many Requests: too many failed authentication attempts, retry later' });
     return;
   }
   setWwwAuthenticate(res, 'invalid_token', 'Invalid bearer token or expired OAuth JWT');
+  if (req.path === '/discover') {
+    res.status(401).json({ error: 'Unauthorized: Invalid bearer token or expired OAuth JWT' });
+    return;
+  }
   res.status(403).json({ error: 'Forbidden: Invalid bearer token or expired OAuth JWT' });
 }
 
 /**
- * Root discovery HTML / documentation page.
+ * Root discovery HTML / documentation page (Redacted when unauthenticated).
  */
-app.get('/', (_req, res) => {
-  const publicBase = publicBaseUrl();
+app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html');
+  if (!isRequestAuthenticated(req)) {
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>iMessage MCP Server</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0a0a0a; color: #f5f0eb; padding: 2rem; max-width: 600px; margin: 4rem auto; line-height: 1.6; }
+    h1 { color: #d4a843; border-bottom: 1px solid #333; padding-bottom: 0.5rem; }
+    .notice { background: #141414; border: 1px solid #2a2a2a; border-left: 4px solid #d4a843; padding: 1rem 1.5rem; margin-top: 1.5rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>iMessage MCP Server</h1>
+  <div class="notice">
+    <strong>Authentication Required</strong>
+    <p>Provide a valid Bearer token or OAuth 2.0 credential to access server documentation and discovery endpoints.</p>
+  </div>
+</body>
+</html>`);
+    return;
+  }
+
+  const publicBase = publicBaseUrl();
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2700,9 +2773,15 @@ app.get('/', (_req, res) => {
 });
 
 /**
- * Health check endpoint.
+ * Two-Tier Health check endpoint.
+ * Returns minimal {"status": "ok"} when unauthenticated, and full diagnostic telemetry when authenticated.
  */
-app.get('/health', (_req, res) => {
+app.get('/health', (req, res) => {
+  if (!isRequestAuthenticated(req)) {
+    res.json({ status: 'ok' });
+    return;
+  }
+
   const telemetry = getHealthTelemetry();
   res.json({
     status: 'ok',
@@ -2719,9 +2798,9 @@ app.get('/health', (_req, res) => {
 });
 
 /**
- * Structured discovery JSON endpoint (2026-07-28 Spec Compliant).
+ * Auth-Gated Structured discovery JSON endpoint (2026-07-28 Spec Compliant).
  */
-app.get('/discover', (_req, res) => {
+app.get('/discover', authMiddleware, (_req, res) => {
   const publicBase = publicBaseUrl();
   res.json({
     name: 'imessage-mcp-server',

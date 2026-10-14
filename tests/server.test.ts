@@ -891,16 +891,25 @@ describe('Express HTTP Endpoints & Transport Integration', () => {
     });
   };
 
-  integration('should return 200 OK on GET /health', async () => {
-    const res = await fetch(`${LOCAL_URL}/health`);
+  integration('should return 200 OK on GET /health (unauthenticated minimal and authenticated diagnostics)', async () => {
+    const unauthRes = await fetch(`${LOCAL_URL}/health`);
+    expect(unauthRes.status).toBe(200);
+    const unauthData = await unauthRes.json();
+    expect(unauthData.status).toBe('ok');
+
+    const res = await fetch(`${LOCAL_URL}/health`, {
+      headers: { 'Authorization': AUTH_HEADER }
+    });
     expect(res.status).toBe(200);
     const data = await res.json();
     expect(data.status).toBe('ok');
     expect(data.server).toBe('imessage-mcp-server');
   });
 
-  integration('should return discovery metadata on GET /discover', async () => {
-    const res = await fetch(`${LOCAL_URL}/discover`);
+  integration('should return discovery metadata on authenticated GET /discover', async () => {
+    const res = await fetch(`${LOCAL_URL}/discover`, {
+      headers: { 'Authorization': AUTH_HEADER }
+    });
     expect(res.status).toBe(200);
     const data = await res.json();
     expect(data.name).toBe('imessage-mcp-server');
@@ -924,7 +933,9 @@ describe('Express HTTP Endpoints & Transport Integration', () => {
   });
 
   integration('should return HTML documentation on GET /', async () => {
-    const res = await fetch(`${LOCAL_URL}/`);
+    const res = await fetch(`${LOCAL_URL}/`, {
+      headers: { 'Authorization': AUTH_HEADER }
+    });
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).toContain('<!DOCTYPE html>');

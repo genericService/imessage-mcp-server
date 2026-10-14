@@ -55,33 +55,83 @@ describe('v1.15.0 Improvements: Dynamic Version, Dashboard Hygiene, Identity Gra
       }
     });
 
-    it('reports dynamic package.json version across /health, /discover, and GET / HTML dashboard', async () => {
+    it('reports dynamic package.json version across authenticated /health, /discover, and GET / HTML dashboard', async () => {
       const pkg = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8'));
+      const token = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || '';
+      const authHeaders = { Authorization: `Bearer ${token}` };
 
-      const healthRes = await fetch(`${testUrl}/health`);
+      const healthRes = await fetch(`${testUrl}/health`, { headers: authHeaders });
       expect(healthRes.status).toBe(200);
       const healthData = await healthRes.json();
       expect(healthData.version).toBe(pkg.version);
 
-      const discRes = await fetch(`${testUrl}/discover`);
+      const discRes = await fetch(`${testUrl}/discover`, { headers: authHeaders });
       expect(discRes.status).toBe(200);
       const discData = await discRes.json();
       expect(discData.version).toBe(pkg.version);
 
-      const htmlRes = await fetch(`${testUrl}/`, { headers: { Accept: 'text/html' } });
+      const htmlRes = await fetch(`${testUrl}/`, { headers: { ...authHeaders, Accept: 'text/html' } });
       expect(htmlRes.status).toBe(200);
       const htmlText = await htmlRes.text();
       expect(htmlText).toContain(`v${pkg.version}`);
     });
   });
 
-  describe('2. Security & HTML Dashboard Hygiene', () => {
-    it('renders client config snippet with "Bearer YOUR_AUTH_TOKEN" placeholder and never leaks actual AUTH_TOKEN', async () => {
-      const res = await fetch(`${testUrl}/`, { headers: { Accept: 'text/html' } });
+  describe('2. Security & HTML Dashboard Hygiene (Two-Tier Health & Auth-Gated Discovery)', () => {
+    it('returns minimal {"status":"ok"} on unauthenticated GET /health and full diagnostics when authenticated', async () => {
+      const unauthRes = await fetch(`${testUrl}/health`);
+      expect(unauthRes.status).toBe(200);
+      const unauthData = await unauthRes.json();
+      expect(unauthData).toEqual({ status: 'ok' });
+      expect(unauthData.version).toBeUndefined();
+      expect(unauthData.imessageSshFda).toBeUndefined();
+      expect(unauthData.chatDbAccessible).toBeUndefined();
+      expect(unauthData.ftsIndexReady).toBeUndefined();
+      expect(unauthData.identityGraphExists).toBeUndefined();
+      expect(unauthData.activeSseSessions).toBeUndefined();
+      expect(unauthData.publicDomain).toBeUndefined();
+
+      const token = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || '';
+      const apiKeyRes = await fetch(`${testUrl}/health`, { headers: { 'x-api-key': token } });
+      expect(apiKeyRes.status).toBe(200);
+      const apiKeyData = await apiKeyRes.json();
+      expect(apiKeyData.status).toBe('ok');
+      expect(apiKeyData.server).toBe('imessage-mcp-server');
+      expect(typeof apiKeyData.chatDbAccessible).toBe('boolean');
+    });
+
+    it('rejects unauthenticated GET /discover with 401 and returns discovery JSON when authenticated', async () => {
+      const unauthRes = await fetch(`${testUrl}/discover`);
+      expect(unauthRes.status).toBe(401);
+
+      const token = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || '';
+      const authRes = await fetch(`${testUrl}/discover`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      expect(authRes.status).toBe(200);
+      const authData = await authRes.json();
+      expect(authData.name).toBe('imessage-mcp-server');
+      expect(Array.isArray(authData.tools)).toBe(true);
+    });
+
+    it('renders redacted "Authentication Required" HTML on unauthenticated GET / and full dashboard with "Bearer YOUR_AUTH_TOKEN" when authenticated', async () => {
+      const pkg = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8'));
+      const unauthRes = await fetch(`${testUrl}/`, { headers: { Accept: 'text/html' } });
+      expect(unauthRes.status).toBe(200);
+      const unauthHtml = await unauthRes.text();
+      expect(unauthHtml).toContain('Authentication Required');
+      expect(unauthHtml).not.toContain('imessage_list_chats');
+      expect(unauthHtml).not.toContain(`v${pkg.version}`);
+
+      const token = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || '';
+      const res = await fetch(`${testUrl}/`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'text/html' }
+      });
       expect(res.status).toBe(200);
       const html = await res.text();
 
       expect(html).toContain('Bearer YOUR_AUTH_TOKEN');
+      expect(html).toContain('imessage_list_chats');
       const activeSecret = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN;
       if (activeSecret && activeSecret.length > 8) {
         expect(html).not.toContain(activeSecret);
@@ -157,8 +207,11 @@ describe('v1.15.0 Improvements: Dynamic Version, Dashboard Hygiene, Identity Gra
   });
 
   describe('4. Ergonomics & Health Telemetry', () => {
-    it('includes ftsIndexReady, identityGraphExists, and chatDbAccessible booleans on GET /health with HTTP 200 status ok', async () => {
-      const res = await fetch(`${testUrl}/health`);
+    it('includes ftsIndexReady, identityGraphExists, and chatDbAccessible booleans on authenticated GET /health with HTTP 200 status ok', async () => {
+      const token = process.env.BEARER_TOKEN || process.env.AUTH_TOKEN || '';
+      const res = await fetch(`${testUrl}/health`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.status).toBe('ok');
